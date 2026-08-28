@@ -17,6 +17,34 @@ from typing import Callable, Protocol, runtime_checkable
 from teleflow.config import ConfigStore, Settings
 
 
+# --- Windows WMME / pjsua2 device-name fix -------------------------------
+# pjsip's WMME backend reads device names as raw ANSI bytes (GBK/cp936 on a
+# zh-CN machine). pjsua2's SWIG wrapper decodes those bytes as UTF-8 with
+# ``surrogateescape``, so the original bytes survive in ``info.name`` as lone
+# surrogate code points (e.g. ``"\udcc1\udca2..."``). Re-encoding with
+# ``surrogateescape`` recovers the exact ANSI bytes; decoding them with the
+# system ANSI code page (``mbcs`` = the ACP, literally GBK on zh-CN) yields the
+# correct name. This is pure in-process table decoding and is unaffected by the
+# native library or the console/OEM codepage.
+
+
+def _needs_recovery(name: str) -> bool:
+    """True when ``name`` still carries the wrapper's surrogate-escaped bytes."""
+    return any(0xDC00 <= ord(ch) <= 0xDFFF for ch in name)
+
+
+def _recover_wmme_names(names: list[str]) -> list[str]:
+    """Repair a batch of pjsua2 WMME names mangled by the SWIG wrapper."""
+    result = list(names)
+    for idx, name in enumerate(names):
+        if _needs_recovery(name):
+            try:
+                result[idx] = name.encode("utf-8", "surrogateescape").decode("mbcs")
+            except UnicodeError:
+                pass  # keep the escaped name rather than dropping the device
+    return result
+
+
 class DeviceKind(str, Enum):
     PHYSICAL = "physical"
     VIRTUAL = "virtual"
@@ -91,12 +119,20 @@ class PortAudioBackend:
             ep.libCreate()
         if ep.libGetState() < 2:  # pragma: no cover - needs lib
             ep.libInit(pj.EpConfig())
+
         manager = ep.audDevManager()
+        count = manager.getDevCount()  # pragma: no cover - needs lib
+
+        # pjsua2 returns the raw device-name bytes as UTF-8 surrogate escapes; we
+        # recover the correct Unicode name in-process (see module doc).
+        infos = [manager.getDevInfo(index) for index in range(count)]  # pragma: no cover - needs lib
+        names = _recover_wmme_names([info.name for info in infos])
 
         devices: list[AudioDevice] = []
-        for index in range(manager.getDevCount()):  # pragma: no cover - needs lib
-            info = manager.getDevInfo(index)
-            upper = info.name.upper()
+        for index in range(count):  # pragma: no cover - needs lib
+            info = infos[index]
+            name = names[index]
+            upper = name.upper()
             kind = (
                 DeviceKind.VIRTUAL
                 if any(token in upper for token in ("CABLE", "BLACKHOLE", "VIRTUAL"))
@@ -105,7 +141,7 @@ class PortAudioBackend:
             devices.append(
                 AudioDevice(
                     id=str(index),
-                    name=info.name,
+                    name=name,
                     kind=kind,
                     supports_playback=info.outputCount > 0,
                     supports_capture=info.inputCount > 0,
