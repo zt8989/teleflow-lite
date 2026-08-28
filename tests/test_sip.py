@@ -15,6 +15,7 @@ from teleflow.sip import (
     EVENT_CALL_INCOMING,
     EVENT_GATEWAY_REGISTERED,
     EVENT_MEDIA_ERROR,
+    EVENT_SIP_STARTED,
     FakeSipBackend,
     SipCoreService,
 )
@@ -86,3 +87,52 @@ def test_service_starts_on_configured_port(tmp_path) -> None:
     svc.start()
 
     assert backend.port == 5070
+
+
+def test_reroute_if_connected_only_fires_while_a_call_is_active(tmp_path) -> None:
+    svc, backend = _service(tmp_path)
+    svc.start()
+    backend.receive_register("sip:ata@192.168.1.50:5060")
+
+    # Idle: a hotplug must not re-route (no call to re-wire).
+    svc.reroute_if_connected()
+    assert backend.rerouted == []
+
+    backend.receive_invite("call-1")
+    svc.reroute_if_connected()
+    assert backend.rerouted == ["reroute"]
+
+    # After the call ends we are idle again: no re-route.
+    backend.receive_bye("call-1")
+    svc.reroute_if_connected()
+    assert backend.rerouted == ["reroute"]
+
+
+def test_network_down_triggers_recovery(tmp_path) -> None:
+    svc, backend = _service(tmp_path)
+    svc.start()
+
+    backend.receive_network_down()
+
+    assert backend.recovered == ["recovered"]
+
+
+def test_recover_re_emits_sip_started(tmp_path) -> None:
+    svc, backend = _service(tmp_path)
+    started: list[bool] = []
+    svc.on(EVENT_SIP_STARTED, lambda: started.append(True))
+    svc.start()  # initial start emits once
+
+    backend.receive_network_down()  # recovery re-announces that the service is up
+
+    assert len(started) == 2
+
+
+def test_device_change_callback_is_invoked(tmp_path) -> None:
+    svc, backend = _service(tmp_path)
+    fired: list[bool] = []
+    backend.set_device_change_callback(lambda: fired.append(True))
+
+    backend.receive_device_change()
+
+    assert fired == [True]

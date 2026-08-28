@@ -31,7 +31,8 @@ from PyQt6.QtWidgets import (
 )
 
 from teleflow.audio import (
-    AudioBackend, AudioDeviceManager, EVENT_DEVICE_SELECTED, FakeAudioBackend, PortAudioBackend,
+    AudioBackend, AudioDeviceManager, EVENT_AUDIO_DEVICES_CHANGED, EVENT_DEVICE_SELECTED,
+    FakeAudioBackend, PortAudioBackend,
 )
 from teleflow.autostart import set_autostart
 from teleflow.config import ConfigStore, Settings
@@ -336,6 +337,13 @@ def build_app(
         service.reroute()
 
     manager.on(EVENT_DEVICE_SELECTED, _on_device_selected)
+
+    # Resilience: on audio-device hotplug, re-enumerate and re-route a live call.
+    def _on_audio_devices_changed() -> None:
+        manager.handle_hotplug()
+        service.reroute_if_connected()
+
+    service.set_device_change_callback(_on_audio_devices_changed)
 
     if settings.autostart:
         set_autostart(True)

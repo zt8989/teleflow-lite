@@ -73,3 +73,16 @@ def test_production_preset_selects_virtual_sound_card(tmp_path) -> None:
     mgr = _manager(tmp_path)
     mgr.apply_preset("production")
     assert mgr.current_selection() == ("vb-cable", "vb-cable")
+
+
+def test_handle_hotplug_re_enumerates_and_signals_change(tmp_path) -> None:
+    backend = FakeAudioBackend()
+    mgr = AudioDeviceManager(backend, ConfigStore(tmp_path / "config.json"))
+    changed: list[object] = []
+    mgr.on("audio_devices_changed", lambda: changed.append(True))
+
+    backend.devices.append(AudioDevice("usb-mic", "USB Mic", DeviceKind.PHYSICAL, False, True))
+    mgr.handle_hotplug()
+
+    assert any(d.name == "USB Mic" for d in mgr.devices)
+    assert changed == [True]

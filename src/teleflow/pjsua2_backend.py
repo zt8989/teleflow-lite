@@ -102,7 +102,6 @@ class Pjsua2Backend:
             ) from exc
         self._pj = pj
         self._store = store
-        self._ep = pj.Endpoint()
         self._handler: Callable[[str, dict], None] | None = None
         self._transport: Any = None
         self._account: Any = None
@@ -111,8 +110,27 @@ class Pjsua2Backend:
         self._lib_created = False
         self._call_cls: type | None = None
         self._account_cls: type | None = None
+        self._device_change_cb: Callable[[], None] | None = None
         self.running = False
         self.port: int | None = None
+
+        # pjsua2's Endpoint is a process-wide singleton; subclass it so we can
+        # hook the audio-device-state and transport-state callbacks in one place.
+        backend_ref = self
+
+        class Endpoint(pj.Endpoint):  # type: ignore[misc, valid-type]
+            def onAudioDevState(self, prm: Any) -> None:  # noqa: ARG002 - prm unused
+                # A device was plugged/unplugged: let the manager re-enumerate
+                # and re-route a live call.
+                if backend_ref._device_change_cb is not None:
+                    backend_ref._device_change_cb()
+
+            def onTransportState(self, prm: Any) -> None:  # noqa: ARG002 - prm unused
+                state = getattr(prm, "state", None)
+                if state == pj.PJSIP_TP_STATE_DISCONNECTED and backend_ref._handler is not None:
+                    backend_ref._handler("network_down", {})
+
+        self._ep = Endpoint()
 
     def _ensure_lib(self) -> None:  # pragma: no cover
         if not self._lib_created:
@@ -189,4 +207,17 @@ class Pjsua2Backend:
 
     def reroute(self) -> None:  # pragma: no cover
         """Re-apply the current device selection to a live call (mid-call switch)."""
+        self._apply_route()
+
+    def set_device_change_callback(self, cb: Callable[[], None]) -> None:  # pragma: no cover
+        self._device_change_cb = cb
+
+    def recover(self) -> None:  # pragma: no cover
+        """Best-effort recovery after a network drop.
+
+        For a UDP transport pjsua2 auto-restores the signaling path; the main
+        thing we must guarantee is that the call's audio is re-wired to whatever
+        devices are now selected (e.g. after the machine's network came back and
+        a virtual sound card reappeared).
+        """
         self._apply_route()

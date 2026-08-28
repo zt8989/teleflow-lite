@@ -111,6 +111,7 @@ class PortAudioBackend:
 EVENT_DEVICES_ENUMERATED = "devices_enumerated"
 EVENT_DEVICE_SELECTED = "device_selected"
 EVENT_PRESET_APPLIED = "preset_applied"
+EVENT_AUDIO_DEVICES_CHANGED = "audio_devices_changed"
 
 # TeleFlow hard rule: an empty / "-1" / -1 device id is never valid.
 _INVALID_IDS = {"", "-1", -1, None}
@@ -141,6 +142,22 @@ class AudioDeviceManager:
     def refresh(self) -> None:
         self._devices = self._backend.enumerate()
         self._emit(EVENT_DEVICES_ENUMERATED, len(self._devices))
+
+    def handle_hotplug(self) -> None:
+        """React to an audio-device hotplug (plug/unplug).
+
+        Re-enumerates the device list (best-effort — a transient enumeration
+        failure must not crash the app) and announces the change so listeners
+        (e.g. the SIP service) can re-route a live call.
+        """
+        try:
+            self.refresh()
+        except (OSError, RuntimeError):
+            # Enumeration can hiccup on hotplug (e.g. native lib mid-state); the
+            # change is still announced so a live call re-routes onto whatever
+            # devices remain, and the app stays up.
+            pass
+        self._emit(EVENT_AUDIO_DEVICES_CHANGED)
 
     @property
     def devices(self) -> list[AudioDevice]:

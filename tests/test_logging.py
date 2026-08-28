@@ -56,3 +56,29 @@ def test_sip_and_device_events_are_logged(tmp_path: Path) -> None:
     assert "incoming call" in joined
     assert "enumerated" in joined
     assert "device selected" in joined
+
+
+def test_log_rotates_when_file_exceeds_max_bytes(tmp_path: Path) -> None:
+    log_path = tmp_path / "app.log"
+    logger = EventLogger(path=log_path, level=LogLevel.DEBUG, max_bytes=100, backup_count=2)
+
+    # Each line is >20 bytes, so a handful of writes should force rotation.
+    for i in range(20):
+        logger.info("SIP", f"line {i:03d} " + "x" * 40)
+
+    # Current file exists and holds only a bounded tail (old lines rotated away).
+    assert log_path.exists()
+    current = log_path.read_text(encoding="utf-8")
+    assert "line 019" in current
+    assert "line 000" not in current  # rotated out of the live file
+
+    # Backups were created and the count is capped at backup_count.
+    backups = sorted(p.name for p in tmp_path.glob("app.log.*"))
+    assert backups, "expected at least one rotated backup"
+    assert len(backups) <= 2
+    # Total retained on disk stays bounded: the live tail plus <=2 backups, none
+    # of which is the whole 20-line history.
+    total_lines = current.count("\n") + sum(
+        (tmp_path / b).read_text(encoding="utf-8").count("\n") for b in backups
+    )
+    assert total_lines < 20

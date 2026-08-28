@@ -45,6 +45,14 @@ class SipBackend(Protocol):
         """Re-apply the current device selection to a live call (mid-call switch)."""
         ...
 
+    def set_device_change_callback(self, cb: Callable[[], None]) -> None:
+        """Register a callback fired when audio devices are hot-plugged."""
+        ...
+
+    def recover(self) -> None:
+        """Best-effort recovery after a network drop / transport disconnect."""
+        ...
+
 
 class FakeSipBackend:
     """Scripted ATA gateway for tests/headless runs.
@@ -62,6 +70,9 @@ class FakeSipBackend:
         self.answered: list[str] = []
         self.hung_up: list[str] = []
         self.placed: list[str] = []
+        self.recovered: list[str] = []
+        self.rerouted: list[str] = []
+        self.device_change_callbacks: list[Callable[[], None]] = []
 
     def start(self, port: int, handler: Callable[[str, dict], None]) -> None:
         self._handler = handler
@@ -99,8 +110,24 @@ class FakeSipBackend:
         self.placed.append(target)
 
     def reroute(self) -> None:
-        # Scripted fake has no live call audio to re-route.
-        pass
+        # Scripted fake has no live call audio to re-route, but records the call.
+        self.rerouted.append("reroute")
+
+    def set_device_change_callback(self, cb: Callable[[], None]) -> None:
+        self.device_change_callbacks.append(cb)
+
+    def receive_device_change(self) -> None:
+        """Simulate an audio-device hotplug (test hook)."""
+        for cb in self.device_change_callbacks:
+            cb()
+
+    def receive_network_down(self) -> None:
+        """Simulate a network / transport drop (test hook)."""
+        self._fire("network_down")
+
+    def recover(self) -> None:
+        # Scripted fake records the recovery attempt; no real transport to fix.
+        self.recovered.append("recovered")
 
 
 class SipCoreService:
@@ -162,6 +189,28 @@ class SipCoreService:
         """
         self._backend.reroute()
 
+    def reroute_if_connected(self) -> None:
+        """Re-route only when a call is actually active.
+
+        Used on device hotplug: re-enumerating devices must not touch a call
+        that isn't connected, and must re-wire the bridge when one is.
+        """
+        if self._state is CallState.CONNECTED:
+            self._backend.reroute()
+
+    def set_device_change_callback(self, cb: Callable[[], None]) -> None:
+        """Register the callback the backend fires on audio-device hotplug."""
+        self._backend.set_device_change_callback(cb)
+
+    def recover(self) -> None:
+        """Recover from a network / transport drop without manual intervention.
+
+        Asks the backend to restore its path and re-announces that the service
+        is up so the UI/logger reflect the recovered state.
+        """
+        self._backend.recover()
+        self._emit(EVENT_SIP_STARTED)
+
     def _dispatch(self, name: str, data: dict) -> None:
         if name == "register":
             self._contact = str(data["contact"])
@@ -177,5 +226,7 @@ class SipCoreService:
             self._state = CallState.ENDED
             self._emit(EVENT_CALL_ENDED, call_id=str(data.get("call_id", "")))
             self._state = CallState.IDLE
+        elif name == "network_down":
+            self.recover()
         elif name == "media_error":
             self._emit(EVENT_MEDIA_ERROR, message=str(data.get("message", "")))
