@@ -60,14 +60,16 @@ from teleflow.sip import (
     EVENT_CALL_CONNECTED,
     EVENT_CALL_ENDED,
     EVENT_CALL_INCOMING,
-    EVENT_GATEWAY_REGISTERED,
     EVENT_REPORT_COMPLETED,
     EVENT_REPORT_CONNECTED,
     EVENT_REPORT_FAILED,
     EVENT_REPORT_PLAYING,
     EVENT_REPORT_STARTED,
+    EVENT_SIP_REGISTERED,
+    EVENT_SIP_REGISTER_FAILED,
     EVENT_SIP_STARTED,
     EVENT_SIP_STOPPED,
+    EVENT_SIP_UNREGISTERED,
     FakeSipBackend,
     ReportState,
     SipBackend,
@@ -133,7 +135,6 @@ class DashboardWidget(QWidget):
         self._manager = manager
         self._sip_running = False
         self._call_state: CallState = CallState.IDLE
-        self._gateway = "未注册"
         self._mode = "生产模式"
 
         layout = QVBoxLayout(self)
@@ -149,11 +150,11 @@ class DashboardWidget(QWidget):
         stat_row = QHBoxLayout()
         stat_row.setSpacing(8)
         self._sip_stat = self._build_stat_group("SIP 服务", "未启动")
-        self._gw_stat = self._build_stat_group("网关注册", "未注册")
+        self._reg_stat = self._build_stat_group("SIP 注册", "未注册")
         self._mode_stat = self._build_stat_group("当前模式", "生产模式")
         self._call_stat = self._build_stat_group("通话状态", "空闲")
         stat_row.addWidget(self._sip_stat)
-        stat_row.addWidget(self._gw_stat)
+        stat_row.addWidget(self._reg_stat)
         stat_row.addWidget(self._mode_stat)
         stat_row.addWidget(self._call_stat)
         layout.addLayout(stat_row)
@@ -327,6 +328,10 @@ class DashboardWidget(QWidget):
         self._sip_running = running
         self._update_sip_stat()
 
+    def set_sip_registration(self, text: str) -> None:
+        """Update the SIP 注册 status card (e.g. 未注册 / 已注册 / 注册失败)."""
+        self._set_stat_value(self._reg_stat, text)
+
     def set_call_state(self, state: CallState) -> None:
         self._call_state = state
         text = {
@@ -353,10 +358,6 @@ class DashboardWidget(QWidget):
     def _fire_test_report(self) -> None:
         if self._test_report_cb is not None:
             self._test_report_cb()
-
-    def set_registration(self, text: str) -> None:
-        self._gateway = text
-        self._set_stat_value(self._gw_stat, text)
 
     def set_mode(self, mode: str) -> None:
         self._mode = mode
@@ -404,53 +405,29 @@ class SettingsDialog(QDialog):
         sl = QVBoxLayout(sip_page)
         sl.setContentsMargins(12, 12, 12, 12)
         sl.setSpacing(8)
-        sl.addWidget(QLabel("SIP 监听端口（默认 5060）:"))
+        sl.addWidget(QLabel("SIP 本地端口（客户端传输，默认 5060）:"))
         self.port = QSpinBox()
         self.port.setRange(1, 65535)
         sl.addWidget(self.port)
         sl.addStretch()
 
-        # --- Page: 网关与账号 ---
-        gw_page = QWidget()
-        gl = QVBoxLayout(gw_page)
-        gl.setContentsMargins(12, 12, 12, 12)
-        gl.setSpacing(8)
-        gw_row = QHBoxLayout()
-        gw_row.setSpacing(12)
-        gw_port_col = QVBoxLayout()
-        gw_port_col.setSpacing(4)
-        gw_port_col.addWidget(QLabel("网关端口:"))
-        self.gw_port = QSpinBox()
-        self.gw_port.setRange(1, 65535)
-        gw_port_col.addWidget(self.gw_port)
-        gw_pw_col = QVBoxLayout()
-        gw_pw_col.setSpacing(4)
-        gw_pw_col.addWidget(QLabel("网关密码:"))
-        self.gw_password = QLineEdit()
-        self.gw_password.setEchoMode(QLineEdit.EchoMode.Password)
-        self.gw_password.setPlaceholderText("网关注册密码")
-        gw_pw_col.addWidget(self.gw_password)
-        gw_row.addLayout(gw_port_col)
-        gw_row.addLayout(gw_pw_col)
-        gl.addLayout(gw_row)
-        gl.addWidget(QLabel("SIP 号码:"))
-        self.sip_number = QLineEdit()
-        self.sip_number.setPlaceholderText("例如 1001")
-        gl.addWidget(self.sip_number)
-        gl.addWidget(QLabel("账号（分机号 / 名称）:"))
-        acct_row = QHBoxLayout()
-        self.acct_input = QLineEdit()
-        self.acct_input.setPlaceholderText("例如 1001")
-        self.add_acct_btn = QPushButton("添加")
-        self.add_acct_btn.clicked.connect(self._add_account)
-        acct_row.addWidget(self.acct_input)
-        acct_row.addWidget(self.add_acct_btn)
-        gl.addLayout(acct_row)
-        self._acct_label = QLabel("尚未添加账号")
-        self._acct_label.setStyleSheet("color: gray;")
-        gl.addWidget(self._acct_label)
-        self._accounts: list[str] = []
-        gl.addStretch()
+        # --- Page: SIP 账号 (客户端注册到外部服务器) ---
+        acct_page = QWidget()
+        al = QVBoxLayout(acct_page)
+        al.setContentsMargins(12, 12, 12, 12)
+        al.setSpacing(8)
+        al.addWidget(QLabel("SIP 服务器（注册地址，例如 sip:provider.example.com:5060，留空则不注册）:"))
+        self.sip_server = QLineEdit()
+        self.sip_server.setPlaceholderText("sip:provider.example.com:5060")
+        al.addWidget(self.sip_server)
+        al.addWidget(QLabel("SIP 账号（认证用户名 / AOR，例如 2001）:"))
+        self.sip_user = QLineEdit()
+        al.addWidget(self.sip_user)
+        al.addWidget(QLabel("SIP 密码:"))
+        self.sip_password = QLineEdit()
+        self.sip_password.setEchoMode(QLineEdit.EchoMode.Password)
+        al.addWidget(self.sip_password)
+        al.addStretch()
 
         # --- Page: 钩子命令 ---
         hook_page = QWidget()
@@ -523,7 +500,7 @@ class SettingsDialog(QDialog):
 
         for title, page in [
             ("SIP 服务", sip_page),
-            ("网关与账号", gw_page),
+            ("SIP 账号", acct_page),
             ("钩子命令", hook_page),
             ("电话汇报 (RPC)", report_page),
             ("日志与启动", log_page),
@@ -556,12 +533,9 @@ class SettingsDialog(QDialog):
 
     def _load_settings(self) -> None:
         settings = self._store.load()
-        self.port.setValue(settings.sip_port)
-        self.gw_port.setValue(settings.gateway_port)
-        self.gw_password.setText(settings.gateway_password)
-        self.sip_number.setText(settings.sip_number)
-        self._accounts = list(settings.accounts)
-        self._render_accounts()
+        self.sip_server.setText(settings.sip_server)
+        self.sip_user.setText(settings.sip_user)
+        self.sip_password.setText(settings.sip_password)
         self.off_hook_cmd.setText(settings.off_hook_cmd)
         self.on_hook_cmd.setText(settings.on_hook_cmd)
         self.rpc_enabled.setChecked(settings.rpc_enabled)
@@ -577,11 +551,9 @@ class SettingsDialog(QDialog):
 
     def _save_and_close(self) -> None:
         settings = self._store.load()
-        settings.sip_port = self.port.value()
-        settings.gateway_port = self.gw_port.value()
-        settings.gateway_password = self.gw_password.text()
-        settings.sip_number = self.sip_number.text()
-        settings.accounts = list(self._accounts)
+        settings.sip_server = self.sip_server.text().strip()
+        settings.sip_user = self.sip_user.text().strip()
+        settings.sip_password = self.sip_password.text()
         settings.off_hook_cmd = self.off_hook_cmd.text().strip()
         settings.on_hook_cmd = self.on_hook_cmd.text().strip()
         settings.rpc_enabled = self.rpc_enabled.isChecked()
@@ -603,18 +575,6 @@ class SettingsDialog(QDialog):
 
         self.rpc_token.setText(secrets.token_hex(16))
 
-    def _render_accounts(self) -> None:
-        self._acct_label.setText(
-            "、".join(self._accounts) if self._accounts else "尚未添加账号"
-        )
-
-    def _add_account(self) -> None:
-        text = self.acct_input.text().strip()
-        if not text:
-            return
-        self._accounts.append(text)
-        self._render_accounts()
-        self.acct_input.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -709,8 +669,18 @@ class MainWindow(QMainWindow):
         svc.on(EVENT_SIP_STARTED, lambda: self._sync_sip_button())
         svc.on(EVENT_SIP_STOPPED, lambda: self._sync_sip_button())
         svc.on(
-            EVENT_GATEWAY_REGISTERED,
-            lambda contact: self.dashboard.set_registration(contact),
+            EVENT_SIP_REGISTERED,
+            lambda contact: self.dashboard.set_sip_registration("已注册"),
+        )
+        svc.on(
+            EVENT_SIP_UNREGISTERED,
+            lambda: self.dashboard.set_sip_registration("未注册"),
+        )
+        svc.on(
+            EVENT_SIP_REGISTER_FAILED,
+            lambda code, reason: self.dashboard.set_sip_registration(
+                f"注册失败 ({code})" if code else "注册失败"
+            ),
         )
         svc.on(
             EVENT_CALL_INCOMING,
@@ -758,6 +728,8 @@ class MainWindow(QMainWindow):
         running = self._service.running
         label = "停止 SIP 服务" if running else "启动 SIP 服务"
         self.dashboard.set_sip_running(running)
+        if not running:
+            self.dashboard.set_sip_registration("未注册")
         tray_sip = self._tray_sip
         if tray_sip is not None:
             tray_sip.setText(label)

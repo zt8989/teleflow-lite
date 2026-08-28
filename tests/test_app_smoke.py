@@ -9,13 +9,16 @@ the SIP-status wiring against the fake backends.
 import pytest
 
 try:
-    from PyQt6.QtWidgets import QApplication  # noqa: F401
+    from PyQt6.QtWidgets import QApplication, QLabel  # noqa: F401
 
-    from teleflow.app import MainWindow
+    from teleflow.app import MainWindow, SettingsDialog
     from teleflow.audio import AudioDeviceManager, FakeAudioBackend
     from teleflow.config import ConfigStore
     from teleflow.logging import EventLogger, LogLevel, attach
-    from teleflow.sip import FakeSipBackend, SipCoreService
+    from teleflow.sip import (
+        FakeSipBackend,
+        SipCoreService,
+    )
 
     _HAVE_GUI = True
 except Exception:  # pragma: no cover - environment dependent
@@ -72,9 +75,6 @@ def test_status_panel_reflects_sip_events(tmp_path) -> None:
     dash = window.dashboard
 
     service.start()
-    sip.receive_register("sip:ata@192.168.1.50:5060")
-    assert dash._gateway == "sip:ata@192.168.1.50:5060"
-
     sip.receive_invite("call-1")
     assert dash._call_state.value == "connected"
 
@@ -97,7 +97,7 @@ def test_sip_events_appear_in_log_view(tmp_path) -> None:
 
     service.start()
     service._backend.receive_register("sip:ata@192.168.1.50:5060")
-    assert "gateway registered" in window.dashboard._log_view.toPlainText()
+    assert "SIP registered" in window.dashboard._log_view.toPlainText()
     window.close()
 
 
@@ -132,4 +132,36 @@ def test_start_minimized_hides_window(tmp_path) -> None:
     if store.load().start_minimized:
         window.hide()
     assert window.isHidden() is True
+    window.close()
+
+
+def test_sip_registration_updates_dashboard_card(tmp_path) -> None:
+    app, window, service, _ = _make_window(tmp_path)
+    dash = window.dashboard
+    sip = service._backend
+    service.start()
+
+    sip.receive_register("sip:2001@provider.example.com")
+    assert "已注册" in dash._reg_stat.findChild(QLabel, "stat_value").text()
+
+    sip.receive_unregister()
+    assert "未注册" in dash._reg_stat.findChild(QLabel, "stat_value").text()
+
+    sip.receive_register_failed(code=403, reason="Forbidden")
+    assert "注册失败" in dash._reg_stat.findChild(QLabel, "stat_value").text()
+    window.close()
+
+
+def test_settings_dialog_round_trips_sip_account(tmp_path) -> None:
+    app, window, service, manager = _make_window(tmp_path)
+    dialog = SettingsDialog(manager, window)
+    dialog.sip_server.setText("sip:provider.example.com:5060")
+    dialog.sip_user.setText("2001")
+    dialog.sip_password.setText("secret")
+    dialog._save_and_close()
+
+    reloaded = ConfigStore(tmp_path / "config.json").load()
+    assert reloaded.sip_server == "sip:provider.example.com:5060"
+    assert reloaded.sip_user == "2001"
+    assert reloaded.sip_password == "secret"
     window.close()

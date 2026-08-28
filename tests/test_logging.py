@@ -52,7 +52,7 @@ def test_sip_and_device_events_are_logged(tmp_path: Path) -> None:
     manager.set_selection("vb-cable", "blackhole")
 
     joined = "\n".join(sink)
-    assert "gateway registered" in joined
+    assert "SIP registered" in joined
     assert "incoming call" in joined
     assert "enumerated" in joined
     assert "device selected" in joined

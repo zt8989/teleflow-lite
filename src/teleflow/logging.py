@@ -24,10 +24,12 @@ from teleflow.sip import (
     EVENT_CALL_CONNECTED,
     EVENT_CALL_ENDED,
     EVENT_CALL_INCOMING,
-    EVENT_GATEWAY_REGISTERED,
     EVENT_MEDIA_ERROR,
+    EVENT_SIP_REGISTERED,
+    EVENT_SIP_REGISTER_FAILED,
     EVENT_SIP_STARTED,
     EVENT_SIP_STOPPED,
+    EVENT_SIP_UNREGISTERED,
     SipCoreService,
 )
 
@@ -139,8 +141,16 @@ def attach(logger: EventLogger, service: SipCoreService, manager: AudioDeviceMan
     service.on(EVENT_SIP_STARTED, lambda: logger.info("SIP", "service started"))
     service.on(EVENT_SIP_STOPPED, lambda: logger.info("SIP", "service stopped"))
     service.on(
-        EVENT_GATEWAY_REGISTERED,
-        lambda contact: logger.info("SIP", f"gateway registered: {contact}"),
+        EVENT_SIP_REGISTERED,
+        lambda contact: logger.info("SIP", f"SIP registered: {contact}"),
+    )
+    service.on(
+        EVENT_SIP_UNREGISTERED,
+        lambda: logger.info("SIP", "SIP unregistered"),
+    )
+    service.on(
+        EVENT_SIP_REGISTER_FAILED,
+        lambda code, reason: logger.info("SIP", f"SIP registration failed: {code} {reason}"),
     )
     service.on(EVENT_CALL_INCOMING, lambda call_id: logger.info("CALL", f"incoming call: {call_id}"))
     service.on(EVENT_CALL_CONNECTED, lambda call_id: logger.info("CALL", f"call connected: {call_id}"))
