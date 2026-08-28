@@ -93,14 +93,17 @@ def _load_icon() -> QIcon:
 
 
 def _load_tray_icon() -> QIcon:
-    """Load the TeleFlow monochrome SVG icon (for system tray).
+    """Load the TeleFlow tray icon.
 
-    On macOS, setting the icon as a mask makes it a template image that
-    automatically adapts to light/dark menu bar appearance.
+    Only macOS uses the monochrome SVG, set as a mask so it becomes a template
+    image that adapts to light/dark menu bar appearance. Every other platform
+    uses the colored icon.
     """
-    icon = _load_svg("teleflow-icon-mono.svg")
-    icon.setIsMask(True)
-    return icon
+    if sys.platform == "darwin":
+        icon = _load_svg("teleflow-icon-mono.svg")
+        icon.setIsMask(True)
+        return icon
+    return _load_icon()
 
 
 def _load_svg(name: str) -> QIcon:
@@ -647,6 +650,17 @@ class MainWindow(QMainWindow):
 
     def quit_app(self) -> None:
         self._force_quit = True
+        # Tear down before leaving the event loop: quitting with a live pjsua2
+        # stack and/or the tray menu still open has crashed Qt6Gui.dll on this
+        # Windows build (access violation, exit code 0xC0000005).
+        if self._service.running:
+            self._service.stop()
+        tray = self._tray
+        if tray is not None:
+            menu = tray.contextMenu()
+            if menu is not None and menu.isVisible():
+                menu.close()
+        QApplication.processEvents()
         QApplication.quit()
 
     def _open_settings(self) -> None:
