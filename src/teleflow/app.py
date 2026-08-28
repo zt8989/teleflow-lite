@@ -49,6 +49,7 @@ from teleflow.audio import (
 from teleflow.autostart import set_autostart
 from teleflow.config import ConfigStore, Settings
 from teleflow.logging import EventLogger, LogLevel, attach
+from teleflow.hooks import SubprocessHookRunner, attach_hooks
 from teleflow.pjsua2_backend import Pjsua2Backend
 from teleflow.sip import (
     CallState,
@@ -390,6 +391,17 @@ class SettingsDialog(QDialog):
         layout.addWidget(self._acct_label)
         self._accounts: list[str] = []
 
+        # Hook commands: executed at call-lifecycle moments, with {call_id}
+        # substituted by the incoming call id.
+        layout.addWidget(QLabel("摘机命令（自动接通时执行，可用 {call_id} 表示来电 ID）:"))
+        self.off_hook_cmd = QLineEdit()
+        self.off_hook_cmd.setPlaceholderText("例如 /usr/local/bin/on-answer.sh {call_id}")
+        layout.addWidget(self.off_hook_cmd)
+        layout.addWidget(QLabel("挂机命令（通话结束时执行，可用 {call_id} 表示来电 ID）:"))
+        self.on_hook_cmd = QLineEdit()
+        self.on_hook_cmd.setPlaceholderText("例如 /usr/local/bin/on-hangup.sh {call_id}")
+        layout.addWidget(self.on_hook_cmd)
+
         # Log level, autostart, start-minimized
         fl = QFormLayout()
         self.log_level = QComboBox()
@@ -422,6 +434,8 @@ class SettingsDialog(QDialog):
         self.sip_number.setText(settings.sip_number)
         self._accounts = list(settings.accounts)
         self._render_accounts()
+        self.off_hook_cmd.setText(settings.off_hook_cmd)
+        self.on_hook_cmd.setText(settings.on_hook_cmd)
         self.log_level.setCurrentText(settings.log_level)
         self.autostart.setChecked(settings.autostart)
         self.start_minimized.setChecked(settings.start_minimized)
@@ -433,6 +447,8 @@ class SettingsDialog(QDialog):
         settings.gateway_password = self.gw_password.text()
         settings.sip_number = self.sip_number.text()
         settings.accounts = list(self._accounts)
+        settings.off_hook_cmd = self.off_hook_cmd.text().strip()
+        settings.on_hook_cmd = self.on_hook_cmd.text().strip()
         settings.log_level = self.log_level.currentText()
         settings.autostart = self.autostart.isChecked()
         settings.start_minimized = self.start_minimized.isChecked()
@@ -624,6 +640,12 @@ def build_app(
         service.reroute_if_connected()
 
     service.set_device_change_callback(_on_audio_devices_changed)
+
+    # Hook commands: run the user-configured 摘机 command when the current SIP
+    # auto-answers an incoming call. Non-blocking; failures are logged, never
+    # raised into the call path.
+    hook_runner = SubprocessHookRunner(store, log=window.append_log_line)
+    attach_hooks(service, hook_runner, store)
 
     if settings.autostart:
         set_autostart(True)
