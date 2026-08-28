@@ -14,6 +14,7 @@ try:
     from teleflow.app import MainWindow
     from teleflow.audio import AudioDeviceManager, FakeAudioBackend
     from teleflow.config import ConfigStore
+    from teleflow.logging import EventLogger, LogLevel, attach
     from teleflow.sip import FakeSipBackend, SipCoreService
 
     _HAVE_GUI = True
@@ -21,6 +22,20 @@ except Exception:  # pragma: no cover - environment dependent
     _HAVE_GUI = False
 
 pytestmark = pytest.mark.skipif(not _HAVE_GUI, reason="PyQt6 not available")
+
+
+class _CloseEvent:
+    """Minimal stand-in for a Qt closeEvent carrying ignore()/accept()."""
+
+    def __init__(self) -> None:
+        self.ignored = False
+        self.accepted = False
+
+    def ignore(self) -> None:
+        self.ignored = True
+
+    def accept(self) -> None:
+        self.accepted = True
 
 
 def _make_window(tmp_path):
@@ -64,4 +79,56 @@ def test_status_panel_reflects_sip_events(tmp_path) -> None:
 
     sip.receive_bye("call-1")
     assert window.status_panel.call_state.text() == "空闲"
+    window.close()
+
+
+def test_log_view_tab_exists_and_appends(tmp_path) -> None:
+    app, window, _ = _make_window(tmp_path)
+    window.append_log_line("[INFO] hello")
+    assert "[INFO] hello" in window.log_view.toPlainText()
+    window.close()
+
+
+def test_sip_events_appear_in_log_view(tmp_path) -> None:
+    app, window, service = _make_window(tmp_path)
+    logger = EventLogger(level=LogLevel.INFO, sink=window.append_log_line)
+    attach(logger, service, window.settings_page._manager)
+
+    service.start()
+    service._backend.receive_register("sip:ata@192.168.1.50:5060")
+    assert "gateway registered" in window.log_view.toPlainText()
+    window.close()
+
+
+def test_close_to_tray_hides_window(tmp_path) -> None:
+    app, window, _ = _make_window(tmp_path)
+    window._tray = object()  # pretend a real tray is present
+    event = _CloseEvent()
+    window.closeEvent(event)
+    assert event.ignored is True
+    assert window.isHidden() is True
+    window.close()
+
+
+def test_close_without_tray_quits(tmp_path) -> None:
+    app, window, _ = _make_window(tmp_path)
+    window._tray = None
+    event = _CloseEvent()
+    window.closeEvent(event)
+    assert event.accepted is True
+    window.close()
+
+
+def test_start_minimized_hides_window(tmp_path) -> None:
+    app = QApplication.instance() or QApplication([])
+    store = ConfigStore(tmp_path / "config.json")
+    settings = store.load()
+    settings.start_minimized = True
+    store.save(settings)
+    manager = AudioDeviceManager(FakeAudioBackend(), store)
+    service = SipCoreService(FakeSipBackend(), store)
+    window = MainWindow(manager, service)
+    if store.load().start_minimized:
+        window.hide()
+    assert window.isHidden() is True
     window.close()

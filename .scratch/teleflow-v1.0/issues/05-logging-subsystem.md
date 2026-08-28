@@ -4,9 +4,9 @@
 
 **Blocked by:** 02 — Audio Device Manager & device selection; 03 — SIP Core Service.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Registration, call, answer, hang-up, and media-error events appear in the live log window in real time.
-- [ ] Device enumeration and device-switch events are logged.
-- [ ] Logs are persisted to a local file and survive app restart.
-- [ ] Log verbosity follows the configured log level.
+- [x] Registration, call, answer, hang-up, and media-error events appear in the live log window in real time.
+- [x] Device enumeration and device-switch events are logged.
+- [x] Logs are persisted to a local file and survive app restart.
+- [x] Log verbosity follows the configured log level (applied at launch and on runtime change in the settings UI).

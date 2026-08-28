@@ -11,21 +11,28 @@ from __future__ import annotations
 import warnings
 from pathlib import Path
 
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QAction, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QFormLayout,
     QLabel,
-    QPushButton,
     QMainWindow,
+    QMenu,
+    QPlainTextEdit,
+    QPushButton,
     QSpinBox,
+    QSystemTrayIcon,
     QTabWidget,
     QWidget,
 )
 
 from teleflow.audio import AudioBackend, AudioDeviceManager, FakeAudioBackend, PortAudioBackend
+from teleflow.autostart import set_autostart
 from teleflow.config import ConfigStore, Settings
+from teleflow.logging import EventLogger, LogLevel, attach
 from teleflow.sip import (
     CallState,
     EVENT_CALL_CONNECTED,
@@ -182,17 +189,64 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self._manager = manager
         self._service = service
+        self._force_quit = False
+        self._tray: QSystemTrayIcon | None = None
+        self._tray_sip: QAction | None = None
         self.setWindowTitle("TeleFlow — 座机声音流转助手")
         self.resize(460, 400)
 
         tabs = QTabWidget(self)
         self.status_panel = StatusPanel()
         self.settings_page = SettingsPage(manager)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(2000)
         tabs.addTab(self.status_panel, "状态")
         tabs.addTab(self.settings_page, "设置")
+        tabs.addTab(self.log_view, "日志")
         self.setCentralWidget(tabs)
 
+        self._setup_tray()
         self._wire_service()
+
+    def append_log_line(self, line: str) -> None:
+        self.log_view.appendPlainText(line)
+
+    def _setup_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray = None
+            return
+        self._tray = QSystemTrayIcon(self)
+        icon_pix = QPixmap(16, 16)
+        icon_pix.fill(Qt.GlobalColor.darkGreen)
+        self._tray.setIcon(QIcon(icon_pix))
+        menu = QMenu()
+        sip_action = menu.addAction("启动 SIP 服务")
+        assert sip_action is not None
+        sip_action.triggered.connect(self._toggle_sip)
+        show_action = menu.addAction("显示窗口")
+        assert show_action is not None
+        show_action.triggered.connect(self.show_window)
+        quit_action = menu.addAction("退出程序")
+        assert quit_action is not None
+        quit_action.triggered.connect(self.quit_app)
+        self._tray_sip = sip_action
+        self._tray.setContextMenu(menu)
+        self._tray.activated.connect(
+            lambda reason: self.show_window()
+            if reason == QSystemTrayIcon.ActivationReason.DoubleClick
+            else None
+        )
+        self._tray.show()
+
+    def show_window(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self) -> None:
+        self._force_quit = True
+        QApplication.quit()
 
     def _wire_service(self) -> None:
         svc = self._service
@@ -213,14 +267,21 @@ class MainWindow(QMainWindow):
         self._sync_sip_button()
 
     def _sync_sip_button(self) -> None:
-        self.status_panel.start_btn.setText(
-            "停止 SIP 服务" if self._service.running else "启动 SIP 服务"
-        )
+        label = "停止 SIP 服务" if self._service.running else "启动 SIP 服务"
+        self.status_panel.start_btn.setText(label)
         self.status_panel.set_sip_status("运行中" if self._service.running else "未启动")
+        tray_sip = self._tray_sip
+        if tray_sip is not None:
+            tray_sip.setText(label)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self._tray is not None and not self._force_quit:
+            self.settings_page.save()
+            event.ignore()
+            self.hide()
+            return
         self.settings_page.save()
-        super().closeEvent(event)
+        event.accept()
 
 
 def _default_audio_backend() -> AudioBackend:
@@ -248,12 +309,29 @@ def build_app(
 ) -> QApplication:
     app = QApplication([])
     store = ConfigStore(config_path)
+    settings = store.load()
     audio_backend = audio_backend or _default_audio_backend()
     sip_backend = sip_backend or _default_sip_backend()
     manager = AudioDeviceManager(audio_backend, store)
     service = SipCoreService(sip_backend, store)
     window = MainWindow(manager, service)
-    window.show()
+
+    logger = EventLogger(level=LogLevel[settings.log_level], sink=window.append_log_line)
+    attach(logger, service, manager)
+    window.settings_page.log_level.currentTextChanged.connect(
+        lambda level: logger.set_level(LogLevel[level])
+    )
+
+    if settings.autostart:
+        set_autostart(True)
+    else:
+        set_autostart(False)
+
+    if settings.start_minimized:
+        window.hide()
+    else:
+        window.show()
+
     return app
 
 
