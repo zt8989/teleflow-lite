@@ -35,9 +35,37 @@ def test_round_trip_preserves_all_fields(tmp_path: Path) -> None:
         autostart=True,
         start_minimized=True,
         log_level="DEBUG",
+        gateway_port=5071,
+        gateway_password="secret",
+        sip_number="2002",
+        accounts=["1001", "1002"],
     )
     store.save(original)
     assert store.load() == original
+
+
+def test_gateway_fields_default_on_fresh_file(tmp_path: Path) -> None:
+    store = ConfigStore(tmp_path / "config.json")
+    settings = store.load()
+    assert settings.gateway_port == 5060
+    assert settings.gateway_password == ""
+    assert settings.sip_number == "1001"
+    assert settings.accounts == []
+
+
+def test_old_file_without_new_fields_uses_defaults(tmp_path: Path) -> None:
+    """A config file written by an older version (no gateway/accounts keys)
+    must still load without error, falling back to the new defaults."""
+    store = ConfigStore(tmp_path / "config.json")
+    store.path.write_text(
+        '{"sip_port": 5090, "playback_device_id": "x"}', encoding="utf-8"
+    )
+    loaded = store.load()
+    assert loaded.sip_port == 5090
+    assert loaded.playback_device_id == "x"
+    assert loaded.gateway_port == 5060
+    assert loaded.accounts == []
+    assert loaded.sip_number == "1001"
 
 
 def test_partial_file_merges_with_defaults(tmp_path: Path) -> None:
