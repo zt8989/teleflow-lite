@@ -1,8 +1,8 @@
-"""PyQt6 application shell for TeleFlow (tickets 01–02).
+"""PyQt6 application shell for TeleFlow (tickets 01–03).
 
 Owns only the UI surface: a status panel and a settings page, wired to the
-Config Store and the Audio Device Manager. No SIP or audio I/O happens here —
-those arrive in later tickets. The Config Store and Audio Device Manager are
+Config Store, the Audio Device Manager, and the SIP Core Service. No SIP or
+audio I/O happens here — those arrive in later tickets. All collaborators are
 injected, so the window is testable without a display, real hardware, or pjsua2.
 """
 
@@ -26,11 +26,21 @@ from PyQt6.QtWidgets import (
 
 from teleflow.audio import AudioBackend, AudioDeviceManager, FakeAudioBackend, PortAudioBackend
 from teleflow.config import ConfigStore, Settings
+from teleflow.sip import (
+    CallState,
+    EVENT_CALL_CONNECTED,
+    EVENT_CALL_ENDED,
+    EVENT_CALL_INCOMING,
+    EVENT_GATEWAY_REGISTERED,
+    EVENT_SIP_STARTED,
+    EVENT_SIP_STOPPED,
+    FakeSipBackend,
+    SipCoreService,
+)
 
 
 class StatusPanel(QWidget):
-    """Read-only view of live SIP / device / call state (placeholder until
-    ticket 03+ feeds it real events)."""
+    """Live view of SIP service, gateway registration, and call state."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -40,11 +50,23 @@ class StatusPanel(QWidget):
         self.call_state = QLabel("空闲")
         self.playback = QLabel("—")
         self.capture = QLabel("—")
+        self.start_btn = QPushButton("启动 SIP 服务")
+
         layout.addRow("SIP 服务", self.sip_status)
         layout.addRow("ATA 注册", self.registration)
         layout.addRow("通话状态", self.call_state)
         layout.addRow("播放设备", self.playback)
         layout.addRow("采集设备", self.capture)
+        layout.addRow(self.start_btn)
+
+    def set_sip_status(self, text: str) -> None:
+        self.sip_status.setText(text)
+
+    def set_registration(self, text: str) -> None:
+        self.registration.setText(text)
+
+    def set_call_state(self, text: str) -> None:
+        self.call_state.setText(text)
 
 
 class SettingsPage(QWidget):
@@ -151,11 +173,17 @@ class SettingsPage(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, manager: AudioDeviceManager, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        manager: AudioDeviceManager,
+        service: SipCoreService,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._manager = manager
+        self._service = service
         self.setWindowTitle("TeleFlow — 座机声音流转助手")
-        self.resize(460, 380)
+        self.resize(460, 400)
 
         tabs = QTabWidget(self)
         self.status_panel = StatusPanel()
@@ -164,12 +192,38 @@ class MainWindow(QMainWindow):
         tabs.addTab(self.settings_page, "设置")
         self.setCentralWidget(tabs)
 
+        self._wire_service()
+
+    def _wire_service(self) -> None:
+        svc = self._service
+        svc.on(EVENT_SIP_STARTED, lambda: self._sync_sip_button())
+        svc.on(EVENT_SIP_STOPPED, lambda: self._sync_sip_button())
+        svc.on(EVENT_GATEWAY_REGISTERED, lambda contact: self.status_panel.set_registration(contact))
+        svc.on(EVENT_CALL_INCOMING, lambda call_id: self.status_panel.set_call_state("呼入"))
+        svc.on(EVENT_CALL_CONNECTED, lambda call_id: self.status_panel.set_call_state("通话中"))
+        svc.on(EVENT_CALL_ENDED, lambda call_id: self.status_panel.set_call_state("空闲"))
+        self.status_panel.start_btn.clicked.connect(self._toggle_sip)
+        self._sync_sip_button()
+
+    def _toggle_sip(self) -> None:
+        if self._service.running:
+            self._service.stop()
+        else:
+            self._service.start()
+        self._sync_sip_button()
+
+    def _sync_sip_button(self) -> None:
+        self.status_panel.start_btn.setText(
+            "停止 SIP 服务" if self._service.running else "启动 SIP 服务"
+        )
+        self.status_panel.set_sip_status("运行中" if self._service.running else "未启动")
+
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         self.settings_page.save()
         super().closeEvent(event)
 
 
-def _default_backend() -> AudioBackend:
+def _default_audio_backend() -> AudioBackend:
     try:
         return PortAudioBackend()
     except RuntimeError:
@@ -180,15 +234,25 @@ def _default_backend() -> AudioBackend:
         return FakeAudioBackend()
 
 
+def _default_sip_backend() -> FakeSipBackend:
+    # The real pjsua2 transport is a pending native dependency (the pjsua2 sdist
+    # fails to build in this environment). Until it lands, drive the service with
+    # the scripted fake backend so the app is runnable and testable headless.
+    return FakeSipBackend()
+
+
 def build_app(
     config_path: Path | None = None,
-    backend: AudioBackend | None = None,
+    audio_backend: AudioBackend | None = None,
+    sip_backend: FakeSipBackend | None = None,
 ) -> QApplication:
     app = QApplication([])
     store = ConfigStore(config_path)
-    backend = backend or _default_backend()
-    manager = AudioDeviceManager(backend, store)
-    window = MainWindow(manager)
+    audio_backend = audio_backend or _default_audio_backend()
+    sip_backend = sip_backend or _default_sip_backend()
+    manager = AudioDeviceManager(audio_backend, store)
+    service = SipCoreService(sip_backend, store)
+    window = MainWindow(manager, service)
     window.show()
     return app
 
