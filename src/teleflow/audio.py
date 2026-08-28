@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
 
 from teleflow.config import ConfigStore, Settings
 
@@ -107,6 +107,11 @@ class PortAudioBackend:
         return devices
 
 
+# Domain events emitted by the device manager (mirrors teleflow.sip EVENT_*).
+EVENT_DEVICES_ENUMERATED = "devices_enumerated"
+EVENT_DEVICE_SELECTED = "device_selected"
+EVENT_PRESET_APPLIED = "preset_applied"
+
 # TeleFlow hard rule: an empty / "-1" / -1 device id is never valid.
 _INVALID_IDS = {"", "-1", -1, None}
 
@@ -122,11 +127,20 @@ class AudioDeviceManager:
     def __init__(self, backend: AudioBackend, store: ConfigStore) -> None:
         self._backend = backend
         self.store = store
+        self._subscribers: dict[str, list[Callable[..., None]]] = {}
         self._devices: list[AudioDevice] = []
         self.refresh()
 
+    def on(self, event: str, callback: Callable[..., None]) -> None:
+        self._subscribers.setdefault(event, []).append(callback)
+
+    def _emit(self, event: str, *args: object) -> None:
+        for callback in self._subscribers.get(event, []):
+            callback(*args)
+
     def refresh(self) -> None:
         self._devices = self._backend.enumerate()
+        self._emit(EVENT_DEVICES_ENUMERATED, len(self._devices))
 
     @property
     def devices(self) -> list[AudioDevice]:
@@ -149,6 +163,7 @@ class AudioDeviceManager:
         settings.playback_device_id = str(playback_id)
         settings.capture_device_id = str(capture_id)
         self.store.save(settings)
+        self._emit(EVENT_DEVICE_SELECTED, settings.playback_device_id, settings.capture_device_id)
 
     def apply_preset(self, preset: str) -> tuple[str, str]:
         if preset not in ("debug", "production"):
@@ -163,4 +178,5 @@ class AudioDeviceManager:
         if playback is None or capture is None:
             raise ValueError(f"no {kind.value} device available for preset {preset!r}")
         self.set_selection(playback.id, capture.id)
+        self._emit(EVENT_PRESET_APPLIED, preset)
         return (playback.id, capture.id)
