@@ -1,9 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="TeleFlow">
-  <!-- rounded app tile: white background -->
-  <rect x="2" y="2" width="60" height="60" rx="14" fill="#ffffff" stroke="#e0e0e0" stroke-width="2"/>
-  <!-- telephone handset: rotated 180°, centered, enlarged -->
+  <!-- telephone handset: monochrome, no background, for tray icon -->
   <g transform="translate(32, 32) rotate(180) translate(-32, -32)">
-    <path transform="translate(3.2, 3.2) scale(2.4)" fill="#e53935"
+    <path transform="translate(3.2, 3.2) scale(2.4)" fill="#000000"
       d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z"/>
   </g>
 </svg>

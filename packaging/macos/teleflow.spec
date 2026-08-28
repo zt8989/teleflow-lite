@@ -21,11 +21,16 @@ SRC = os.path.join(_REPO, "src")
 
 block_cipher = None
 
+ICON = os.path.join(_HERE, "TeleFlow.icns")
+
 a = Analysis(
     [ENTRY],
     pathex=[SRC],
     binaries=[],
-    datas=[],
+    datas=[
+        (os.path.join(_REPO, "prototypes", "teleflow-icon.svg"), "prototypes"),
+        (os.path.join(_REPO, "prototypes", "teleflow-icon-mono.svg"), "prototypes"),
+    ],
     hiddenimports=["pjsua2"],
     hookspath=[],
     hooksconfig={},
@@ -68,7 +73,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="TeleFlow.app",
-    icon=None,
+    icon=ICON,
     bundle_identifier="com.teleflow.lite",
     info_plist={
         # TeleFlow reads an audio *input* device (e.g. BlackHole) even though it

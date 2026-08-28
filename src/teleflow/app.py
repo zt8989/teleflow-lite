@@ -9,6 +9,7 @@ window is testable without a display, real hardware, or the native library.
 
 from __future__ import annotations
 
+import sys
 import warnings
 from pathlib import Path
 
@@ -61,6 +62,47 @@ from teleflow.sip import (
     SipBackend,
     SipCoreService,
 )
+
+
+# ---------------------------------------------------------------------------
+# SVG icon helper
+# ---------------------------------------------------------------------------
+def _load_icon() -> QIcon:
+    """Load the TeleFlow color SVG icon (for window/dock).
+
+    Falls back to a green square if missing. Works both when running from source
+    (``__file__`` relative) and from a PyInstaller-frozen app (``sys._MEIPASS``
+    relative).
+    """
+    return _load_svg("teleflow-icon.svg")
+
+
+def _load_tray_icon() -> QIcon:
+    """Load the TeleFlow monochrome SVG icon (for system tray).
+
+    On macOS, setting the icon as a mask makes it a template image that
+    automatically adapts to light/dark menu bar appearance.
+    """
+    icon = _load_svg("teleflow-icon-mono.svg")
+    icon.setIsMask(True)
+    return icon
+
+
+def _load_svg(name: str) -> QIcon:
+    """Load an SVG icon from the prototypes directory by name."""
+    candidates = []
+    # 1. Running from source
+    candidates.append(Path(__file__).resolve().parent.parent.parent / "prototypes" / name)
+    # 2. Frozen PyInstaller bundle
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass is not None:
+        candidates.append(Path(meipass) / "prototypes" / name)
+    for icon_path in candidates:
+        if icon_path.exists():
+            return QIcon(str(icon_path))
+    icon_pix = QPixmap(16, 16)
+    icon_pix.fill(Qt.GlobalColor.darkGreen)
+    return QIcon(icon_pix)
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +471,7 @@ class MainWindow(QMainWindow):
         self._tray_sip: QAction | None = None
         self._settings_dialog: SettingsDialog | None = None
         self.setWindowTitle("TeleFlow — 座机声音流转助手")
+        self.setWindowIcon(_load_icon())
         self.resize(680, 520)
 
         # Dashboard as central widget
@@ -446,13 +489,7 @@ class MainWindow(QMainWindow):
             self._tray = None
             return
         self._tray = QSystemTrayIcon(self)
-        icon_path = Path(__file__).resolve().parent.parent.parent / "prototypes" / "teleflow-icon.svg"
-        if icon_path.exists():
-            self._tray.setIcon(QIcon(str(icon_path)))
-        else:
-            icon_pix = QPixmap(16, 16)
-            icon_pix.fill(Qt.GlobalColor.darkGreen)
-            self._tray.setIcon(QIcon(icon_pix))
+        self._tray.setIcon(_load_tray_icon())
         menu = QMenu()
         sip_action = menu.addAction("启动 SIP 服务")
         assert sip_action is not None
@@ -563,6 +600,7 @@ def build_app(
     sip_backend: SipBackend | None = None,
 ) -> QApplication:
     app = QApplication([])
+    app.setWindowIcon(_load_icon())
     store = ConfigStore(config_path)
     settings = store.load()
     audio_backend = audio_backend or _default_audio_backend()
