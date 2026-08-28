@@ -8,7 +8,7 @@ core, so it is fully unit-testable without a display or a running UA.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "teleflow" / "config.json"
@@ -29,6 +29,10 @@ class Settings:
     autostart: bool = False
     start_minimized: bool = False
     log_level: str = "INFO"
+    gateway_port: int = 5060
+    gateway_password: str = ""
+    sip_number: str = "1001"
+    accounts: list[str] = field(default_factory=list)
 
     @classmethod
     def field_names(cls) -> frozenset[str]:

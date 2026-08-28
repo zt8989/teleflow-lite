@@ -1,10 +1,10 @@
 """PyQt6 application shell for TeleFlow.
 
-Owns the UI surface (status, settings, log tabs, system tray) and wires it to
-the Config Store, the Audio Device Manager, and the SIP Core Service. SIP and
-audio I/O are delegated to injected backends (real pjsua2 when available,
-scripted fakes otherwise), so the window is testable without a display, real
-hardware, or the native library.
+Owns the UI surface (dashboard with status cards, audio routing, live log;
+system tray menu; settings modal) and wires it to the Config Store, the Audio
+Device Manager, and the SIP Core Service. SIP and audio I/O are delegated to
+injected backends (real pjsua2 when available, scripted fakes otherwise), so the
+window is testable without a display, real hardware, or the native library.
 """
 
 from __future__ import annotations
@@ -13,26 +13,37 @@ import warnings
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QAction, QIcon, QPixmap
+from PyQt6.QtGui import QAction, QColor, QIcon, QPixmap, QTextCharFormat
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFormLayout,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QSystemTrayIcon,
-    QTabWidget,
+    QVBoxLayout,
     QWidget,
 )
 
 from teleflow.audio import (
-    AudioBackend, AudioDeviceManager, EVENT_AUDIO_DEVICES_CHANGED, EVENT_DEVICE_SELECTED,
-    FakeAudioBackend, PortAudioBackend,
+    AudioBackend,
+    AudioDeviceManager,
+    DeviceKind,
+    EVENT_AUDIO_DEVICES_CHANGED,
+    EVENT_DEVICE_SELECTED,
+    FakeAudioBackend,
+    PortAudioBackend,
 )
 from teleflow.autostart import set_autostart
 from teleflow.config import ConfigStore, Settings
@@ -52,88 +63,136 @@ from teleflow.sip import (
 )
 
 
-class StatusPanel(QWidget):
-    """Live view of SIP service, gateway registration, and call state."""
+# ---------------------------------------------------------------------------
+# Dashboard — single-page card-based layout (prototype layout reference)
+# ---------------------------------------------------------------------------
+class DashboardWidget(QWidget):
+    """Single-page Dashboard: stat grid + audio routing + live log."""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        layout = QFormLayout(self)
-        self.sip_status = QLabel("未启动")
-        self.registration = QLabel("未注册")
-        self.call_state = QLabel("空闲")
-        self.playback = QLabel("—")
-        self.capture = QLabel("—")
-        self.start_btn = QPushButton("启动 SIP 服务")
-
-        layout.addRow("SIP 服务", self.sip_status)
-        layout.addRow("ATA 注册", self.registration)
-        layout.addRow("通话状态", self.call_state)
-        layout.addRow("播放设备", self.playback)
-        layout.addRow("采集设备", self.capture)
-        layout.addRow(self.start_btn)
-
-    def set_sip_status(self, text: str) -> None:
-        self.sip_status.setText(text)
-
-    def set_registration(self, text: str) -> None:
-        self.registration.setText(text)
-
-    def set_call_state(self, text: str) -> None:
-        self.call_state.setText(text)
-
-
-class SettingsPage(QWidget):
-    """Editable settings bound to the Config Store and Audio Device Manager."""
-
-    def __init__(self, manager: AudioDeviceManager, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        manager: AudioDeviceManager,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._manager = manager
-        self._store = manager.store
-        layout = QFormLayout(self)
+        self._sip_running = False
+        self._call_state: CallState = CallState.IDLE
+        self._gateway = "未注册"
+        self._mode = "生产模式"
 
-        self.port = QSpinBox()
-        self.port.setRange(1, 65535)
-        self.playback_cb = QComboBox()
-        self.capture_cb = QComboBox()
-        self.refresh_btn = QPushButton("刷新音频设备")
-        self.autostart = QCheckBox("开机自启")
-        self.start_minimized = QCheckBox("启动最小化到托盘")
-        self.log_level = QComboBox()
-        self.log_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
-        self.debug_btn = QPushButton("调试模式")
-        self.production_btn = QPushButton("生产模式")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
 
-        layout.addRow("SIP 监听端口", self.port)
-        layout.addRow("播放设备", self.playback_cb)
-        layout.addRow("采集设备", self.capture_cb)
-        layout.addRow(self.refresh_btn)
-        layout.addRow(self.autostart)
-        layout.addRow(self.start_minimized)
-        layout.addRow("日志等级", self.log_level)
-        layout.addRow(self.debug_btn, self.production_btn)
+        # Hint
+        hint = QLabel("设置与退出在右下角系统托盘菜单中 · 点击托盘图标打开")
+        hint.setStyleSheet("color: gray; font-size: 11px;")
+        layout.addWidget(hint)
 
-        self.refresh_btn.clicked.connect(self._on_refresh)
-        self.debug_btn.clicked.connect(lambda: self._on_preset("debug"))
-        self.production_btn.clicked.connect(lambda: self._on_preset("production"))
-        self.playback_cb.currentIndexChanged.connect(self._on_device_change)
-        self.capture_cb.currentIndexChanged.connect(self._on_device_change)
+        # Stat grid (4 cards in a horizontal row)
+        stat_row = QHBoxLayout()
+        stat_row.setSpacing(8)
+        self._sip_stat = self._build_stat_group("SIP 服务", "未启动")
+        self._gw_stat = self._build_stat_group("网关注册", "未注册")
+        self._mode_stat = self._build_stat_group("当前模式", "生产模式")
+        self._call_stat = self._build_stat_group("通话状态", "空闲")
+        stat_row.addWidget(self._sip_stat)
+        stat_row.addWidget(self._gw_stat)
+        stat_row.addWidget(self._mode_stat)
+        stat_row.addWidget(self._call_stat)
+        layout.addLayout(stat_row)
 
-        self.apply_settings(self._store.load())
+        # Audio device routing group
+        audio_group = QGroupBox("音频设备（独立选择）")
+        ag = QVBoxLayout(audio_group)
+        ag.setSpacing(8)
+
+        dev_row = QHBoxLayout()
+        dev_row.setSpacing(12)
+        self._playback_cb = QComboBox()
+        self._capture_cb = QComboBox()
+        pb_col = QVBoxLayout()
+        pb_col.setSpacing(4)
+        pb_col.addWidget(QLabel("扬声器 / 播放（下行）"))
+        pb_col.addWidget(self._playback_cb)
+        cap_col = QVBoxLayout()
+        cap_col.setSpacing(4)
+        cap_col.addWidget(QLabel("麦克风 / 采集（上行）"))
+        cap_col.addWidget(self._capture_cb)
+        dev_row.addLayout(pb_col)
+        dev_row.addLayout(cap_col)
+        ag.addLayout(dev_row)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self._refresh_btn = QPushButton("刷新设备")
+        self._debug_btn = QPushButton("调试模式（耳机）")
+        self._prod_btn = QPushButton("生产模式（虚拟声卡）")
+        self._prod_btn.setEnabled(False)  # production is the default
+        btn_row.addWidget(self._refresh_btn)
+        btn_row.addWidget(QLabel("模式预设："))
+        btn_row.addWidget(self._debug_btn)
+        btn_row.addWidget(self._prod_btn)
+        btn_row.addStretch()
+        ag.addLayout(btn_row)
+        layout.addWidget(audio_group)
+
+        self._refresh_btn.clicked.connect(self._on_refresh)
+        self._debug_btn.clicked.connect(lambda: self._on_preset("debug"))
+        self._prod_btn.clicked.connect(lambda: self._on_preset("production"))
+        self._playback_cb.currentIndexChanged.connect(self._on_device_change)
+        self._capture_cb.currentIndexChanged.connect(self._on_device_change)
+
+        # Log group
+        log_group = QGroupBox("实时日志（SIP / 媒体 / 设备）")
+        lg = QVBoxLayout(log_group)
+        self._log_view = QPlainTextEdit()
+        self._log_view.setReadOnly(True)
+        self._log_view.setMaximumBlockCount(2000)
+        self._log_view.setMinimumHeight(180)
+        lg.addWidget(self._log_view)
+        layout.addWidget(log_group)
+
+        self._populate_devices()
+
+    # -- stat group helpers --
+
+    @staticmethod
+    def _build_stat_group(key: str, value: str) -> QGroupBox:
+        g = QGroupBox(key)
+        vl = QVBoxLayout(g)
+        vl.setContentsMargins(8, 8, 8, 8)
+        lbl = QLabel(value)
+        lbl.setObjectName("stat_value")
+        font = lbl.font()
+        font.setBold(True)
+        font.setPointSize(font.pointSize() + 2)
+        lbl.setFont(font)
+        vl.addWidget(lbl)
+        return g
+
+    def _set_stat_value(self, group: QGroupBox, value: str) -> None:
+        lbl = group.findChild(QLabel, "stat_value")
+        if lbl is not None:
+            lbl.setText(value)
+
+    # -- audio device handling --
 
     def _populate_devices(self) -> None:
         playback_id, capture_id = self._manager.current_selection()
-        self.playback_cb.blockSignals(True)
-        self.capture_cb.blockSignals(True)
-        self.playback_cb.clear()
+        self._playback_cb.blockSignals(True)
+        self._capture_cb.blockSignals(True)
+        self._playback_cb.clear()
         for device in self._manager.playback_devices():
-            self.playback_cb.addItem(device.name, device.id)
-        self.capture_cb.clear()
+            self._playback_cb.addItem(device.name, device.id)
+        self._capture_cb.clear()
         for device in self._manager.capture_devices():
-            self.capture_cb.addItem(device.name, device.id)
-        self._select(self.playback_cb, playback_id)
-        self._select(self.capture_cb, capture_id)
-        self.playback_cb.blockSignals(False)
-        self.capture_cb.blockSignals(False)
+            self._capture_cb.addItem(device.name, device.id)
+        self._select(self._playback_cb, playback_id)
+        self._select(self._capture_cb, capture_id)
+        self._playback_cb.blockSignals(False)
+        self._capture_cb.blockSignals(False)
 
     @staticmethod
     def _select(combo: QComboBox, device_id: str) -> None:
@@ -151,10 +210,15 @@ class SettingsPage(QWidget):
         except ValueError:
             return
         self._populate_devices()
+        is_debug = preset == "debug"
+        self._debug_btn.setEnabled(not is_debug)
+        self._prod_btn.setEnabled(is_debug)
+        self._mode = "调试模式" if is_debug else "生产模式"
+        self._set_stat_value(self._mode_stat, self._mode)
 
     def _on_device_change(self) -> None:
-        playback_id = self.playback_cb.currentData()
-        capture_id = self.capture_cb.currentData()
+        playback_id = self._playback_cb.currentData()
+        capture_id = self._capture_cb.currentData()
         if playback_id is None or capture_id is None:
             return
         try:
@@ -162,29 +226,194 @@ class SettingsPage(QWidget):
         except ValueError:
             self._populate_devices()
 
-    def apply_settings(self, settings: Settings) -> None:
+    # -- log --
+
+    def append_log_line(self, line: str) -> None:
+        """Append a log line, auto-scrolling to bottom.
+
+        Lines are colour-coded by category:
+          [SIP]/[CALL] → blue, [MEDIA] → green, [AUDIO] → dark yellow, [ERROR] → red
+        """
+        colour_map = {
+            "[SIP]": QColor("#0000cc"),
+            "[CALL]": QColor("#0000cc"),
+            "[MEDIA]": QColor("#006600"),
+            "[AUDIO]": QColor("#996600"),
+            "[ERROR]": QColor("#cc0000"),
+        }
+        fmt = QTextCharFormat()
+        for prefix, colour in colour_map.items():
+            if prefix in line:
+                fmt.setForeground(colour)
+                break
+        self._log_view.setCurrentCharFormat(fmt)
+        self._log_view.appendPlainText(line)
+        scrollbar = self._log_view.verticalScrollBar()
+        if scrollbar is not None:
+            scrollbar.setValue(scrollbar.maximum())
+
+    # -- public setters called by MainWindow --
+
+    def set_sip_running(self, running: bool) -> None:
+        self._sip_running = running
+        self._update_sip_stat()
+
+    def set_call_state(self, state: CallState) -> None:
+        self._call_state = state
+        text = {
+            CallState.CONNECTED: "通话中",
+            CallState.INCOMING: "呼入",
+            CallState.ENDED: "挂断",
+            CallState.IDLE: "空闲 · 监听中" if self._sip_running else "空闲",
+        }.get(state, "空闲")
+        self._set_stat_value(self._call_stat, text)
+
+    def set_registration(self, text: str) -> None:
+        self._gateway = text
+        self._set_stat_value(self._gw_stat, text)
+
+    def set_mode(self, mode: str) -> None:
+        self._mode = mode
+        self._set_stat_value(self._mode_stat, mode)
+
+    def _update_sip_stat(self) -> None:
+        self._set_stat_value(self._sip_stat, "运行中" if self._sip_running else "未启动")
+
+
+# ---------------------------------------------------------------------------
+# Settings dialog (modal — opened from tray menu)
+# ---------------------------------------------------------------------------
+class SettingsDialog(QDialog):
+    """Settings modal, opened from the system tray menu."""
+
+    def __init__(
+        self,
+        manager: AudioDeviceManager,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._manager = manager
+        self._store = manager.store
+        self.setWindowTitle("设置")
+        self.setModal(True)
+        self.setMinimumWidth(480)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        # SIP port
+        layout.addWidget(QLabel("SIP 监听端口（默认 5060）:"))
+        self.port = QSpinBox()
+        self.port.setRange(1, 65535)
+        layout.addWidget(self.port)
+
+        # Gateway port + password
+        gw_row = QHBoxLayout()
+        gw_row.setSpacing(12)
+        gw_port_col = QVBoxLayout()
+        gw_port_col.setSpacing(4)
+        gw_port_col.addWidget(QLabel("网关端口:"))
+        self.gw_port = QSpinBox()
+        self.gw_port.setRange(1, 65535)
+        gw_port_col.addWidget(self.gw_port)
+        gw_pw_col = QVBoxLayout()
+        gw_pw_col.setSpacing(4)
+        gw_pw_col.addWidget(QLabel("网关密码:"))
+        self.gw_password = QLineEdit()
+        self.gw_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.gw_password.setPlaceholderText("网关注册密码")
+        gw_pw_col.addWidget(self.gw_password)
+        gw_row.addLayout(gw_port_col)
+        gw_row.addLayout(gw_pw_col)
+        layout.addLayout(gw_row)
+
+        # SIP number
+        layout.addWidget(QLabel("SIP 号码:"))
+        self.sip_number = QLineEdit()
+        self.sip_number.setPlaceholderText("例如 1001")
+        layout.addWidget(self.sip_number)
+
+        # Accounts
+        layout.addWidget(QLabel("账号（分机号 / 名称）:"))
+        acct_row = QHBoxLayout()
+        self.acct_input = QLineEdit()
+        self.acct_input.setPlaceholderText("例如 1001")
+        self.add_acct_btn = QPushButton("添加")
+        self.add_acct_btn.clicked.connect(self._add_account)
+        acct_row.addWidget(self.acct_input)
+        acct_row.addWidget(self.add_acct_btn)
+        layout.addLayout(acct_row)
+        self._acct_label = QLabel("尚未添加账号")
+        self._acct_label.setStyleSheet("color: gray;")
+        layout.addWidget(self._acct_label)
+        self._accounts: list[str] = []
+
+        # Log level, autostart, start-minimized
+        fl = QFormLayout()
+        self.log_level = QComboBox()
+        self.log_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
+        fl.addRow("日志级别:", self.log_level)
+        self.autostart = QCheckBox("开机自启")
+        fl.addRow(self.autostart)
+        self.start_minimized = QCheckBox("最小化启动")
+        fl.addRow(self.start_minimized)
+        layout.addLayout(fl)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        self.save_btn = QPushButton("保存设置")
+        self.save_btn.clicked.connect(self._save_and_close)
+        self.cancel_btn = QPushButton("关闭")
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(self.save_btn)
+        btn_row.addWidget(self.cancel_btn)
+        layout.addLayout(btn_row)
+
+        self._load_settings()
+
+    def _load_settings(self) -> None:
+        settings = self._store.load()
         self.port.setValue(settings.sip_port)
+        self.gw_port.setValue(settings.gateway_port)
+        self.gw_password.setText(settings.gateway_password)
+        self.sip_number.setText(settings.sip_number)
+        self._accounts = list(settings.accounts)
+        self._render_accounts()
+        self.log_level.setCurrentText(settings.log_level)
         self.autostart.setChecked(settings.autostart)
         self.start_minimized.setChecked(settings.start_minimized)
-        self.log_level.setCurrentText(settings.log_level)
-        self._populate_devices()
 
-    def collect(self) -> Settings:
-        playback_id = self.playback_cb.currentData()
-        capture_id = self.capture_cb.currentData()
-        return Settings(
-            sip_port=self.port.value(),
-            playback_device_id=playback_id if playback_id is not None else "",
-            capture_device_id=capture_id if capture_id is not None else "",
-            autostart=self.autostart.isChecked(),
-            start_minimized=self.start_minimized.isChecked(),
-            log_level=self.log_level.currentText(),
+    def _save_and_close(self) -> None:
+        settings = self._store.load()
+        settings.sip_port = self.port.value()
+        settings.gateway_port = self.gw_port.value()
+        settings.gateway_password = self.gw_password.text()
+        settings.sip_number = self.sip_number.text()
+        settings.accounts = list(self._accounts)
+        settings.log_level = self.log_level.currentText()
+        settings.autostart = self.autostart.isChecked()
+        settings.start_minimized = self.start_minimized.isChecked()
+        self._store.save(settings)
+        self.accept()
+
+    def _render_accounts(self) -> None:
+        self._acct_label.setText(
+            "、".join(self._accounts) if self._accounts else "尚未添加账号"
         )
 
-    def save(self) -> None:
-        self._store.save(self.collect())
+    def _add_account(self) -> None:
+        text = self.acct_input.text().strip()
+        if not text:
+            return
+        self._accounts.append(text)
+        self._render_accounts()
+        self.acct_input.clear()
 
 
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
 class MainWindow(QMainWindow):
     def __init__(
         self,
@@ -198,34 +427,32 @@ class MainWindow(QMainWindow):
         self._force_quit = False
         self._tray: QSystemTrayIcon | None = None
         self._tray_sip: QAction | None = None
+        self._settings_dialog: SettingsDialog | None = None
         self.setWindowTitle("TeleFlow — 座机声音流转助手")
-        self.resize(460, 400)
+        self.resize(680, 520)
 
-        tabs = QTabWidget(self)
-        self.status_panel = StatusPanel()
-        self.settings_page = SettingsPage(manager)
-        self.log_view = QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(2000)
-        tabs.addTab(self.status_panel, "状态")
-        tabs.addTab(self.settings_page, "设置")
-        tabs.addTab(self.log_view, "日志")
-        self.setCentralWidget(tabs)
+        # Dashboard as central widget
+        self.dashboard = DashboardWidget(manager)
+        self.setCentralWidget(self.dashboard)
 
         self._setup_tray()
         self._wire_service()
 
     def append_log_line(self, line: str) -> None:
-        self.log_view.appendPlainText(line)
+        self.dashboard.append_log_line(line)
 
     def _setup_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
             self._tray = None
             return
         self._tray = QSystemTrayIcon(self)
-        icon_pix = QPixmap(16, 16)
-        icon_pix.fill(Qt.GlobalColor.darkGreen)
-        self._tray.setIcon(QIcon(icon_pix))
+        icon_path = Path(__file__).resolve().parent.parent.parent / "prototypes" / "teleflow-icon.svg"
+        if icon_path.exists():
+            self._tray.setIcon(QIcon(str(icon_path)))
+        else:
+            icon_pix = QPixmap(16, 16)
+            icon_pix.fill(Qt.GlobalColor.darkGreen)
+            self._tray.setIcon(QIcon(icon_pix))
         menu = QMenu()
         sip_action = menu.addAction("启动 SIP 服务")
         assert sip_action is not None
@@ -233,7 +460,11 @@ class MainWindow(QMainWindow):
         show_action = menu.addAction("显示窗口")
         assert show_action is not None
         show_action.triggered.connect(self.show_window)
-        quit_action = menu.addAction("退出程序")
+        settings_action = menu.addAction("设置")
+        assert settings_action is not None
+        settings_action.triggered.connect(self._open_settings)
+        menu.addSeparator()
+        quit_action = menu.addAction("退出")
         assert quit_action is not None
         quit_action.triggered.connect(self.quit_app)
         self._tray_sip = sip_action
@@ -254,15 +485,31 @@ class MainWindow(QMainWindow):
         self._force_quit = True
         QApplication.quit()
 
+    def _open_settings(self) -> None:
+        if self._settings_dialog is None:
+            self._settings_dialog = SettingsDialog(self._manager, self)
+        self._settings_dialog.exec()
+
     def _wire_service(self) -> None:
         svc = self._service
         svc.on(EVENT_SIP_STARTED, lambda: self._sync_sip_button())
         svc.on(EVENT_SIP_STOPPED, lambda: self._sync_sip_button())
-        svc.on(EVENT_GATEWAY_REGISTERED, lambda contact: self.status_panel.set_registration(contact))
-        svc.on(EVENT_CALL_INCOMING, lambda call_id: self.status_panel.set_call_state("呼入"))
-        svc.on(EVENT_CALL_CONNECTED, lambda call_id: self.status_panel.set_call_state("通话中"))
-        svc.on(EVENT_CALL_ENDED, lambda call_id: self.status_panel.set_call_state("空闲"))
-        self.status_panel.start_btn.clicked.connect(self._toggle_sip)
+        svc.on(
+            EVENT_GATEWAY_REGISTERED,
+            lambda contact: self.dashboard.set_registration(contact),
+        )
+        svc.on(
+            EVENT_CALL_INCOMING,
+            lambda call_id: self.dashboard.set_call_state(CallState.INCOMING),
+        )
+        svc.on(
+            EVENT_CALL_CONNECTED,
+            lambda call_id: self.dashboard.set_call_state(CallState.CONNECTED),
+        )
+        svc.on(
+            EVENT_CALL_ENDED,
+            lambda call_id: self.dashboard.set_call_state(CallState.ENDED),
+        )
         self._sync_sip_button()
 
     def _toggle_sip(self) -> None:
@@ -273,23 +520,24 @@ class MainWindow(QMainWindow):
         self._sync_sip_button()
 
     def _sync_sip_button(self) -> None:
-        label = "停止 SIP 服务" if self._service.running else "启动 SIP 服务"
-        self.status_panel.start_btn.setText(label)
-        self.status_panel.set_sip_status("运行中" if self._service.running else "未启动")
+        running = self._service.running
+        label = "停止 SIP 服务" if running else "启动 SIP 服务"
+        self.dashboard.set_sip_running(running)
         tray_sip = self._tray_sip
         if tray_sip is not None:
             tray_sip.setText(label)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         if self._tray is not None and not self._force_quit:
-            self.settings_page.save()
             event.ignore()
             self.hide()
             return
-        self.settings_page.save()
         event.accept()
 
 
+# ---------------------------------------------------------------------------
+# App factory
+# ---------------------------------------------------------------------------
 def _default_audio_backend() -> AudioBackend:
     try:
         return PortAudioBackend()
@@ -302,9 +550,6 @@ def _default_audio_backend() -> AudioBackend:
 
 
 def _default_sip_backend() -> SipBackend:
-    # Prefer the real pjsua2 transport when the native library is built and
-    # installed; otherwise fall back to the scripted fake so the app stays
-    # runnable and testable headless.
     try:
         return Pjsua2Backend(ConfigStore())
     except RuntimeError:
@@ -328,9 +573,6 @@ def build_app(
 
     logger = EventLogger(level=LogLevel[settings.log_level], sink=window.append_log_line)
     attach(logger, service, manager)
-    window.settings_page.log_level.currentTextChanged.connect(
-        lambda level: logger.set_level(LogLevel[level])
-    )
 
     # Re-route a live call when the user switches the playback/capture device.
     def _on_device_selected(_playback: str, _capture: str) -> None:

@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TeleFlow — UI 原型 (PROTOTYPE)</title>
+<!--
+  PROTOTYPE — throwaway design artifact. Not production code.
+
+  Question this prototype answers:
+    "What should the TeleFlow desktop app look like?" — a single, minimal
+    Dashboard, a simulated system tray with a menu, and a settings dialog,
+    styled to mimic native Qt (Fusion) widgets as closely as HTML allows.
+
+  TeleFlow (per .scratch/teleflow-v1.0/spec.md) is a PyQt6 local SIP UA that
+  bridges a telephone gateway's SIP calls to a user-selected sound card.
+  Styling target: Qt Fusion palette (light gray, blue highlight) — the
+  cross-platform "native" Qt look, so the mockup matches what PyQt6 renders.
+-->
+<style>
+  :root{
+    --bg:#f0f0f0; --panel:#ffffff; --panel-2:#f7f7f7;
+    --line:#c4c4c4; --line-strong:#a9adb2;
+    --text:#1c1c1c; --muted:#6a6a6a;
+    --accent:#0078d7; --accent-2:#005a9e;
+    --ok:#1a7d33; --warn:#9a5b00; --bad:#c0341c;
+    --btn-top:#fdfdfd; --btn-bot:#e8e9ec;
+    --font:"Segoe UI",system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--text);font-family:var(--font);
+       font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased}
+  button{font-family:inherit}
+  .window{margin:0 auto;max-width:1080px;min-height:100%;display:flex;flex-direction:column;background:var(--bg)}
+
+  /* window chrome (light, Qt-ish) */
+  .titlebar{display:flex;align-items:center;gap:8px;padding:8px 12px;
+            background:linear-gradient(#fbfbfb,#e9e9ec);border-bottom:1px solid var(--line)}
+  .titlebar .name{font-weight:600;font-size:13px}
+  .titlebar .tag{margin-left:auto;font-size:11px;color:var(--muted);
+                 border:1px solid var(--line);padding:2px 8px;border-radius:3px;background:#fff}
+  .body{flex:1;padding:16px;display:flex;flex-direction:column;gap:16px}
+  .statusbar{display:flex;gap:16px;padding:4px 12px;border-top:1px solid var(--line);
+             background:linear-gradient(#fbfbfb,#e9e9ec);font-size:11px;color:#444}
+  .statusbar span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .hint{font-size:11px;color:var(--muted);margin:-4px 0 0}
+
+  /* QGroupBox */
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:4px;
+        padding:16px 14px 14px;margin-top:14px;position:relative}
+  .card h3{position:absolute;top:-0.7em;left:10px;background:var(--bg);padding:0 6px;
+           margin:0;font-size:12px;color:#2a2a2a;font-weight:600}
+  .card.dlg{margin-top:0;border:none;padding:0;position:static}
+  .card.dlg h3{position:static;background:none;padding:0;margin:0 0 12px}
+
+  /* status label */
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:2px 9px;border-radius:3px;
+        font-size:12px;font-weight:600;border:1px solid var(--line);background:#fff;color:#333}
+  .pill .dot{width:9px;height:9px;border-radius:50%;background:#9a9a9a}
+  .pill.ok .dot{background:var(--ok)} .pill.ok{color:var(--ok);border-color:#bfe0c8}
+  .pill.warn .dot{background:var(--warn)} .pill.warn{color:var(--warn);border-color:#e6cf9e}
+  .pill.bad .dot{background:var(--bad)} .pill.bad{color:var(--bad);border-color:#eabfb6}
+  .pill.run .dot{background:var(--accent);box-shadow:0 0 0 3px rgba(0,120,215,.15)}
+
+  /* QLineEdit / QComboBox */
+  label.fld{display:block;margin-bottom:12px}
+  label.fld span{display:block;font-size:12px;color:#333;margin-bottom:5px}
+  select,input[type=text],input[type=number],input[type=password]{
+    width:100%;background:var(--panel);color:var(--text);border:1px solid var(--line-strong);
+    border-radius:2px;padding:7px 10px;font-size:13px;font-family:inherit}
+  select{appearance:none;-webkit-appearance:none;padding-right:26px;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><path d='M0 0l5 6 5-6z' fill='%23555'/></svg>");
+    background-repeat:no-repeat;background-position:right 9px center}
+  select:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(0,120,215,.25)}
+
+  /* QPushButton */
+  .btn{background:linear-gradient(var(--btn-top),var(--btn-bot));color:var(--text);
+       border:1px solid #adb0b3;border-radius:3px;padding:7px 14px;cursor:pointer;
+       font-size:13px;font-weight:500;min-height:30px}
+  .btn:hover{background:linear-gradient(#ffffff,#f1f2f4)}
+  .btn:active{background:linear-gradient(#e4e5e8,#f4f5f7);border-color:var(--accent)}
+  .btn.primary{background:linear-gradient(#2a92e6,#0b6fc2);border-color:#0b6fc2;color:#fff}
+  .btn.primary:hover{background:linear-gradient(#3a9cec,#1a7fcf)}
+  .btn.primary:active{background:linear-gradient(#0b6fc2,#2a92e6)}
+  .btn.active{background:linear-gradient(#0b6fc2,#2a92e6);border-color:#0b6fc2;color:#fff}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .row > *{flex:1;min-width:200px}
+
+  /* stat tiles */
+  .statgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:12px}
+  .stat .k{font-size:11px;color:var(--muted);margin-bottom:6px}
+  .stat .v{font-size:14px;font-weight:600}
+
+  /* QPlainTextEdit (log) */
+  .log{background:var(--panel);border:1px solid var(--line-strong);border-radius:2px;padding:8px;
+       font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:#222;
+       height:200px;overflow:auto;display:flex;flex-direction:column;gap:2px}
+  .log .ln{white-space:pre-wrap}
+  .log .ln .t{color:#9a9a9a}
+  .log .ln.sip{color:#0b6fb0}.log .ln.media{color:var(--ok)}.log .ln.dev{color:var(--warn)}.log .ln.err{color:var(--bad)}
+
+  .demo{display:flex;gap:7px;flex-wrap:wrap;align-items:center;border-top:1px dashed var(--line);
+        padding-top:10px;margin-top:4px}
+  .demo .lbl{font-size:11px;color:var(--muted);margin-right:2px}
+
+  /* system tray (icon) + QMenu */
+  .tray{position:fixed;right:18px;bottom:18px;z-index:60}
+  .trayIcon{width:46px;height:46px;border-radius:10px;background:#171a21;border:1px solid #2a2f3a;
+    display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25)}
+  .trayIcon:hover{border-color:var(--accent)}
+  .trayMenu{position:absolute;right:0;bottom:56px;width:200px;background:linear-gradient(#fdfdfd,#f0f0f0);
+    border:1px solid #9a9a9a;border-radius:3px;padding:4px;box-shadow:0 2px 12px rgba(0,0,0,.25);
+    display:flex;flex-direction:column;gap:1px}
+  .trayMenu button{display:flex;align-items:center;gap:9px;width:100%;background:none;border:none;
+    color:#1c1c1c;text-align:left;padding:6px 10px;border-radius:2px;cursor:pointer;font-size:13px}
+  .trayMenu button:hover{background:var(--accent);color:#fff}
+  .trayMenu button.danger{color:var(--bad)}
+  .trayMenu button.danger:hover{background:var(--bad);color:#fff}
+  .trayMenu .sep{height:1px;background:#d6d6d6;margin:4px 4px}
+
+  /* QDialog (settings) */
+  .modal{position:fixed;inset:0;background:rgba(0,0,0,.28);display:flex;align-items:center;
+    justify-content:center;z-index:80}
+  .modalCard{width:min(560px,92vw);background:var(--bg);border:1px solid #9a9a9a;border-radius:5px;
+    box-shadow:0 6px 24px rgba(0,0,0,.3);overflow:hidden}
+  .modalHead{display:flex;align-items:center;justify-content:space-between;padding:9px 14px;
+    background:linear-gradient(#fbfbfb,#e9e9ec);border-bottom:1px solid var(--line)}
+  .modalHead span{font-weight:600;font-size:13px}
+  #settingsBody{padding:16px;background:var(--bg)}
+
+  .hidden{display:none !important}
+  @media (max-width:720px){.statgrid{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<div class="window">
+  <div class="titlebar">
+    <img src="teleflow-icon.svg" alt="☎️" style="width:18px;height:18px">
+    <div class="name">TeleFlow</div>
+    <div class="tag">原型 · 非生产</div>
+  </div>
+  <div class="body" id="stage"></div>
+  <div class="statusbar">
+    <span id="sb">就绪</span>
+    <span style="margin-left:auto">SIP 0.0.0.0:5060</span>
+  </div>
+</div>
+
+<!-- simulated system tray: left-click opens the menu (proxy for right-click) -->
+<div class="tray" id="tray">
+  <div class="trayIcon" id="trayIcon" title="TeleFlow — 点击打开菜单"><img src="teleflow-icon.svg" alt="☎️" style="width:24px;height:24px;display:block"></div>
+  <div class="trayMenu hidden" id="trayMenu">
+    <button onclick="simMenu('start')">▶ 启动服务</button>
+    <button onclick="simMenu('stop')">⏸ 停止服务</button>
+    <button onclick="simMenu('show')">🪟 显示窗口</button>
+    <button onclick="openSettings()">⚙ 设置</button>
+    <div class="sep"></div>
+    <button class="danger" onclick="simMenu('quit')">⏻ 退出</button>
+  </div>
+</div>
+
+<!-- settings, opened from the tray menu -->
+<div class="modal hidden" id="settingsModal">
+  <div class="modalCard">
+    <div class="modalHead"><span>设置 / 连接（网关 + SIP）</span>
+      <button class="btn" onclick="closeSettings()">关闭</button></div>
+    <div id="settingsBody"></div>
+  </div>
+</div>
+
+<script>
+/* =========================================================================
+   Shared mock state (in-memory stub — prototype only, no persistence)
+   ========================================================================= */
+const PLAYBACK = [
+  {id:0, name:"内置扬声器 (Built-in Speaker)", kind:"physical"},
+  {id:1, name:"VB-Cable (Virtual Audio Cable)", kind:"virtual"},
+  {id:2, name:"BlackHole 2ch", kind:"virtual"},
+  {id:3, name:"耳机 (Headphones)", kind:"physical"},
+];
+const CAPTURE = [
+  {id:10, name:"内置麦克风 (Built-in Mic)", kind:"physical"},
+  {id:11, name:"VB-Cable Input", kind:"virtual"},
+  {id:12, name:"BlackHole 2ch", kind:"virtual"},
+  {id:13, name:"耳机麦克风 (Headset Mic)", kind:"physical"},
+];
+const CALL = {IDLE:"空闲", INCOMING:"呼入", ACTIVE:"通话中", ENDED:"挂断"};
+const state = {
+  sipRunning:true,
+  gateway:"已注册 · 192.168.1.50:5060",
+  mode:"生产模式",
+  playback:2, capture:12,
+  call:CALL.IDLE,
+  accounts:[],
+  log:[],
+};
+function now(){const d=new Date();return d.toTimeString().slice(0,8);}
+function pushLog(msg, cls=""){
+  state.log.push({t:now(), msg, cls});
+  if(state.log.length>200) state.log.shift();
+  render();
+}
+function deviceName(list,id){const d=list.find(x=>x.id===id);return d?d.name:"未知设备";}
+function fmtLog(){
+  return state.log.map(l=>`<div class="ln ${l.cls}"><span class="t">${l.t}</span>  ${l.msg}</div>`).join("");
+}
+function statusPill(){
+  if(!state.sipRunning) return `<span class="pill bad"><span class="dot"></span>服务已停止</span>`;
+  if(state.call===CALL.ACTIVE) return `<span class="pill ok"><span class="dot"></span>通话中</span>`;
+  if(state.call===CALL.INCOMING) return `<span class="pill warn"><span class="dot"></span>呼入</span>`;
+  if(state.call===CALL.ENDED) return `<span class="pill bad"><span class="dot"></span>挂断</span>`;
+  return `<span class="pill run"><span class="dot"></span>空闲 · 监听中</span>`;
+}
+function deviceSelect(list, sel, onchange){
+  return `<select onchange="${onchange}(this.value)">`+
+    list.map(d=>`<option value="${d.id}" ${d.id===sel?"selected":""}>${d.name}${d.kind==="virtual"?"  ·虚拟":""}</option>`).join("")+
+    `</select>`;
+}
+function setPlayback(v){state.playback=+v;pushLog(`播放设备 -> ${deviceName(PLAYBACK,+v)}`,"dev");}
+function setCapture(v){state.capture=+v;pushLog(`采集设备 -> ${deviceName(CAPTURE,+v)}`,"dev");}
+function refreshDevices(){pushLog("重新枚举音频设备…","dev");pushLog(`发现 ${PLAYBACK.length} 个播放设备 / ${CAPTURE.length} 个采集设备（含虚拟声卡）`,"dev");}
+function setMode(m){
+  state.mode=m;
+  if(m==="调试模式"){state.playback=3;state.capture=13;}
+  else {state.playback=2;state.capture=12;}
+  pushLog(`切换模式 -> ${m}`,"dev");
+  render();
+}
+function simRegister(){state.gateway="已注册 · 192.168.1.50:5060";pushLog("ATA 网关 REGISTER 收到，回复 200 OK，已保存 Contact","sip");render();}
+function simIncoming(){state.call=CALL.INCOMING;pushLog("收到 INVITE，自动应答…","sip");pushLog("SDP 协商完成，RTP 媒体流建立","media");state.call=CALL.ACTIVE;pushLog("通话已建立，下行音频写入播放设备，上行音频采集中","media");render();}
+function simEnd(){if(state.call!==CALL.IDLE){state.call=CALL.ENDED;pushLog("收到 BYE，通话结束，状态复位","sip");setTimeout(()=>{state.call=CALL.IDLE;render();},900);}render();}
+function toggleSip(){state.sipRunning=!state.sipRunning;pushLog(state.sipRunning?"SIP 服务已启动，监听 0.0.0.0:5060":"SIP 服务已停止","sip");if(!state.sipRunning)state.call=CALL.IDLE;render();}
+function addAccount(){const el=document.getElementById("acctInput");const v=el?el.value.trim():"";if(!v)return;state.accounts.push(v);pushLog(`添加账号：${v}`,"sip");}
+function connectSim(){pushLog("模拟网关已连接（端口/密码已应用），SIP 号码注册中…","sip");pushLog("INVITE 通道就绪，自动应答已开启","media");}
+
+const DEMO = `<div class="demo">
+  <span class="lbl">演示事件：</span>
+  <button class="btn" onclick="simRegister()">网关注册</button>
+  <button class="btn" onclick="simIncoming()">呼入·接通</button>
+  <button class="btn" onclick="simEnd()">挂断</button>
+  <button class="btn" onclick="toggleSip()">启停服务</button>
+  <button class="btn" onclick="refreshDevices()">刷新设备</button>
+</div>`;
+
+/* device routing card (core of the dashboard) */
+const DEV_PANE = `<div class="card">
+  <h3>音频设备（独立选择）</h3>
+  <div class="row">
+    <label class="fld"><span>扬声器 / 播放（下行）</span>${deviceSelect(PLAYBACK,state.playback,"setPlayback")}</label>
+    <label class="fld"><span>麦克风 / 采集（上行）</span>${deviceSelect(CAPTURE,state.capture,"setCapture")}</label>
+  </div>
+  <div class="row" style="align-items:center">
+    <button class="btn" onclick="refreshDevices()">刷新设备</button>
+    <span style="color:var(--muted);font-size:12px">模式预设：</span>
+    <button class="btn ${state.mode==="调试模式"?"active":""}" onclick="setMode('调试模式')">调试模式（耳机）</button>
+    <button class="btn ${state.mode==="生产模式"?"active":""}" onclick="setMode('生产模式')">生产模式（虚拟声卡）</button>
+  </div>
+</div>`;
+
+const LOG_PANE = `<div class="card"><h3>实时日志（SIP / 媒体 / 设备）</h3>
+  <div class="log" id="logbox">${fmtLog()}</div>${DEMO}</div>`;
+
+/* settings panel — lives in the tray-opened dialog, not on the dashboard */
+const SETTINGS_PANE = `<div class="card dlg">
+  <h3>设置 / 连接（网关 + SIP）</h3>
+  <label class="fld"><span>SIP 监听端口（TeleFlow 本地 UA，默认 5060）</span><input type="number" value="5060"></label>
+  <div class="row">
+    <label class="fld"><span>网关端口</span><input type="number" value="5060"></label>
+    <label class="fld"><span>网关密码</span><input type="password" placeholder="网关注册密码"></label>
+  </div>
+  <label class="fld"><span>SIP 号码</span><input type="text" value="1001" placeholder="例如 1001"></label>
+  <label class="fld"><span>添加账号（分机号 / 名称）</span><input type="text" id="acctInput" placeholder="例如 1001"></label>
+  <div class="row" style="align-items:center;margin-bottom:12px">
+    <button class="btn primary" onclick="connectSim()">模拟网关 + SIP 连接</button>
+    <button class="btn" onclick="addAccount()">添加账号</button>
+  </div>
+  <div style="margin-bottom:12px">${state.accounts.length? state.accounts.map(a=>`<span class="pill" style="margin:4px 6px 0 0">${a}</span>`).join("") : '<span style="color:var(--muted);font-size:12px">尚未添加账号</span>'}</div>
+  <div class="row">
+    <label class="fld"><span>日志级别</span><select><option>DEBUG</option><option selected>INFO</option><option>WARNING</option><option>ERROR</option></select></label>
+    <label class="fld"><span>开机自启</span><select><option>关</option><option>开</option></select></label>
+    <label class="fld"><span>最小化启动</span><select><option>关</option><option>开</option></select></label>
+  </div>
+  <button class="btn primary">保存设置</button>
+</div>`;
+
+/* =========================================================================
+   Dashboard (the only variant — necessary info only)
+   ========================================================================= */
+function Dashboard(){
+  return `
+  <p class="hint">设置与退出在右下角系统托盘菜单中 · 点击 ☎ 图标打开</p>
+  <div class="statgrid">
+    <div class="stat"><div class="k">SIP 服务</div><div class="v">${statusPill()}</div></div>
+    <div class="stat"><div class="k">网关注册</div><div class="v">${state.gateway}</div></div>
+    <div class="stat"><div class="k">当前模式</div><div class="v">${state.mode}</div></div>
+    <div class="stat"><div class="k">通话状态</div><div class="v">${state.call}</div></div>
+  </div>
+  ${DEV_PANE}
+  ${LOG_PANE}`;
+}
+
+/* =========================================================================
+   Render + tray + settings dialog
+   ========================================================================= */
+function render(){
+  document.getElementById("stage").innerHTML = Dashboard();
+  const logbox=document.getElementById("logbox");
+  if(logbox) logbox.scrollTop=logbox.scrollHeight;
+  const sb=document.getElementById("sb");
+  if(sb) sb.textContent =
+    (state.sipRunning?"SIP 监听中":"SIP 已停止")+" · 网关 "+(state.gateway||"未注册")+" · 通话 "+state.call;
+}
+
+/* tray menu (QMenu) */
+function closeTray(){document.getElementById("trayMenu").classList.add("hidden");}
+document.getElementById("trayIcon").onclick=(e)=>{
+  e.stopPropagation();
+  document.getElementById("trayMenu").classList.toggle("hidden");
+};
+document.addEventListener("click",(e)=>{
+  const t=document.getElementById("tray");
+  if(!t.contains(e.target)) closeTray();
+});
+function simMenu(a){
+  closeTray();
+  if(a==="start"){ if(!state.sipRunning) toggleSip(); else pushLog("服务已在运行","sip"); }
+  else if(a==="stop"){ if(state.sipRunning) toggleSip(); else pushLog("服务已停止","sip"); }
+  else if(a==="show"){ pushLog("显示主窗口","sip"); }
+  else if(a==="quit"){
+    pushLog("应用退出（原型模拟）","sip");
+    document.getElementById("stage").innerHTML =
+      '<div class="card"><h3>状态</h3><p style="color:var(--muted);margin:0">已退出（原型模拟）。重新加载页面可恢复。</p></div>';
+  }
+}
+
+/* settings dialog (QDialog) */
+function openSettings(){
+  closeTray();
+  document.getElementById("settingsBody").innerHTML=SETTINGS_PANE;
+  document.getElementById("settingsModal").classList.remove("hidden");
+}
+function closeSettings(){document.getElementById("settingsModal").classList.add("hidden");}
+document.getElementById("settingsModal").addEventListener("click",(e)=>{
+  if(e.target.id==="settingsModal") closeSettings();
+});
+
+// seed a couple of log lines so the log panel isn't empty on first open
+pushLog("TeleFlow 启动，SIP UA 绑定 0.0.0.0:5060","sip");
+pushLog("枚举音频设备完成，虚拟声卡已识别","dev");
+render();
+</script>
+</body>
+</html>

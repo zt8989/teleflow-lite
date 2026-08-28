@@ -44,64 +44,65 @@ def _make_window(tmp_path):
     manager = AudioDeviceManager(FakeAudioBackend(), store)
     service = SipCoreService(FakeSipBackend(), store)
     window = MainWindow(manager, service)
-    return app, window, service
+    return app, window, service, manager
 
 
 def test_window_populates_device_comboboxes(tmp_path) -> None:
-    app, window, _ = _make_window(tmp_path)
+    app, window, _, _ = _make_window(tmp_path)
+    dash = window.dashboard
     playback_names = [
-        window.settings_page.playback_cb.itemText(i)
-        for i in range(window.settings_page.playback_cb.count())
+        dash._playback_cb.itemText(i)
+        for i in range(dash._playback_cb.count())
     ]
-    assert "VB-Cable" in playback_names
-    assert window.settings_page.capture_cb.count() > 0
+    assert any("VB-Cable" in name for name in playback_names)
+    assert dash._capture_cb.count() > 0
     window.close()
 
 
 def test_debug_preset_button_selects_headset(tmp_path) -> None:
-    app, window, _ = _make_window(tmp_path)
-    window.settings_page.debug_btn.click()
-    manager = window.settings_page._manager
+    app, window, _, manager = _make_window(tmp_path)
+    window.dashboard._debug_btn.click()
     assert manager.current_selection() == ("hw:0,0", "hw:0,0")
     window.close()
 
 
 def test_status_panel_reflects_sip_events(tmp_path) -> None:
-    app, window, service = _make_window(tmp_path)
+    app, window, service, _ = _make_window(tmp_path)
     sip = service._backend  # the scripted fake gateway
+    dash = window.dashboard
 
     service.start()
     sip.receive_register("sip:ata@192.168.1.50:5060")
-    assert window.status_panel.registration.text() == "sip:ata@192.168.1.50:5060"
+    assert dash._gateway == "sip:ata@192.168.1.50:5060"
 
     sip.receive_invite("call-1")
-    assert window.status_panel.call_state.text() == "通话中"
+    assert dash._call_state.value == "connected"
 
     sip.receive_bye("call-1")
-    assert window.status_panel.call_state.text() == "空闲"
+    assert dash._call_state.value == "ended"
     window.close()
 
 
 def test_log_view_tab_exists_and_appends(tmp_path) -> None:
-    app, window, _ = _make_window(tmp_path)
+    app, window, _, _ = _make_window(tmp_path)
     window.append_log_line("[INFO] hello")
-    assert "[INFO] hello" in window.log_view.toPlainText()
+    assert "[INFO] hello" in window.dashboard._log_view.toPlainText()
     window.close()
 
 
 def test_sip_events_appear_in_log_view(tmp_path) -> None:
-    app, window, service = _make_window(tmp_path)
+    app, window, service, manager = _make_window(tmp_path)
     logger = EventLogger(level=LogLevel.INFO, sink=window.append_log_line)
-    attach(logger, service, window.settings_page._manager)
+    attach(logger, service, manager)
 
     service.start()
     service._backend.receive_register("sip:ata@192.168.1.50:5060")
-    assert "gateway registered" in window.log_view.toPlainText()
+    assert "gateway registered" in window.dashboard._log_view.toPlainText()
     window.close()
 
 
 def test_close_to_tray_hides_window(tmp_path) -> None:
-    app, window, _ = _make_window(tmp_path)
+    app, window, _, _ = _make_window(tmp_path)
     window._tray = object()  # pretend a real tray is present
     event = _CloseEvent()
     window.closeEvent(event)
@@ -111,7 +112,7 @@ def test_close_to_tray_hides_window(tmp_path) -> None:
 
 
 def test_close_without_tray_quits(tmp_path) -> None:
-    app, window, _ = _make_window(tmp_path)
+    app, window, _, _ = _make_window(tmp_path)
     window._tray = None
     event = _CloseEvent()
     window.closeEvent(event)
