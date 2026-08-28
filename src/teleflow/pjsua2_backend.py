@@ -25,6 +25,48 @@ from teleflow.media import AudioDeviceController, MediaBridge
 from teleflow.sip import SipBackend
 
 
+# pjsua2's ``Endpoint`` is a process-wide singleton: constructing a second
+# ``pj.Endpoint()`` aborts the process with ``PJ_EEXISTS`` (uncatchable SIGABRT).
+# Both the audio backend (device enumeration) and this SIP backend need the same
+# singleton, so we construct it exactly once here as the callback-bearing
+# subclass and hand the same instance to everyone. ``_shared_backend`` wires the
+# singleton's callbacks back to the live (single) SIP backend instance.
+_shared_endpoint: Any | None = None
+_shared_backend: "Pjsua2Backend | None" = None
+
+
+def get_shared_endpoint(pj: Any) -> Any:  # pragma: no cover - native only
+    """Return the one process-wide ``pjsua2.Endpoint`` instance.
+
+    The instance is built as a subclass so the audio-device and transport-state
+    callbacks can be routed to the live backend without anyone else constructing
+    a second (fatal) Endpoint.
+    """
+
+    global _shared_endpoint
+    if _shared_endpoint is None:
+
+        class _Endpoint(pj.Endpoint):  # type: ignore[misc, valid-type]
+            def onAudioDevState(self, prm: Any) -> None:  # noqa: ARG002
+                if (
+                    _shared_backend is not None
+                    and _shared_backend._device_change_cb is not None
+                ):
+                    _shared_backend._device_change_cb()
+
+            def onTransportState(self, prm: Any) -> None:  # noqa: ARG002
+                state = getattr(prm, "state", None)
+                if (
+                    state == pj.PJSIP_TP_STATE_DISCONNECTED
+                    and _shared_backend is not None
+                    and _shared_backend._handler is not None
+                ):
+                    _shared_backend._handler("network_down", {})
+
+        _shared_endpoint = _Endpoint()
+    return _shared_endpoint
+
+
 class Pjsua2AudioController:
     """Thin adapter from ``AudioDeviceController`` to pjsua2's ``audDevManager``.
 
@@ -114,32 +156,26 @@ class Pjsua2Backend:
         self.running = False
         self.port: int | None = None
 
-        # pjsua2's Endpoint is a process-wide singleton; subclass it so we can
-        # hook the audio-device-state and transport-state callbacks in one place.
-        backend_ref = self
-
-        class Endpoint(pj.Endpoint):  # type: ignore[misc, valid-type]
-            def onAudioDevState(self, prm: Any) -> None:  # noqa: ARG002 - prm unused
-                # A device was plugged/unplugged: let the manager re-enumerate
-                # and re-route a live call.
-                if backend_ref._device_change_cb is not None:
-                    backend_ref._device_change_cb()
-
-            def onTransportState(self, prm: Any) -> None:  # noqa: ARG002 - prm unused
-                state = getattr(prm, "state", None)
-                if state == pj.PJSIP_TP_STATE_DISCONNECTED and backend_ref._handler is not None:
-                    backend_ref._handler("network_down", {})
-
-        self._ep = Endpoint()
+        # Use the shared, process-wide Endpoint (built as the callback subclass
+        # above). This also makes the singleton's callbacks route back to us.
+        global _shared_backend
+        _shared_backend = self
+        self._ep = get_shared_endpoint(pj)
 
     def _ensure_lib(self) -> None:  # pragma: no cover
-        if not self._lib_created:
+        if self._lib_created:
+            return
+        # ``libGetState()`` returns 0 (not created), 1 (created), 2 (initialized).
+        # The audio backend may have already initialized the shared lib during
+        # device enumeration, so only create/init what is missing.
+        if self._ep.libGetState() == 0:
             self._ep.libCreate()
+        if self._ep.libGetState() < 2:
             self._ep.libInit(self._pj.EpConfig())
-            mgr = self._ep.audDevManager()
-            self._bridge = MediaBridge(Pjsua2AudioController(mgr, self._pj))
-            self._call_cls, self._account_cls = _make_classes(self._pj, self)
-            self._lib_created = True
+        mgr = self._ep.audDevManager()
+        self._bridge = MediaBridge(Pjsua2AudioController(mgr, self._pj))
+        self._call_cls, self._account_cls = _make_classes(self._pj, self)
+        self._lib_created = True
 
     def _apply_route(self) -> None:  # pragma: no cover
         if self._bridge is None:

@@ -80,9 +80,16 @@ class PortAudioBackend:
                 "pjsua2 is required for real audio device enumeration"
             ) from exc
 
-        ep = pj.Endpoint()
-        if ep.libGetState() != pj.PJSUA2_LIBT_INIT:  # pragma: no cover - needs lib
+        # Share the single process-wide Endpoint with the SIP backend: pjsua2
+        # aborts if a second ``pj.Endpoint()`` is constructed. The library state
+        # is an int in 2.17 (0 = not created, 1 = created, 2 = initialized); only
+        # create/init what the SIP backend has not already initialized.
+        from teleflow.pjsua2_backend import get_shared_endpoint
+
+        ep = get_shared_endpoint(pj)
+        if ep.libGetState() == 0:  # pragma: no cover - needs lib
             ep.libCreate()
+        if ep.libGetState() < 2:  # pragma: no cover - needs lib
             ep.libInit(pj.EpConfig())
         manager = ep.audDevManager()
 

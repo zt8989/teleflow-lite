@@ -7,6 +7,12 @@ __pycache__/
 build/
 dist/
 
+# Packaging output (PyInstaller build dir, frozen app, DMG)
+packaging/macos/build/
+packaging/macos/dist/
+packaging/macos/dmgroot/
+*.dmg
+
 # Tooling
 .pytest_cache/
 .mypy_cache/
