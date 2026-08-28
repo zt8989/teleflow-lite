@@ -33,6 +33,12 @@ class Settings:
     gateway_password: str = ""
     sip_number: str = "1001"
     accounts: list[str] = field(default_factory=list)
+    # Hook commands (ticket 01/02): local shell commands run at call-lifecycle
+    # moments, with {call_id} substituted. Empty means no hook.
+    #   off_hook_cmd — when the current SIP auto-answers an incoming call (摘机).
+    #   on_hook_cmd  — when the call ends, e.g. the landline hangs up (挂机).
+    off_hook_cmd: str = ""
+    on_hook_cmd: str = ""
 
     @classmethod
     def field_names(cls) -> frozenset[str]:

@@ -99,7 +99,7 @@
        height:200px;overflow:auto;display:flex;flex-direction:column;gap:2px}
   .log .ln{white-space:pre-wrap}
   .log .ln .t{color:#9a9a9a}
-  .log .ln.sip{color:#0b6fb0}.log .ln.media{color:var(--ok)}.log .ln.dev{color:var(--warn)}.log .ln.err{color:var(--bad)}
+  .log .ln.sip{color:#0b6fb0}.log .ln.media{color:var(--ok)}.log .ln.dev{color:var(--warn)}.log .ln.err{color:var(--bad)}.log .ln.hook{color:#7a3fb5;font-weight:600}
 
   .demo{display:flex;gap:7px;flex-wrap:wrap;align-items:center;border-top:1px dashed var(--line);
         padding-top:10px;margin-top:4px}
@@ -193,7 +193,9 @@ const state = {
   mode:"生产模式",
   playback:2, capture:12,
   call:CALL.IDLE,
+  callId:"",
   accounts:[],
+  offHookCmd:"", onHookCmd:"",
   log:[],
 };
 function now(){const d=new Date();return d.toTimeString().slice(0,8);}
@@ -203,6 +205,7 @@ function pushLog(msg, cls=""){
   render();
 }
 function deviceName(list,id){const d=list.find(x=>x.id===id);return d?d.name:"未知设备";}
+function renderCmd(cmd, id){return (cmd||"").replaceAll("{call_id}", id);}
 function fmtLog(){
   return state.log.map(l=>`<div class="ln ${l.cls}"><span class="t">${l.t}</span>  ${l.msg}</div>`).join("");
 }
@@ -229,8 +232,25 @@ function setMode(m){
   render();
 }
 function simRegister(){state.gateway="已注册 · 192.168.1.50:5060";pushLog("ATA 网关 REGISTER 收到，回复 200 OK，已保存 Contact","sip");render();}
-function simIncoming(){state.call=CALL.INCOMING;pushLog("收到 INVITE，自动应答…","sip");pushLog("SDP 协商完成，RTP 媒体流建立","media");state.call=CALL.ACTIVE;pushLog("通话已建立，下行音频写入播放设备，上行音频采集中","media");render();}
-function simEnd(){if(state.call!==CALL.IDLE){state.call=CALL.ENDED;pushLog("收到 BYE，通话结束，状态复位","sip");setTimeout(()=>{state.call=CALL.IDLE;render();},900);}render();}
+function simIncoming(){
+  state.call=CALL.INCOMING;
+  state.callId = "CALL-"+Math.random().toString(36).slice(2,8).toUpperCase();
+  pushLog("收到 INVITE，自动应答…","sip");
+  pushLog("SDP 协商完成，RTP 媒体流建立","media");
+  state.call=CALL.ACTIVE;
+  pushLog("通话已建立，下行音频写入播放设备，上行音频采集中","media");
+  if(state.offHookCmd.trim()) pushLog(`[HOOK] 执行摘机命令: ${renderCmd(state.offHookCmd, state.callId)}`,"hook");
+  render();
+}
+function simEnd(){
+  if(state.call!==CALL.IDLE){
+    state.call=CALL.ENDED;
+    pushLog("收到 BYE，通话结束，状态复位","sip");
+    if(state.onHookCmd.trim()) pushLog(`[HOOK] 执行挂机命令: ${renderCmd(state.onHookCmd, state.callId)}`,"hook");
+    setTimeout(()=>{state.call=CALL.IDLE;render();},900);
+  }
+  render();
+}
 function toggleSip(){state.sipRunning=!state.sipRunning;pushLog(state.sipRunning?"SIP 服务已启动，监听 0.0.0.0:5060":"SIP 服务已停止","sip");if(!state.sipRunning)state.call=CALL.IDLE;render();}
 function addAccount(){const el=document.getElementById("acctInput");const v=el?el.value.trim():"";if(!v)return;state.accounts.push(v);pushLog(`添加账号：${v}`,"sip");}
 function connectSim(){pushLog("模拟网关已连接（端口/密码已应用），SIP 号码注册中…","sip");pushLog("INVITE 通道就绪，自动应答已开启","media");}
@@ -282,7 +302,13 @@ const SETTINGS_PANE = `<div class="card dlg">
     <label class="fld"><span>开机自启</span><select><option>关</option><option>开</option></select></label>
     <label class="fld"><span>最小化启动</span><select><option>关</option><option>开</option></select></label>
   </div>
-  <button class="btn primary">保存设置</button>
+  <div style="margin:16px 0 12px;border-top:1px dashed var(--line);padding-top:14px">
+    <div style="font-size:13px;font-weight:600;color:#2a2a2a;margin-bottom:10px">Hook 命令（摘机 / 挂机）</div>
+    <p class="hint" style="margin:0 0 12px">通话生命周期的本地命令，可用 <code>{call_id}</code> 表示来电 ID；留空则不执行。命令以非阻塞方式在后台线程执行，失败仅记入实时日志，不会中断通话。</p>
+    <label class="fld"><span>摘机命令（自动接通时执行）</span><input type="text" id="offHookCmd" value="${state.offHookCmd}" placeholder="例如 /usr/local/bin/on-answer.sh {call_id}"></label>
+    <label class="fld"><span>挂机命令（通话结束时执行）</span><input type="text" id="onHookCmd" value="${state.onHookCmd}" placeholder="例如 /usr/local/bin/on-hangup.sh {call_id}"></label>
+  </div>
+  <button class="btn primary" onclick="saveSettings()">保存设置</button>
 </div>`;
 
 /* =========================================================================
@@ -342,6 +368,14 @@ function openSettings(){
   document.getElementById("settingsModal").classList.remove("hidden");
 }
 function closeSettings(){document.getElementById("settingsModal").classList.add("hidden");}
+function saveSettings(){
+  const o=document.getElementById("offHookCmd");
+  const n=document.getElementById("onHookCmd");
+  if(o) state.offHookCmd=o.value;
+  if(n) state.onHookCmd=n.value;
+  pushLog("设置已保存（含 Hook 命令）","sip");
+  closeSettings();
+}
 document.getElementById("settingsModal").addEventListener("click",(e)=>{
   if(e.target.id==="settingsModal") closeSettings();
 });
