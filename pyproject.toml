@@ -7,8 +7,17 @@ name = "teleflow"
 version = "0.1.0"
 description = "TeleFlow — 座机声音流转助手: local SIP UA + lossless audio routing to a user-selected sound card"
 requires-python = ">=3.10"
-dependencies = ["PyQt6"]
+dependencies = [
+    "PyQt6",
+    # Phone-report TTS (feature teleflow-phone-report): synthesizes report speech.
+    "edge-tts",
+]
 
+# ffmpeg is an *external binary* required by the phone-report feature to transcode
+# the synthesized mp3 into an 8 kHz mono wav pjsua2 can play. It is not a pip
+# package: install it via Homebrew (`brew install ffmpeg`) or any package manager,
+# make it available on PATH, or set `ffmpeg_path` in TeleFlow settings. The app
+# locates it automatically (PATH) or via that explicit setting.
 [project.optional-dependencies]
 dev = ["pytest", "mypy"]
 

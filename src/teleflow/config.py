@@ -39,6 +39,26 @@ class Settings:
     #   on_hook_cmd  — when the call ends, e.g. the landline hangs up (挂机).
     off_hook_cmd: str = ""
     on_hook_cmd: str = ""
+    # Phone-report RPC (feature teleflow-phone-report). TeleFlow can be told by an
+    # external hook to dial the desk phone and play a report; these persist that
+    # control channel + synthesis settings.
+    #   rpc_enabled   — whether the local HTTP control channel is on.
+    #   rpc_port      — localhost port for the RPC server (bound to 127.0.0.1 only).
+    #   rpc_token     — bearer token; empty => auto-generated & persisted on first run.
+    #   report_target — SIP URI of the desk phone / FXS extension to dial
+    #                   (e.g. sip:8000@192.168.1.116). Empty => /v1/report errors.
+    #   report_caller_id — caller display name for the outbound report call.
+    #   report_hangup_on_eof — hang up automatically when playback finishes.
+    #   tts_voice     — default edge-tts voice/timbre for report synthesis.
+    #   ffmpeg_path   — external ffmpeg binary; empty => auto-discover via PATH.
+    rpc_enabled: bool = True
+    rpc_port: int = 8731
+    rpc_token: str = ""
+    report_target: str = ""
+    report_caller_id: str = "TeleFlow"
+    report_hangup_on_eof: bool = True
+    tts_voice: str = "zh-CN-XiaoxiaoNeural"
+    ffmpeg_path: str = ""
 
     @classmethod
     def field_names(cls) -> frozenset[str]:

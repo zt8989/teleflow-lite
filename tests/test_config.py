@@ -90,3 +90,47 @@ def test_persists_across_two_store_instances(tmp_path: Path) -> None:
     ConfigStore(path).save(Settings(sip_port=6060))
     reloaded = ConfigStore(path).load()
     assert reloaded.sip_port == 6060
+
+
+def test_phone_report_fields_default_on_fresh_file(tmp_path: Path) -> None:
+    store = ConfigStore(tmp_path / "config.json")
+    settings = store.load()
+    assert settings.rpc_enabled is True
+    assert settings.rpc_port == 8731
+    assert settings.rpc_token == ""
+    assert settings.report_target == ""
+    assert settings.report_caller_id == "TeleFlow"
+    assert settings.report_hangup_on_eof is True
+    assert settings.tts_voice == "zh-CN-XiaoxiaoNeural"
+    assert settings.ffmpeg_path == ""
+
+
+def test_phone_report_fields_round_trip(tmp_path: Path) -> None:
+    store = ConfigStore(tmp_path / "config.json")
+    original = Settings(
+        rpc_enabled=False,
+        rpc_port=9123,
+        rpc_token="s3cr3t",
+        report_target="sip:8000@192.168.1.116",
+        report_caller_id="WorkBuddy",
+        report_hangup_on_eof=False,
+        tts_voice="zh-CN-YunyangNeural",
+        ffmpeg_path="/opt/homebrew/bin/ffmpeg",
+    )
+    store.save(original)
+    assert store.load() == original
+
+
+def test_old_file_without_phone_report_fields_uses_defaults(tmp_path: Path) -> None:
+    """A config written before the phone-report feature must load cleanly,
+    falling back to the new defaults (no exception, no breakage)."""
+    store = ConfigStore(tmp_path / "config.json")
+    store.path.write_text(
+        '{"sip_port": 5090, "playback_device_id": "x"}', encoding="utf-8"
+    )
+    loaded = store.load()
+    assert loaded.rpc_enabled is True
+    assert loaded.rpc_port == 8731
+    assert loaded.report_target == ""
+    assert loaded.tts_voice == "zh-CN-XiaoxiaoNeural"
+    assert loaded.ffmpeg_path == ""

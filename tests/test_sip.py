@@ -136,3 +136,24 @@ def test_device_change_callback_is_invoked(tmp_path) -> None:
     backend.receive_device_change()
 
     assert fired == [True]
+
+
+def test_fake_place_report_call_is_recorded(tmp_path) -> None:
+    backend = FakeSipBackend()
+    backend.start(5060, lambda name, data: None)
+    backend.place_report_call("sip:8000@192.168.1.116", "/tmp/r.wav")
+    assert backend.report_calls == [("sip:8000@192.168.1.116", "/tmp/r.wav")]
+
+
+def test_fake_report_lifecycle_fires_handler(tmp_path) -> None:
+    backend = FakeSipBackend()
+    events: list[tuple[str, dict]] = []
+    backend.start(5060, lambda name, data: events.append((name, data)))
+
+    backend.receive_report_connected("report-1")
+    backend.play_file_to_call("report-1", "/tmp/r.wav")
+    backend.receive_report_playback_done("report-1")
+
+    assert ("report_connected", {"call_id": "report-1"}) in events
+    assert backend.report_played == [("report-1", "/tmp/r.wav")]
+    assert ("report_eof", {"call_id": "report-1"}) in events

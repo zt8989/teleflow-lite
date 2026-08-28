@@ -99,21 +99,33 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
                 backend._calls.pop(str(info.id), None)
 
         def onCallMediaState(self, prm: Any) -> None:  # noqa: ARG002 - prm unused
-            # Bridge the call's audio to the selected devices through the
-            # conference bridge: downstream call -> playback device, upstream
-            # capture device -> call. No recorder / transform is inserted.
             info = self.getInfo()
             for media in info.media:
-                if (
+                if not (
                     media.type == pj.PJMEDIA_TYPE_AUDIO
                     and media.status == pj.PJSUA_CALL_MEDIA_ACTIVE
                 ):
-                    call_audio = self.getAudioMedia(media.index)
-                    dev_mgr = backend._ep.audDevManager()
-                    # Downstream: decoded call audio -> selected playback device.
-                    call_audio.startTransmit(dev_mgr.getPlaybackDevMedia())
-                    # Upstream: selected capture device -> call audio (to telephone).
-                    dev_mgr.getCaptureDevMedia().startTransmit(call_audio)
+                    continue
+                # A report call is played into (one-way) by the service on
+                # connect; it must NOT be bridged to the user's sound devices.
+                # Signal connect exactly once and let the service drive playback.
+                if getattr(self, "_is_report", False):
+                    if not getattr(self, "_report_connected_fired", False):
+                        self._report_connected_fired = True
+                        if backend._handler is not None:
+                            backend._handler(
+                                "report_connected", {"call_id": str(info.id)}
+                            )
+                    return
+                # Normal call: bridge the call's audio to the selected devices
+                # through the conference bridge: downstream call -> playback
+                # device, upstream capture device -> call. No recorder / transform.
+                call_audio = self.getAudioMedia(media.index)
+                dev_mgr = backend._ep.audDevManager()
+                # Downstream: decoded call audio -> selected playback device.
+                call_audio.startTransmit(dev_mgr.getPlaybackDevMedia())
+                # Upstream: selected capture device -> call audio (to telephone).
+                dev_mgr.getCaptureDevMedia().startTransmit(call_audio)
 
     class Account(pj.Account):  # type: ignore[misc, valid-type]
         def __init__(self) -> None:
@@ -130,6 +142,18 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
                 backend._handler("invite", {"call_id": call_id})
 
     return Call, Account
+
+
+def _make_report_eof_callback(pj: Any, backend: "Pjsua2Backend", call_id: str) -> Any:  # pragma: no cover
+    """Build a pjsua2 ``AudioMediaPlayer`` EOF callback that tells the backend
+    the report playback finished (so the service can hang up). Native-only."""
+
+    class _ReportEofCallback(pj.AudioMediaPlayerEOFCallback):  # type: ignore[misc, valid-type]
+        def onEOF(self) -> None:  # noqa: ARG002 - pjsua2 callback signature
+            if backend._handler is not None:
+                backend._handler("report_eof", {"call_id": call_id})
+
+    return _ReportEofCallback()
 
 
 class Pjsua2Backend:
@@ -240,6 +264,41 @@ class Pjsua2Backend:
         assert self._call_cls is not None
         call = self._call_cls(self._account)
         call.makeCall(target)
+
+    def place_report_call(self, target: str, wav_path: str) -> None:  # pragma: no cover
+        # Like place_call, but the Call instance is tagged as a report call so
+        # onCallMediaState signals "report_connected" (instead of bridging) and
+        # the service plays the file into it on answer.
+        self._apply_route()
+        assert self._call_cls is not None
+        call = self._call_cls(self._account)
+        call._is_report = True
+        call._report_file = wav_path
+        call._report_connected_fired = False
+        call.makeCall(target)
+
+    def play_file_to_call(self, call_id: str, wav_path: str) -> None:  # pragma: no cover
+        # One-way playback: file -> call audio only. No capture device, no
+        # recorder. Registers an EOF callback that tells the service to hang up.
+        call = self._calls.get(call_id)
+        if call is None:
+            return
+        info = call.getInfo()
+        media_index = None
+        for media in info.media:
+            if (
+                media.type == self._pj.PJMEDIA_TYPE_AUDIO
+                and media.status == self._pj.PJSUA_CALL_MEDIA_ACTIVE
+            ):
+                media_index = media.index
+                break
+        if media_index is None:
+            return
+        call_audio = call.getAudioMedia(media_index)
+        player = self._pj.AudioMediaPlayer()
+        player.createPlayer(wav_path)
+        player.startTransmit(call_audio)
+        player.setEOFCallback(_make_report_eof_callback(self._pj, self, call_id))
 
     def reroute(self) -> None:  # pragma: no cover
         """Re-apply the current device selection to a live call (mid-call switch)."""

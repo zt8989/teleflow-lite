@@ -9,9 +9,11 @@ window is testable without a display, real hardware, or the native library.
 
 from __future__ import annotations
 
+import shutil
 import sys
 import warnings
 from pathlib import Path
+from typing import Callable
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QColor, QIcon, QPixmap, QTextCharFormat
@@ -25,6 +27,8 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QStackedWidget,
     QLineEdit,
     QMainWindow,
     QMenu,
@@ -57,12 +61,20 @@ from teleflow.sip import (
     EVENT_CALL_ENDED,
     EVENT_CALL_INCOMING,
     EVENT_GATEWAY_REGISTERED,
+    EVENT_REPORT_COMPLETED,
+    EVENT_REPORT_CONNECTED,
+    EVENT_REPORT_FAILED,
+    EVENT_REPORT_PLAYING,
+    EVENT_REPORT_STARTED,
     EVENT_SIP_STARTED,
     EVENT_SIP_STOPPED,
     FakeSipBackend,
+    ReportState,
     SipBackend,
     SipCoreService,
 )
+from teleflow.rpc import RpcServer
+from teleflow.tts import EdgeTtsBackend
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +199,17 @@ class DashboardWidget(QWidget):
         self._playback_cb.currentIndexChanged.connect(self._on_device_change)
         self._capture_cb.currentIndexChanged.connect(self._on_device_change)
 
+        # Phone-report group (feature teleflow-phone-report)
+        report_group = QGroupBox("电话汇报 (RPC)")
+        rg = QVBoxLayout(report_group)
+        self._report_stat = self._build_stat_group("汇报状态", "空闲")
+        rg.addWidget(self._report_stat)
+        self._test_report_btn = QPushButton("测试汇报")
+        self._test_report_btn.clicked.connect(self._fire_test_report)
+        rg.addWidget(self._test_report_btn)
+        layout.addWidget(report_group)
+        self._test_report_cb: Callable[..., None] | None = None
+
         # Log group
         log_group = QGroupBox("实时日志（SIP / 媒体 / 设备）")
         lg = QVBoxLayout(log_group)
@@ -282,6 +305,9 @@ class DashboardWidget(QWidget):
             "[CALL]": QColor("#0000cc"),
             "[MEDIA]": QColor("#006600"),
             "[AUDIO]": QColor("#996600"),
+            "[TTS]": QColor("#663399"),
+            "[FFMPEG]": QColor("#663399"),
+            "[REPORT]": QColor("#663399"),
             "[ERROR]": QColor("#cc0000"),
         }
         fmt = QTextCharFormat()
@@ -311,6 +337,23 @@ class DashboardWidget(QWidget):
         }.get(state, "空闲")
         self._set_stat_value(self._call_stat, text)
 
+    def set_report_state(self, state: ReportState) -> None:
+        text = {
+            ReportState.IDLE: "空闲",
+            ReportState.DIALING: "拨号中…",
+            ReportState.PLAYING: "播放中…",
+            ReportState.COMPLETED: "已完成",
+            ReportState.FAILED: "失败",
+        }.get(state, "空闲")
+        self._set_stat_value(self._report_stat, text)
+
+    def set_test_report_callback(self, cb: Callable[..., None]) -> None:
+        self._test_report_cb = cb
+
+    def _fire_test_report(self) -> None:
+        if self._test_report_cb is not None:
+            self._test_report_cb()
+
     def set_registration(self, text: str) -> None:
         self._gateway = text
         self._set_stat_value(self._gw_stat, text)
@@ -339,18 +382,39 @@ class SettingsDialog(QDialog):
         self._store = manager.store
         self.setWindowTitle("设置")
         self.setModal(True)
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(560)
+        self.setMinimumHeight(460)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
 
-        # SIP port
-        layout.addWidget(QLabel("SIP 监听端口（默认 5060）:"))
+        # Left: section menu  |  Right: grouped config panels (macOS System
+        # Settings style). A QListWidget drives a QStackedWidget of pages.
+        split = QHBoxLayout()
+        split.setSpacing(12)
+        self._menu = QListWidget()
+        self._menu.setFixedWidth(150)
+        self._pages = QStackedWidget()
+        split.addWidget(self._menu)
+        split.addWidget(self._pages, 1)
+        layout.addLayout(split)
+
+        # --- Page: SIP 服务 ---
+        sip_page = QWidget()
+        sl = QVBoxLayout(sip_page)
+        sl.setContentsMargins(12, 12, 12, 12)
+        sl.setSpacing(8)
+        sl.addWidget(QLabel("SIP 监听端口（默认 5060）:"))
         self.port = QSpinBox()
         self.port.setRange(1, 65535)
-        layout.addWidget(self.port)
+        sl.addWidget(self.port)
+        sl.addStretch()
 
-        # Gateway port + password
+        # --- Page: 网关与账号 ---
+        gw_page = QWidget()
+        gl = QVBoxLayout(gw_page)
+        gl.setContentsMargins(12, 12, 12, 12)
+        gl.setSpacing(8)
         gw_row = QHBoxLayout()
         gw_row.setSpacing(12)
         gw_port_col = QVBoxLayout()
@@ -368,16 +432,12 @@ class SettingsDialog(QDialog):
         gw_pw_col.addWidget(self.gw_password)
         gw_row.addLayout(gw_port_col)
         gw_row.addLayout(gw_pw_col)
-        layout.addLayout(gw_row)
-
-        # SIP number
-        layout.addWidget(QLabel("SIP 号码:"))
+        gl.addLayout(gw_row)
+        gl.addWidget(QLabel("SIP 号码:"))
         self.sip_number = QLineEdit()
         self.sip_number.setPlaceholderText("例如 1001")
-        layout.addWidget(self.sip_number)
-
-        # Accounts
-        layout.addWidget(QLabel("账号（分机号 / 名称）:"))
+        gl.addWidget(self.sip_number)
+        gl.addWidget(QLabel("账号（分机号 / 名称）:"))
         acct_row = QHBoxLayout()
         self.acct_input = QLineEdit()
         self.acct_input.setPlaceholderText("例如 1001")
@@ -385,24 +445,71 @@ class SettingsDialog(QDialog):
         self.add_acct_btn.clicked.connect(self._add_account)
         acct_row.addWidget(self.acct_input)
         acct_row.addWidget(self.add_acct_btn)
-        layout.addLayout(acct_row)
+        gl.addLayout(acct_row)
         self._acct_label = QLabel("尚未添加账号")
         self._acct_label.setStyleSheet("color: gray;")
-        layout.addWidget(self._acct_label)
+        gl.addWidget(self._acct_label)
         self._accounts: list[str] = []
+        gl.addStretch()
 
-        # Hook commands: executed at call-lifecycle moments, with {call_id}
-        # substituted by the incoming call id.
-        layout.addWidget(QLabel("摘机命令（自动接通时执行，可用 {call_id} 表示来电 ID）:"))
+        # --- Page: 钩子命令 ---
+        hook_page = QWidget()
+        hl = QVBoxLayout(hook_page)
+        hl.setContentsMargins(12, 12, 12, 12)
+        hl.setSpacing(8)
+        hl.addWidget(QLabel("摘机命令（自动接通时执行，可用 {call_id} 表示来电 ID）:"))
         self.off_hook_cmd = QLineEdit()
         self.off_hook_cmd.setPlaceholderText("例如 /usr/local/bin/on-answer.sh {call_id}")
-        layout.addWidget(self.off_hook_cmd)
-        layout.addWidget(QLabel("挂机命令（通话结束时执行，可用 {call_id} 表示来电 ID）:"))
+        hl.addWidget(self.off_hook_cmd)
+        hl.addWidget(QLabel("挂机命令（通话结束时执行，可用 {call_id} 表示来电 ID）:"))
         self.on_hook_cmd = QLineEdit()
         self.on_hook_cmd.setPlaceholderText("例如 /usr/local/bin/on-hangup.sh {call_id}")
-        layout.addWidget(self.on_hook_cmd)
+        hl.addWidget(self.on_hook_cmd)
+        hl.addStretch()
 
-        # Log level, autostart, start-minimized
+        # --- Page: 电话汇报 (RPC) ---
+        report_page = QWidget()
+        rp = QVBoxLayout(report_page)
+        rp.setContentsMargins(12, 12, 12, 12)
+        rp.setSpacing(6)
+        self.rpc_enabled = QCheckBox("启用电话汇报 RPC（本地控制通道）")
+        self.rpc_port = QSpinBox()
+        self.rpc_port.setRange(1, 65535)
+        self.rpc_token = QLineEdit()
+        self.rpc_token.setReadOnly(True)
+        self.rpc_token_reset_btn = QPushButton("重置 Token")
+        self.rpc_token_reset_btn.clicked.connect(self._reset_token)
+        rpc_token_row = QHBoxLayout()
+        rpc_token_row.setSpacing(6)
+        rpc_token_row.addWidget(self.rpc_token)
+        rpc_token_row.addWidget(self.rpc_token_reset_btn)
+        self.report_target = QLineEdit()
+        self.report_target.setPlaceholderText("例如 sip:8000@192.168.1.116")
+        self.report_caller_id = QLineEdit()
+        self.report_caller_id.setPlaceholderText("主叫显示名（默认 TeleFlow）")
+        self.tts_voice = QLineEdit()
+        self.tts_voice.setPlaceholderText("例如 zh-CN-XiaoxiaoNeural")
+        self.ffmpeg_path = QLineEdit()
+        rp.addWidget(self.rpc_enabled)
+        rp.addWidget(QLabel("RPC 监听端口:"))
+        rp.addWidget(self.rpc_port)
+        rp.addWidget(QLabel("RPC Token (Bearer，隐藏显示；留空自动生成):"))
+        rp.addLayout(rpc_token_row)
+        rp.addWidget(QLabel("座机目标 SIP URI:"))
+        rp.addWidget(self.report_target)
+        rp.addWidget(QLabel("主叫显示名:"))
+        rp.addWidget(self.report_caller_id)
+        rp.addWidget(QLabel("TTS 音色:"))
+        rp.addWidget(self.tts_voice)
+        rp.addWidget(QLabel("ffmpeg 路径 (可选):"))
+        rp.addWidget(self.ffmpeg_path)
+        rp.addStretch()
+
+        # --- Page: 日志与启动 ---
+        log_page = QWidget()
+        ll = QVBoxLayout(log_page)
+        ll.setContentsMargins(12, 12, 12, 12)
+        ll.setSpacing(8)
         fl = QFormLayout()
         self.log_level = QComboBox()
         self.log_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -411,9 +518,30 @@ class SettingsDialog(QDialog):
         fl.addRow(self.autostart)
         self.start_minimized = QCheckBox("最小化启动")
         fl.addRow(self.start_minimized)
-        layout.addLayout(fl)
+        ll.addLayout(fl)
+        ll.addStretch()
 
-        # Buttons
+        for title, page in [
+            ("SIP 服务", sip_page),
+            ("网关与账号", gw_page),
+            ("钩子命令", hook_page),
+            ("电话汇报 (RPC)", report_page),
+            ("日志与启动", log_page),
+        ]:
+            self._menu.addItem(title)
+            self._pages.addWidget(page)
+        self._menu.currentRowChanged.connect(self._pages.setCurrentIndex)
+        self._menu.setCurrentRow(0)
+
+        # ffmpeg placeholder reflects auto-discovery: if a binary is on PATH, show
+        # its path so the user knows it will be used without explicit config.
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if ffmpeg_bin:
+            self.ffmpeg_path.setPlaceholderText(f"自动发现: {ffmpeg_bin}")
+        else:
+            self.ffmpeg_path.setPlaceholderText("留空 = 自动查找 PATH")
+
+        # Buttons (full width, below the split panes)
         btn_row = QHBoxLayout()
         self.save_btn = QPushButton("保存设置")
         self.save_btn.clicked.connect(self._save_and_close)
@@ -436,6 +564,13 @@ class SettingsDialog(QDialog):
         self._render_accounts()
         self.off_hook_cmd.setText(settings.off_hook_cmd)
         self.on_hook_cmd.setText(settings.on_hook_cmd)
+        self.rpc_enabled.setChecked(settings.rpc_enabled)
+        self.rpc_port.setValue(settings.rpc_port)
+        self.rpc_token.setText(settings.rpc_token)
+        self.report_target.setText(settings.report_target)
+        self.report_caller_id.setText(settings.report_caller_id)
+        self.tts_voice.setText(settings.tts_voice)
+        self.ffmpeg_path.setText(settings.ffmpeg_path)
         self.log_level.setCurrentText(settings.log_level)
         self.autostart.setChecked(settings.autostart)
         self.start_minimized.setChecked(settings.start_minimized)
@@ -449,11 +584,24 @@ class SettingsDialog(QDialog):
         settings.accounts = list(self._accounts)
         settings.off_hook_cmd = self.off_hook_cmd.text().strip()
         settings.on_hook_cmd = self.on_hook_cmd.text().strip()
+        settings.rpc_enabled = self.rpc_enabled.isChecked()
+        settings.rpc_port = self.rpc_port.value()
+        settings.rpc_token = self.rpc_token.text().strip()
+        settings.report_target = self.report_target.text().strip()
+        settings.report_caller_id = self.report_caller_id.text().strip()
+        settings.tts_voice = self.tts_voice.text().strip()
+        settings.ffmpeg_path = self.ffmpeg_path.text().strip()
         settings.log_level = self.log_level.currentText()
         settings.autostart = self.autostart.isChecked()
         settings.start_minimized = self.start_minimized.isChecked()
         self._store.save(settings)
         self.accept()
+
+    def _reset_token(self) -> None:
+        """Generate a fresh random RPC token (writes on Save)."""
+        import secrets
+
+        self.rpc_token.setText(secrets.token_hex(16))
 
     def _render_accounts(self) -> None:
         self._acct_label.setText(
@@ -516,6 +664,9 @@ class MainWindow(QMainWindow):
         settings_action = menu.addAction("设置")
         assert settings_action is not None
         settings_action.triggered.connect(self._open_settings)
+        report_action = menu.addAction("测试汇报")
+        assert report_action is not None
+        report_action.triggered.connect(self._test_report)
         menu.addSeparator()
         quit_action = menu.addAction("退出")
         assert quit_action is not None
@@ -543,6 +694,16 @@ class MainWindow(QMainWindow):
             self._settings_dialog = SettingsDialog(self._manager, self)
         self._settings_dialog.exec()
 
+    def _test_report(self) -> None:
+        """Trigger a phone report with built-in sample text (from the tray menu
+        or the dashboard button)."""
+        try:
+            self._service.start_report(
+                "这是一条 TeleFlow 测试汇报。座机接通后，你会听到这条语音播报。"
+            )
+        except Exception as exc:  # noqa: BLE001 - surface failures in the log view
+            self.append_log_line(f"[REPORT] 测试汇报失败: {exc}")
+
     def _wire_service(self) -> None:
         svc = self._service
         svc.on(EVENT_SIP_STARTED, lambda: self._sync_sip_button())
@@ -563,6 +724,27 @@ class MainWindow(QMainWindow):
             EVENT_CALL_ENDED,
             lambda call_id: self.dashboard.set_call_state(CallState.ENDED),
         )
+        svc.on(
+            EVENT_REPORT_STARTED,
+            lambda report_id, target: self.dashboard.set_report_state(ReportState.DIALING),
+        )
+        svc.on(
+            EVENT_REPORT_CONNECTED,
+            lambda call_id: self.dashboard.set_report_state(ReportState.PLAYING),
+        )
+        svc.on(
+            EVENT_REPORT_PLAYING,
+            lambda call_id: self.dashboard.set_report_state(ReportState.PLAYING),
+        )
+        svc.on(
+            EVENT_REPORT_COMPLETED,
+            lambda report_id, call_id: self.dashboard.set_report_state(ReportState.COMPLETED),
+        )
+        svc.on(
+            EVENT_REPORT_FAILED,
+            lambda reason, report_id: self.dashboard.set_report_state(ReportState.FAILED),
+        )
+        self.dashboard.set_test_report_callback(self._test_report)
         self._sync_sip_button()
 
     def _toggle_sip(self) -> None:
@@ -622,11 +804,15 @@ def build_app(
     audio_backend = audio_backend or _default_audio_backend()
     sip_backend = sip_backend or _default_sip_backend()
     manager = AudioDeviceManager(audio_backend, store)
-    service = SipCoreService(sip_backend, store)
+    tts = EdgeTtsBackend(ffmpeg_path=settings.ffmpeg_path)
+    service = SipCoreService(sip_backend, store, tts=tts)
     window = MainWindow(manager, service)
 
     logger = EventLogger(level=LogLevel[settings.log_level], sink=window.append_log_line)
     attach(logger, service, manager)
+
+    # Route phone-report sub-step logs ([REPORT]/[TTS]/[FFMPEG]) to the dashboard.
+    service._log = window.append_log_line
 
     # Re-route a live call when the user switches the playback/capture device.
     def _on_device_selected(_playback: str, _capture: str) -> None:
@@ -646,6 +832,11 @@ def build_app(
     # raised into the call path.
     hook_runner = SubprocessHookRunner(store, log=window.append_log_line)
     attach_hooks(service, hook_runner, store)
+
+    # Local loopback RPC control channel (feature teleflow-phone-report). Bound to
+    # 127.0.0.1 only, bearer-token authenticated. Skipped if disabled in settings.
+    rpc = RpcServer(service, store)
+    rpc.start()
 
     if settings.autostart:
         set_autostart(True)
