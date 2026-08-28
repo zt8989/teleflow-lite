@@ -1,0 +1,166 @@
+"""Audio device abstraction and selection (ticket 02).
+
+The manager is deliberately backend-agnostic: it talks to an ``AudioBackend``
+protocol so the real PortAudio/pjsua2 enumerator and a fake (used in tests and
+when pjsua2 is unavailable) are interchangeable. That seam is what lets the
+spec's "no real hardware" testing strategy work. The manager owns device
+selection and persists it through the injected ``ConfigStore``; it performs no
+audio I/O itself.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Protocol, runtime_checkable
+
+from teleflow.config import ConfigStore, Settings
+
+
+class DeviceKind(str, Enum):
+    PHYSICAL = "physical"
+    VIRTUAL = "virtual"
+
+
+@dataclass(frozen=True)
+class AudioDevice:
+    """A single audio endpoint exposed by a backend."""
+
+    id: str
+    name: str
+    kind: DeviceKind
+    supports_playback: bool
+    supports_capture: bool
+
+
+@runtime_checkable
+class AudioBackend(Protocol):
+    """Any source of an audio-device list."""
+
+    def enumerate(self) -> list[AudioDevice]: ...
+
+
+class FakeAudioBackend:
+    """Deterministic device list for tests and headless runs.
+
+    Mirrors the kind of devices TeleFlow expects to see: a physical headset plus
+    the two common virtual sound cards (VB-Cable on Windows, BlackHole on macOS).
+    Tests may append to ``devices`` to simulate hotplug before calling refresh.
+    """
+
+    def __init__(self, devices: list[AudioDevice] | None = None) -> None:
+        self.devices = list(devices) if devices is not None else self._defaults()
+
+    @staticmethod
+    def _defaults() -> list[AudioDevice]:
+        return [
+            AudioDevice("hw:0,0", "Built-in Headset", DeviceKind.PHYSICAL, True, True),
+            AudioDevice("vb-cable", "VB-Cable", DeviceKind.VIRTUAL, True, True),
+            AudioDevice("blackhole", "BlackHole", DeviceKind.VIRTUAL, True, True),
+        ]
+
+    def enumerate(self) -> list[AudioDevice]:
+        return list(self.devices)
+
+
+class PortAudioBackend:
+    """Real device enumeration via pjsua2 / PortAudio.
+
+    pjsua2 is imported lazily so this module stays importable (and testable)
+    without the native library installed. The library is initialised only as far
+    as needed to read device info; the SIP UA (ticket 03) will own the full
+    endpoint lifecycle.
+    """
+
+    def enumerate(self) -> list[AudioDevice]:
+        try:
+            import pjsua2 as pj
+        except ImportError as exc:  # pragma: no cover - exercised only with pjsua2
+            raise RuntimeError(
+                "pjsua2 is required for real audio device enumeration"
+            ) from exc
+
+        ep = pj.Endpoint()
+        if ep.libGetState() != pj.PJSUA2_LIBT_INIT:  # pragma: no cover - needs lib
+            ep.libCreate()
+            ep.libInit(pj.EpConfig())
+        manager = ep.audDevManager()
+
+        devices: list[AudioDevice] = []
+        for index in range(manager.getDevCount()):  # pragma: no cover - needs lib
+            info = manager.getDevInfo(index)
+            upper = info.name.upper()
+            kind = (
+                DeviceKind.VIRTUAL
+                if any(token in upper for token in ("CABLE", "BLACKHOLE", "VIRTUAL"))
+                else DeviceKind.PHYSICAL
+            )
+            devices.append(
+                AudioDevice(
+                    id=str(index),
+                    name=info.name,
+                    kind=kind,
+                    supports_playback=info.outputCount > 0,
+                    supports_capture=info.inputCount > 0,
+                )
+            )
+        return devices
+
+
+# TeleFlow hard rule: an empty / "-1" / -1 device id is never valid.
+_INVALID_IDS = {"", "-1", -1, None}
+
+
+class AudioDeviceManager:
+    """Enumerates devices, exposes independent playback/capture selection, and
+    persists that selection through the ``ConfigStore``.
+
+    Selection is validated but not checked against the live enumeration, so a
+    persisted id that is temporarily absent (device unplugged) still round-trips.
+    """
+
+    def __init__(self, backend: AudioBackend, store: ConfigStore) -> None:
+        self._backend = backend
+        self.store = store
+        self._devices: list[AudioDevice] = []
+        self.refresh()
+
+    def refresh(self) -> None:
+        self._devices = self._backend.enumerate()
+
+    @property
+    def devices(self) -> list[AudioDevice]:
+        return list(self._devices)
+
+    def playback_devices(self) -> list[AudioDevice]:
+        return [d for d in self._devices if d.supports_playback]
+
+    def capture_devices(self) -> list[AudioDevice]:
+        return [d for d in self._devices if d.supports_capture]
+
+    def current_selection(self) -> tuple[str, str]:
+        settings = self.store.load()
+        return (settings.playback_device_id, settings.capture_device_id)
+
+    def set_selection(self, playback_id: str | None, capture_id: str | None) -> None:
+        if playback_id in _INVALID_IDS or capture_id in _INVALID_IDS:
+            raise ValueError("device selection must not be null or -1")
+        settings = self.store.load()
+        settings.playback_device_id = str(playback_id)
+        settings.capture_device_id = str(capture_id)
+        self.store.save(settings)
+
+    def apply_preset(self, preset: str) -> tuple[str, str]:
+        if preset not in ("debug", "production"):
+            raise ValueError(f"unknown preset: {preset!r}")
+        kind = DeviceKind.PHYSICAL if preset == "debug" else DeviceKind.VIRTUAL
+        playback = next(
+            (d for d in self._devices if d.kind is kind and d.supports_playback), None
+        )
+        capture = next(
+            (d for d in self._devices if d.kind is kind and d.supports_capture), None
+        )
+        if playback is None or capture is None:
+            raise ValueError(f"no {kind.value} device available for preset {preset!r}")
+        self.set_selection(playback.id, capture.id)
+        return (playback.id, capture.id)
