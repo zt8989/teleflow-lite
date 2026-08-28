@@ -44,7 +44,7 @@ class ConfigStore:
     """
 
     def __init__(self, path: Path | None = None) -> None:
-        self.path = path or DEFAULT_CONFIG_PATH
+        self.path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
 
     def load(self) -> Settings:
         if not self.path.exists():

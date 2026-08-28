@@ -41,6 +41,9 @@ class SipBackend(Protocol):
     def answer(self, call_id: str) -> None: ...
     def hangup(self, call_id: str) -> None: ...
     def place_call(self, target: str) -> None: ...
+    def reroute(self) -> None:
+        """Re-apply the current device selection to a live call (mid-call switch)."""
+        ...
 
 
 class FakeSipBackend:
@@ -95,6 +98,10 @@ class FakeSipBackend:
     def place_call(self, target: str) -> None:
         self.placed.append(target)
 
+    def reroute(self) -> None:
+        # Scripted fake has no live call audio to re-route.
+        pass
+
 
 class SipCoreService:
     """Local UA: accepts ATA REGISTER, stores the Contact, auto-answers INVITE,
@@ -146,6 +153,14 @@ class SipCoreService:
         if self._contact is None:
             raise RuntimeError("no registered gateway to call")
         self._backend.place_call(target)
+
+    def reroute(self) -> None:
+        """Re-apply the current device selection to a live call (mid-call switch).
+
+        The backend (real pjsua2) re-wires the conference bridge to the freshly
+        selected devices; the fake is a no-op.
+        """
+        self._backend.reroute()
 
     def _dispatch(self, name: str, data: dict) -> None:
         if name == "register":

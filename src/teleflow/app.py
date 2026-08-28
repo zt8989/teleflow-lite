@@ -1,9 +1,10 @@
-"""PyQt6 application shell for TeleFlow (tickets 01–03).
+"""PyQt6 application shell for TeleFlow.
 
-Owns only the UI surface: a status panel and a settings page, wired to the
-Config Store, the Audio Device Manager, and the SIP Core Service. No SIP or
-audio I/O happens here — those arrive in later tickets. All collaborators are
-injected, so the window is testable without a display, real hardware, or pjsua2.
+Owns the UI surface (status, settings, log tabs, system tray) and wires it to
+the Config Store, the Audio Device Manager, and the SIP Core Service. SIP and
+audio I/O are delegated to injected backends (real pjsua2 when available,
+scripted fakes otherwise), so the window is testable without a display, real
+hardware, or the native library.
 """
 
 from __future__ import annotations
@@ -29,10 +30,13 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from teleflow.audio import AudioBackend, AudioDeviceManager, FakeAudioBackend, PortAudioBackend
+from teleflow.audio import (
+    AudioBackend, AudioDeviceManager, EVENT_DEVICE_SELECTED, FakeAudioBackend, PortAudioBackend,
+)
 from teleflow.autostart import set_autostart
 from teleflow.config import ConfigStore, Settings
 from teleflow.logging import EventLogger, LogLevel, attach
+from teleflow.pjsua2_backend import Pjsua2Backend
 from teleflow.sip import (
     CallState,
     EVENT_CALL_CONNECTED,
@@ -42,6 +46,7 @@ from teleflow.sip import (
     EVENT_SIP_STARTED,
     EVENT_SIP_STOPPED,
     FakeSipBackend,
+    SipBackend,
     SipCoreService,
 )
 
@@ -295,17 +300,21 @@ def _default_audio_backend() -> AudioBackend:
         return FakeAudioBackend()
 
 
-def _default_sip_backend() -> FakeSipBackend:
-    # The real pjsua2 transport is a pending native dependency (the pjsua2 sdist
-    # fails to build in this environment). Until it lands, drive the service with
-    # the scripted fake backend so the app is runnable and testable headless.
-    return FakeSipBackend()
+def _default_sip_backend() -> SipBackend:
+    # Prefer the real pjsua2 transport when the native library is built and
+    # installed; otherwise fall back to the scripted fake so the app stays
+    # runnable and testable headless.
+    try:
+        return Pjsua2Backend(ConfigStore())
+    except RuntimeError:
+        warnings.warn("pjsua2 unavailable; using fake SIP backend.")
+        return FakeSipBackend()
 
 
 def build_app(
     config_path: Path | None = None,
     audio_backend: AudioBackend | None = None,
-    sip_backend: FakeSipBackend | None = None,
+    sip_backend: SipBackend | None = None,
 ) -> QApplication:
     app = QApplication([])
     store = ConfigStore(config_path)
@@ -321,6 +330,12 @@ def build_app(
     window.settings_page.log_level.currentTextChanged.connect(
         lambda level: logger.set_level(LogLevel[level])
     )
+
+    # Re-route a live call when the user switches the playback/capture device.
+    def _on_device_selected(_playback: str, _capture: str) -> None:
+        service.reroute()
+
+    manager.on(EVENT_DEVICE_SELECTED, _on_device_selected)
 
     if settings.autostart:
         set_autostart(True)
