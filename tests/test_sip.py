@@ -1,11 +1,13 @@
-"""TDD tests for the SIP Core Service (ticket 03).
+"""TDD tests for the SIP Core Service (ticket 03/04/06).
 
-Written red (the module does not exist yet), then made green by
-``src/teleflow/sip.py``. The service is driven through its public interface
-against a ``FakeSipBackend`` that plays the role of the scripted ATA gateway,
-so no real network or pjsua2 is required — this is the pre-agreed "scripted SIP
-peer" testing seam from the spec.
+Driven through its public interface against a ``FakeSipBackend`` that plays the
+role of the scripted SIP peer, so no real network or pjsua2 is required — this
+is the pre-agreed "scripted SIP peer" testing seam from the spec. In the
+``sip-softphone`` design the backend simulates the client-registration outcomes
+that pjsua2 reports after registering to an external server.
 """
+
+import pytest
 
 from teleflow.config import ConfigStore
 from teleflow.sip import (
@@ -13,8 +15,9 @@ from teleflow.sip import (
     EVENT_CALL_CONNECTED,
     EVENT_CALL_ENDED,
     EVENT_CALL_INCOMING,
-    EVENT_GATEWAY_REGISTERED,
     EVENT_MEDIA_ERROR,
+    EVENT_SIP_REGISTERED,
+    EVENT_SIP_REGISTER_FAILED,
     EVENT_SIP_STARTED,
     FakeSipBackend,
     SipCoreService,
@@ -30,11 +33,12 @@ def _service(tmp_path):
 def test_register_emits_event_and_stores_contact(tmp_path) -> None:
     svc, backend = _service(tmp_path)
     received = []
-    svc.on(EVENT_GATEWAY_REGISTERED, lambda contact: received.append(contact))
+    svc.on(EVENT_SIP_REGISTERED, lambda contact: received.append(contact))
     svc.start()
     backend.receive_register("sip:ata@192.168.1.50:5060")
     assert received == ["sip:ata@192.168.1.50:5060"]
     assert svc.registered_contact == "sip:ata@192.168.1.50:5060"
+    assert svc.is_registered
 
 
 def test_incoming_invite_is_auto_answered_and_connected(tmp_path) -> None:
@@ -157,3 +161,54 @@ def test_fake_report_lifecycle_fires_handler(tmp_path) -> None:
     assert ("report_connected", {"call_id": "report-1"}) in events
     assert backend.report_played == [("report-1", "/tmp/r.wav")]
     assert ("report_eof", {"call_id": "report-1"}) in events
+
+
+# --- sip-softphone client registration path (ticket 04 / 06) ---
+
+
+def test_register_without_contact_is_registered(tmp_path) -> None:
+    """The client registration event may carry no Contact (scripted fake); it
+    still marks the service as registered."""
+    svc, backend = _service(tmp_path)
+    received: list[str] = []
+    svc.on(EVENT_SIP_REGISTERED, lambda contact: received.append(contact))
+    svc.start()
+    backend.receive_register()
+    assert svc.is_registered
+    assert svc.registered_contact is None
+    assert received == [""]
+
+
+def test_unregister_clears_registration(tmp_path) -> None:
+    svc, backend = _service(tmp_path)
+    svc.start()
+    backend.receive_register("sip:2001@provider.example.com")
+    assert svc.is_registered
+    backend.receive_unregister()
+    assert not svc.is_registered
+    assert svc.registered_contact is None
+
+
+def test_register_failed_clears_registration_and_reports(tmp_path) -> None:
+    svc, backend = _service(tmp_path)
+    failed: list[tuple[int, str]] = []
+    svc.on(
+        EVENT_SIP_REGISTER_FAILED,
+        lambda code, reason: failed.append((code, reason)),
+    )
+    svc.start()
+    backend.receive_register_failed(code=401, reason="Unauthorized")
+    assert not svc.is_registered
+    assert failed == [(401, "Unauthorized")]
+
+
+def test_place_call_requires_registration(tmp_path) -> None:
+    svc, backend = _service(tmp_path)
+    svc.start()
+    with pytest.raises(RuntimeError):
+        svc.place_call("sip:2001@provider.example.com")
+    backend.receive_register("sip:2001@provider.example.com")
+    svc.place_call("sip:2001@provider.example.com")
+    assert backend.placed == ["sip:2001@provider.example.com"]
+
+

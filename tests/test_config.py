@@ -6,6 +6,7 @@ a Settings record round-trips, defaults apply on a fresh/missing file, and
 partial or unknown keys merge cleanly against the defaults.
 """
 
+import json
 from pathlib import Path
 
 from teleflow.config import ConfigStore, Settings
@@ -16,6 +17,9 @@ def test_load_returns_defaults_when_file_missing(tmp_path: Path) -> None:
     settings = store.load()
     assert settings == Settings()
     assert settings.sip_port == 5060
+    assert settings.sip_server == ""
+    assert settings.sip_user == ""
+    assert settings.sip_password == ""
 
 
 def test_store_accepts_str_path(tmp_path: Path) -> None:
@@ -35,44 +39,67 @@ def test_round_trip_preserves_all_fields(tmp_path: Path) -> None:
         autostart=True,
         start_minimized=True,
         log_level="DEBUG",
-        gateway_port=5071,
-        gateway_password="secret",
-        sip_number="2002",
-        accounts=["1001", "1002"],
+        sip_server="sip:proxy.example.com:5060",
+        sip_user="2002",
+        sip_password="secret",
     )
     store.save(original)
     assert store.load() == original
 
 
-def test_gateway_fields_default_on_fresh_file(tmp_path: Path) -> None:
+def test_sip_client_fields_default_on_fresh_file(tmp_path: Path) -> None:
     store = ConfigStore(tmp_path / "config.json")
     settings = store.load()
-    assert settings.gateway_port == 5060
-    assert settings.gateway_password == ""
-    assert settings.sip_number == "1001"
-    assert settings.accounts == []
+    assert settings.sip_port == 5060
+    assert settings.sip_server == ""
+    assert settings.sip_user == ""
+    assert settings.sip_password == ""
 
 
 def test_old_file_without_new_fields_uses_defaults(tmp_path: Path) -> None:
-    """A config file written by an older version (no gateway/accounts keys)
-    must still load without error, falling back to the new defaults."""
+    """A config file written by an older version (pre-sip-softphone) must still
+    load, carrying ``sip_port`` over as the local transport and dropping the
+    retired server-only fields (gateway_port, accounts, ata_registrar_port)."""
     store = ConfigStore(tmp_path / "config.json")
     store.path.write_text(
         '{"sip_port": 5090, "playback_device_id": "x"}', encoding="utf-8"
     )
     loaded = store.load()
-    assert loaded.sip_port == 5090
+    assert loaded.sip_port == 5090  # old sip_port carries over as local transport
     assert loaded.playback_device_id == "x"
-    assert loaded.gateway_port == 5060
-    assert loaded.accounts == []
-    assert loaded.sip_number == "1001"
+    assert loaded.sip_user == ""  # sip_number no longer auto-defaults
+
+
+def test_migration_maps_gateway_fields_to_client_credentials(tmp_path: Path) -> None:
+    """A pre-sip-softphone config used gateway_password / sip_number for the
+    gateway identity. These must migrate onto the new client sip_user /
+    sip_password; the server-only gateway_port / accounts are dropped."""
+    store = ConfigStore(tmp_path / "config.json")
+    store.path.write_text(
+        json.dumps(
+            {
+                "sip_port": 5060,
+                "gateway_port": 5062,
+                "gateway_password": "old-secret",
+                "sip_number": "2001",
+                "accounts": ["1001@provider"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = store.load()
+    assert loaded.sip_user == "2001"
+    assert loaded.sip_password == "old-secret"
+    assert loaded.sip_port == 5060  # unchanged
+    assert not hasattr(loaded, "gateway_port")  # retired, not carried over
+    assert not hasattr(loaded, "accounts")
 
 
 def test_partial_file_merges_with_defaults(tmp_path: Path) -> None:
     store = ConfigStore(tmp_path / "config.json")
     store.path.write_text('{"sip_port": 5080}', encoding="utf-8")
     loaded = store.load()
-    assert loaded.sip_port == 5080
+    assert loaded.sip_port == 5080  # old sip_port migrates to local transport
     assert loaded.autostart is False  # default retained
     assert loaded.log_level == "INFO"
 
@@ -81,7 +108,7 @@ def test_unknown_keys_are_ignored(tmp_path: Path) -> None:
     store = ConfigStore(tmp_path / "config.json")
     store.path.write_text('{"sip_port": 5090, "mystery": true}', encoding="utf-8")
     loaded = store.load()
-    assert loaded.sip_port == 5090
+    assert loaded.sip_port == 5090  # old sip_port migrates to local transport
     assert not hasattr(loaded, "mystery")
 
 

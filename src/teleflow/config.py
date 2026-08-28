@@ -23,16 +23,17 @@ class Settings:
     falls back to these defaults on load.
     """
 
+    # Local SIP transport: pjsua2 binds this UDP port as a SIP *client*.
     sip_port: int = 5060
+    # SIP client account — TeleFlow registers to this registrar/proxy as this user.
+    sip_server: str = ""  # registrar/proxy URI, e.g. "sip:provider.example.com:5060"
+    sip_user: str = ""  # AOR / auth username
+    sip_password: str = ""  # auth password
     playback_device_id: str = ""
     capture_device_id: str = ""
     autostart: bool = False
     start_minimized: bool = False
     log_level: str = "INFO"
-    gateway_port: int = 5060
-    gateway_password: str = ""
-    sip_number: str = "1001"
-    accounts: list[str] = field(default_factory=list)
     # Hook commands (ticket 01/02): local shell commands run at call-lifecycle
     # moments, with {call_id} substituted. Empty means no hook.
     #   off_hook_cmd — when the current SIP auto-answers an incoming call (摘机).
@@ -86,6 +87,23 @@ class ConfigStore:
         if not isinstance(raw, dict):
             return Settings()
         known = {k: v for k, v in raw.items() if k in Settings.field_names()}
+        # Field migration from the pre-sip-softphone schema (and the intermediate
+        # ata-registration branch). The old design was a SIP *server* the gateway
+        # registered to; the new design is a SIP *client* that registers to an
+        # external server. The server-only fields (gateway_port, accounts,
+        # ata_registrar_port) have no client equivalent and are dropped. The
+        # identity/password fields map onto the new client credentials. ``sip_port``
+        # is already a current field, so it carries over unchanged.
+        if "sip_user" not in known:
+            for legacy in ("sip_number", "ata_number"):
+                if legacy in raw:
+                    known["sip_user"] = raw[legacy]
+                    break
+        if "sip_password" not in known:
+            for legacy in ("gateway_password", "ata_password"):
+                if legacy in raw:
+                    known["sip_password"] = raw[legacy]
+                    break
         return Settings(**known)
 
     def save(self, settings: Settings) -> None:

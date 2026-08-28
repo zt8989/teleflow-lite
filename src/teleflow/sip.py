@@ -20,7 +20,9 @@ from teleflow.tts import TtsBackend, TtsError, clean_markdown
 # Domain events emitted to subscribers.
 EVENT_SIP_STARTED = "sip_started"
 EVENT_SIP_STOPPED = "sip_stopped"
-EVENT_GATEWAY_REGISTERED = "gateway_registered"
+EVENT_SIP_REGISTERED = "sip_registered"
+EVENT_SIP_UNREGISTERED = "sip_unregistered"
+EVENT_SIP_REGISTER_FAILED = "sip_register_failed"
 EVENT_CALL_INCOMING = "call_incoming"
 EVENT_CALL_CONNECTED = "call_connected"
 EVENT_CALL_ENDED = "call_ended"
@@ -88,12 +90,14 @@ class SipBackend(Protocol):
 
 
 class FakeSipBackend:
-    """Scripted ATA gateway for tests/headless runs.
+    """Scripted SIP transport for tests/headless runs.
 
     The test drives it with ``receive_register`` / ``receive_invite`` /
     ``receive_bye`` / ``receive_media_error``; the backend invokes the service's
-    handler exactly as a real UA transport would, so the service logic is
-    exercised end-to-end without a network or pjsua2.
+    handler exactly as a real pjsua2 transport would, so the service logic is
+    exercised end-to-end without a network or pjsua2. In the ``sip-softphone``
+    design it additionally simulates the client-registration outcomes that
+    pjsua2 reports after it registers to the external server.
     """
 
     def __init__(self) -> None:
@@ -121,9 +125,18 @@ class FakeSipBackend:
         assert self._handler is not None, "backend used before start()"
         self._handler(name, data)
 
-    # --- test hooks (the scripted ATA) ---
-    def receive_register(self, contact: str) -> None:
-        self._fire("register", contact=contact)
+    # --- test hooks (the scripted SIP peer) ---
+    def receive_register(self, contact: str | None = None) -> None:
+        if contact is not None:
+            self._fire("register", contact=contact)
+        else:
+            self._fire("register")
+
+    def receive_unregister(self) -> None:
+        self._fire("unregister")
+
+    def receive_register_failed(self, code: int = 0, reason: str = "") -> None:
+        self._fire("register_failed", code=code, reason=reason)
 
     def receive_invite(self, call_id: str) -> None:
         self._fire("invite", call_id=call_id)
@@ -180,9 +193,13 @@ class FakeSipBackend:
 
 
 class SipCoreService:
-    """Local UA: accepts ATA REGISTER, stores the Contact, auto-answers INVITE,
-    and emits call/media state as domain events. State resets cleanly on
-    hang-up or abnormal disconnect.
+    """Local UA: stores the registered Contact, auto-answers INVITE, and emits
+    call/media state as domain events. State resets cleanly on hang-up or
+    abnormal disconnect.
+
+    In the ``sip-softphone`` design the service is a SIP *client*: the backend
+    registers to an external registrar and reports ``register`` / ``unregister``
+    through the same dispatch the service uses to drive the UI/logger.
     """
 
     def __init__(
@@ -196,6 +213,7 @@ class SipCoreService:
         self._tts = tts
         self._state = CallState.IDLE
         self._contact: str | None = None
+        self._registered = False
         self._running = False
         self._subscribers: dict[str, list[Callable[..., None]]] = {}
         # Phone-report state (feature teleflow-phone-report).
@@ -228,6 +246,10 @@ class SipCoreService:
         return self._contact
 
     @property
+    def is_registered(self) -> bool:
+        return self._registered
+
+    @property
     def running(self) -> bool:
         return self._running
 
@@ -240,8 +262,8 @@ class SipCoreService:
         return self._report_active
 
     def start(self) -> None:
-        port = self._store.load().sip_port
-        self._backend.start(port, self._dispatch)
+        settings = self._store.load()
+        self._backend.start(settings.sip_port, self._dispatch)
         self._running = True
         self._emit(EVENT_SIP_STARTED)
 
@@ -250,11 +272,12 @@ class SipCoreService:
         self._running = False
         self._state = CallState.IDLE
         self._contact = None
+        self._registered = False
         self._emit(EVENT_SIP_STOPPED)
 
     def place_call(self, target: str) -> None:
-        if self._contact is None:
-            raise RuntimeError("no registered gateway to call")
+        if not self._registered:
+            raise RuntimeError("SIP client is not registered")
         self._backend.place_call(target)
 
     # ------------------------------------------------------------------
@@ -393,8 +416,23 @@ class SipCoreService:
 
     def _dispatch(self, name: str, data: dict) -> None:
         if name == "register":
-            self._contact = str(data["contact"])
-            self._emit(EVENT_GATEWAY_REGISTERED, contact=self._contact)
+            # The backend may report a Contact (real pjsua2) or none (scripted
+            # fake); either way registration succeeded.
+            self._contact = data.get("contact")
+            self._registered = True
+            self._emit(EVENT_SIP_REGISTERED, contact=self._contact or "")
+        elif name == "unregister":
+            self._contact = None
+            self._registered = False
+            self._emit(EVENT_SIP_UNREGISTERED)
+        elif name == "register_failed":
+            self._contact = None
+            self._registered = False
+            self._emit(
+                EVENT_SIP_REGISTER_FAILED,
+                code=int(data.get("code", 0)),
+                reason=str(data.get("reason", "")),
+            )
         elif name == "invite":
             call_id = str(data["call_id"])
             self._state = CallState.INCOMING

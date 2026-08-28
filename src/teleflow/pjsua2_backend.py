@@ -86,6 +86,26 @@ class Pjsua2AudioController:
         self._mgr.setCaptureDev(int(device_id))
 
 
+def _sip_uri(server: str) -> str:
+    """Normalize a user-entered registrar address into a ``sip:`` URI."""
+    s = server.strip()
+    if not s:
+        return ""
+    if s.startswith("sip:"):
+        return s
+    return f"sip:{s}"
+
+
+def _host_of(server: str) -> str:
+    """Extract the host part from a ``sip:`` URI or a bare ``host[:port]``."""
+    s = server.strip()
+    if s.startswith("sip:"):
+        s = s[4:]
+    if "@" in s:  # strip user@ if present
+        s = s.split("@", 1)[1]
+    return s.split(":", 1)[0]
+
+
 def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
     """Build the pjsua2 Account/Call subclasses wired to this backend."""
 
@@ -140,6 +160,28 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
             # and the real backend.
             if backend._handler is not None:
                 backend._handler("invite", {"call_id": call_id})
+
+        def onRegState(self, prm: Any) -> None:  # noqa: ARG002 - prm unused
+            # Report client-registration outcomes to the SIP core so it can
+            # drive the "SIP 注册" state. pjsua2 fires this on every REGISTER
+            # transaction: code 200 + expiration>0 = registered, code 200 +
+            # expiration 0 = unregistered. 401/407 are digest-auth challenges
+            # pjsua2 answers itself; the real outcome arrives in a subsequent
+            # onRegState, so we must not surface them as a failure or the UI
+            # flashes a spurious error before the 200 OK lands.
+            if backend._handler is None:
+                return
+            code = getattr(prm, "code", 0)
+            expiration = getattr(prm, "expiration", 0)
+            if code == 200 and expiration > 0:
+                backend._handler("register", {})
+            elif code == 200 and expiration == 0:
+                backend._handler("unregister", {})
+            elif code not in (401, 407):
+                backend._handler(
+                    "register_failed",
+                    {"code": code, "reason": getattr(prm, "reason", "")},
+                )
 
     return Call, Account
 
@@ -227,7 +269,21 @@ class Pjsua2Backend:
         self._ep.libStart()
 
         acc_cfg = self._pj.AccountConfig()
-        acc_cfg.idUri = "sip:teleflow@localhost"
+        settings = self._store.load()
+        # Local account URI (the AOR). Anchor the host to the configured
+        # registrar when present so the identity matches the server's realm;
+        # otherwise fall back to a local peer identity (direct IP calling).
+        host = _host_of(settings.sip_server) or "localhost"
+        acc_cfg.idUri = f"sip:{settings.sip_user or 'teleflow'}@{host}"
+        # Register to the configured SIP server as a client, with digest auth.
+        if settings.sip_server:
+            acc_cfg.regConfig.registrarUri = _sip_uri(settings.sip_server)
+            acc_cfg.regConfig.register = True
+            if settings.sip_user:
+                cred = self._pj.AuthCredInfo(
+                    "digest", "*", settings.sip_user, 0, settings.sip_password
+                )
+                acc_cfg.sipConfig.authCreds.append(cred)
         assert self._account_cls is not None
         self._account = self._account_cls()
         self._account.create(acc_cfg)
