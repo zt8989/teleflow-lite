@@ -9,6 +9,12 @@
 # building user (no quarantine, no Gatekeeper block), but distributing to other
 # machines requires an Apple Developer signature + notarization, which is out of
 # scope here.
+#
+# Phone-report feature (teleflow-phone-report): report audio is synthesized with
+# edge-tts (a pip dependency) and transcoded with ffmpeg. ffmpeg is NOT bundled
+# here — it must be present on the target machine's PATH (e.g. `brew install
+# ffmpeg`) or configured via TeleFlow's `ffmpeg_path` setting. See
+# packaging/macos/README.md.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

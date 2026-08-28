@@ -88,7 +88,7 @@
   .row > *{flex:1;min-width:200px}
 
   /* stat tiles */
-  .statgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+  .statgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}
   .stat{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:12px}
   .stat .k{font-size:11px;color:var(--muted);margin-bottom:6px}
   .stat .v{font-size:14px;font-weight:600}
@@ -100,6 +100,7 @@
   .log .ln{white-space:pre-wrap}
   .log .ln .t{color:#9a9a9a}
   .log .ln.sip{color:#0b6fb0}.log .ln.media{color:var(--ok)}.log .ln.dev{color:var(--warn)}.log .ln.err{color:var(--bad)}.log .ln.hook{color:#7a3fb5;font-weight:600}
+  .log .ln.report{color:#6a3fb5;font-weight:600}.log .ln.tts{color:var(--warn)}.log .ln.ffmpeg{color:#9a3fb0}
 
   .demo{display:flex;gap:7px;flex-wrap:wrap;align-items:center;border-top:1px dashed var(--line);
         padding-top:10px;margin-top:4px}
@@ -130,6 +131,18 @@
   .modalHead span{font-weight:600;font-size:13px}
   #settingsBody{padding:16px;background:var(--bg)}
 
+  /* settings dialog: left menu + right grouped panels (macOS System Settings style) */
+  .dlgLayout{display:flex;gap:14px;align-items:stretch}
+  .dlgMenu{width:150px;flex:0 0 150px;display:flex;flex-direction:column;gap:2px;
+           border-right:1px solid var(--line);padding-right:12px}
+  .dlgMenu button{display:block;width:100%;text-align:left;background:none;border:none;
+    color:#1c1c1c;padding:7px 10px;border-radius:3px;cursor:pointer;font-size:13px}
+  .dlgMenu button:hover{background:#e7eef7}
+  .dlgMenu button.active{background:var(--accent);color:#fff}
+  .dlgPanel{flex:1;min-width:0}
+  .dlgPanel.hidden{display:none}
+  .dlgFoot{margin-top:14px;display:flex;justify-content:flex-end;gap:10px}
+
   .hidden{display:none !important}
   @media (max-width:720px){.statgrid{grid-template-columns:repeat(2,1fr)}}
 </style>
@@ -155,6 +168,7 @@
     <button onclick="simMenu('start')">▶ 启动服务</button>
     <button onclick="simMenu('stop')">⏸ 停止服务</button>
     <button onclick="simMenu('show')">🪟 显示窗口</button>
+    <button onclick="simReport()">📞 测试汇报</button>
     <button onclick="openSettings()">⚙ 设置</button>
     <div class="sep"></div>
     <button class="danger" onclick="simMenu('quit')">⏻ 退出</button>
@@ -164,7 +178,7 @@
 <!-- settings, opened from the tray menu -->
 <div class="modal hidden" id="settingsModal">
   <div class="modalCard">
-    <div class="modalHead"><span>设置 / 连接（网关 + SIP）</span>
+    <div class="modalHead"><span>设置</span>
       <button class="btn" onclick="closeSettings()">关闭</button></div>
     <div id="settingsBody"></div>
   </div>
@@ -196,6 +210,9 @@ const state = {
   callId:"",
   accounts:[],
   offHookCmd:"", onHookCmd:"",
+  rpcToken:"",
+  reportTarget:"sip:8000@192.168.1.116",
+  report:{state:"空闲", id:""},
   log:[],
 };
 function now(){const d=new Date();return d.toTimeString().slice(0,8);}
@@ -255,6 +272,39 @@ function toggleSip(){state.sipRunning=!state.sipRunning;pushLog(state.sipRunning
 function addAccount(){const el=document.getElementById("acctInput");const v=el?el.value.trim():"";if(!v)return;state.accounts.push(v);pushLog(`添加账号：${v}`,"sip");}
 function connectSim(){pushLog("模拟网关已连接（端口/密码已应用），SIP 号码注册中…","sip");pushLog("INVITE 通道就绪，自动应答已开启","media");}
 
+/* settings dialog: switch left-menu -> right panel */
+function showPanel(name){
+  ["sip","gw","hook","rpc","log"].forEach(n=>{
+    const p=document.getElementById("p-"+n); if(p) p.classList.toggle("hidden", n!==name);
+    const m=document.getElementById("m-"+n); if(m) m.classList.toggle("active", n===name);
+  });
+}
+function resetToken(){
+  state.rpcToken = "tok_"+Math.random().toString(36).slice(2,18);
+  const el=document.getElementById("rpcToken"); if(el) el.value=state.rpcToken;
+  pushLog("RPC Token 已重置","report");
+}
+/* simulate the phone-report flow end-to-end (TTS -> dial -> play -> EOF -> hangup) */
+function simReport(){
+  if(state.report.id){ pushLog("已有汇报进行中，忽略","report"); return; }
+  if(!state.sipRunning){ pushLog("SIP 未运行，无法汇报（请先启动服务）","report"); return; }
+  state.report.id="RPT-"+Math.random().toString(36).slice(2,6).toUpperCase();
+  state.report.state="拨号中…"; render();
+  pushLog(`[REPORT] 启动汇报: target=${state.reportTarget} voice=zh-CN-XiaoxiaoNeural`,"report");
+  setTimeout(()=>{
+    pushLog("[TTS] 合成中: voice=zh-CN-XiaoxiaoNeural","tts");
+    pushLog("[TTS] 合成完成: report_xxxx.mp3","tts");
+    pushLog("[FFMPEG] 转码完成: report_xxxx.wav","ffmpeg");
+    pushLog("[REPORT] 座机接通, 开始播放 (call CALL-RPT)","report");
+    state.report.state="播放中…"; render();
+    setTimeout(()=>{
+      pushLog("[REPORT] 播放结束, 挂断 (call CALL-RPT)","report");
+      state.report.state="已完成"; render();
+      setTimeout(()=>{ state.report.id=""; state.report.state="空闲"; render(); },1300);
+    },2200);
+  },1200);
+}
+
 const DEMO = `<div class="demo">
   <span class="lbl">演示事件：</span>
   <button class="btn" onclick="simRegister()">网关注册</button>
@@ -262,6 +312,7 @@ const DEMO = `<div class="demo">
   <button class="btn" onclick="simEnd()">挂断</button>
   <button class="btn" onclick="toggleSip()">启停服务</button>
   <button class="btn" onclick="refreshDevices()">刷新设备</button>
+  <button class="btn primary" onclick="simReport()">测试汇报</button>
 </div>`;
 
 /* device routing card (core of the dashboard) */
@@ -282,32 +333,64 @@ const DEV_PANE = `<div class="card">
 const LOG_PANE = `<div class="card"><h3>实时日志（SIP / 媒体 / 设备）</h3>
   <div class="log" id="logbox">${fmtLog()}</div>${DEMO}</div>`;
 
-/* settings panel — lives in the tray-opened dialog, not on the dashboard */
-const SETTINGS_PANE = `<div class="card dlg">
-  <h3>设置 / 连接（网关 + SIP）</h3>
-  <label class="fld"><span>SIP 监听端口（TeleFlow 本地 UA，默认 5060）</span><input type="number" value="5060"></label>
-  <div class="row">
-    <label class="fld"><span>网关端口</span><input type="number" value="5060"></label>
-    <label class="fld"><span>网关密码</span><input type="password" placeholder="网关注册密码"></label>
+/* settings panel — lives in the tray-opened dialog, not on the dashboard.
+   Left menu + right grouped panels (macOS System Settings style). */
+const SETTINGS_PANE = `<div class="dlgLayout">
+  <div class="dlgMenu">
+    <button id="m-sip" class="active" onclick="showPanel('sip')">SIP 服务</button>
+    <button id="m-gw" onclick="showPanel('gw')">网关与账号</button>
+    <button id="m-hook" onclick="showPanel('hook')">钩子命令</button>
+    <button id="m-rpc" onclick="showPanel('rpc')">电话汇报 (RPC)</button>
+    <button id="m-log" onclick="showPanel('log')">日志与启动</button>
   </div>
-  <label class="fld"><span>SIP 号码</span><input type="text" value="1001" placeholder="例如 1001"></label>
-  <label class="fld"><span>添加账号（分机号 / 名称）</span><input type="text" id="acctInput" placeholder="例如 1001"></label>
-  <div class="row" style="align-items:center;margin-bottom:12px">
-    <button class="btn primary" onclick="connectSim()">模拟网关 + SIP 连接</button>
-    <button class="btn" onclick="addAccount()">添加账号</button>
+  <div style="flex:1;min-width:0">
+    <div class="dlgPanel" id="p-sip">
+      <label class="fld"><span>SIP 监听端口（TeleFlow 本地 UA，默认 5060）</span><input type="number" value="5060"></label>
+      <p class="hint">TeleFlow 作为本地 SIP UA 监听此端口，对接电话网关 / ATA。</p>
+    </div>
+    <div class="dlgPanel hidden" id="p-gw">
+      <div class="row">
+        <label class="fld"><span>网关端口</span><input type="number" value="5060"></label>
+        <label class="fld"><span>网关密码</span><input type="password" placeholder="网关注册密码"></label>
+      </div>
+      <label class="fld"><span>SIP 号码</span><input type="text" value="1001" placeholder="例如 1001"></label>
+      <label class="fld"><span>添加账号（分机号 / 名称）</span><input type="text" id="acctInput" placeholder="例如 1001"></label>
+      <div class="row" style="align-items:center;margin-bottom:12px">
+        <button class="btn primary" onclick="connectSim()">模拟网关 + SIP 连接</button>
+        <button class="btn" onclick="addAccount()">添加账号</button>
+      </div>
+      <div style="margin-bottom:12px">${state.accounts.length? state.accounts.map(a=>`<span class="pill" style="margin:4px 6px 0 0">${a}</span>`).join("") : '<span style="color:var(--muted);font-size:12px">尚未添加账号</span>'}</div>
+    </div>
+    <div class="dlgPanel hidden" id="p-hook">
+      <p class="hint" style="margin:0 0 12px">通话生命周期的本地命令，可用 <code>{call_id}</code> 表示来电 ID；留空则不执行。命令以非阻塞方式在后台线程执行，失败仅记入实时日志，不会中断通话。</p>
+      <label class="fld"><span>摘机命令（自动接通时执行）</span><input type="text" id="offHookCmd" value="${state.offHookCmd}" placeholder="例如 /usr/local/bin/on-answer.sh {call_id}"></label>
+      <label class="fld"><span>挂机命令（通话结束时执行）</span><input type="text" id="onHookCmd" value="${state.onHookCmd}" placeholder="例如 /usr/local/bin/on-hangup.sh {call_id}"></label>
+    </div>
+    <div class="dlgPanel hidden" id="p-rpc">
+      <label class="fld" style="display:flex;align-items:center;gap:8px"><input type="checkbox" checked> 启用电话汇报 RPC（本地控制通道）</label>
+      <label class="fld"><span>RPC 监听端口</span><input type="number" value="8731"></label>
+      <label class="fld"><span>RPC Token（Bearer；留空自动生成并保存）</span>
+        <div class="row" style="align-items:center;gap:8px">
+          <input type="text" id="rpcToken" value="${state.rpcToken}" readonly placeholder="自动生成">
+          <button class="btn" onclick="resetToken()">重置 Token</button>
+        </div></label>
+      <label class="fld"><span>座机目标 SIP URI</span><input type="text" id="reportTarget" value="${state.reportTarget}" placeholder="例如 sip:8000@192.168.1.116"></label>
+      <label class="fld"><span>主叫显示名</span><input type="text" value="TeleFlow" placeholder="默认 TeleFlow"></label>
+      <label class="fld"><span>TTS 音色</span><input type="text" value="zh-CN-XiaoxiaoNeural" placeholder="例如 zh-CN-XiaoxiaoNeural"></label>
+      <label class="fld"><span>ffmpeg 路径（可选）</span><input type="text" placeholder="自动发现: /opt/homebrew/bin/ffmpeg"></label>
+      <p class="hint">外部 hook（如 WorkBuddy Stop hook）POST 文本到 <code>/v1/report</code> 即可让本机拨打座机并播放。ffmpeg 留空时从 PATH 自动查找。</p>
+    </div>
+    <div class="dlgPanel hidden" id="p-log">
+      <div class="row">
+        <label class="fld"><span>日志级别</span><select><option>DEBUG</option><option selected>INFO</option><option>WARNING</option><option>ERROR</option></select></label>
+        <label class="fld"><span>开机自启</span><select><option>关</option><option>开</option></select></label>
+        <label class="fld"><span>最小化启动</span><select><option>关</option><option>开</option></select></label>
+      </div>
+    </div>
   </div>
-  <div style="margin-bottom:12px">${state.accounts.length? state.accounts.map(a=>`<span class="pill" style="margin:4px 6px 0 0">${a}</span>`).join("") : '<span style="color:var(--muted);font-size:12px">尚未添加账号</span>'}</div>
-  <div class="row">
-    <label class="fld"><span>日志级别</span><select><option>DEBUG</option><option selected>INFO</option><option>WARNING</option><option>ERROR</option></select></label>
-    <label class="fld"><span>开机自启</span><select><option>关</option><option>开</option></select></label>
-    <label class="fld"><span>最小化启动</span><select><option>关</option><option>开</option></select></label>
-  </div>
-  <div style="margin:16px 0 12px;border-top:1px dashed var(--line);padding-top:14px">
-    <div style="font-size:13px;font-weight:600;color:#2a2a2a;margin-bottom:10px">Hook 命令（摘机 / 挂机）</div>
-    <p class="hint" style="margin:0 0 12px">通话生命周期的本地命令，可用 <code>{call_id}</code> 表示来电 ID；留空则不执行。命令以非阻塞方式在后台线程执行，失败仅记入实时日志，不会中断通话。</p>
-    <label class="fld"><span>摘机命令（自动接通时执行）</span><input type="text" id="offHookCmd" value="${state.offHookCmd}" placeholder="例如 /usr/local/bin/on-answer.sh {call_id}"></label>
-    <label class="fld"><span>挂机命令（通话结束时执行）</span><input type="text" id="onHookCmd" value="${state.onHookCmd}" placeholder="例如 /usr/local/bin/on-hangup.sh {call_id}"></label>
-  </div>
+</div>
+<div class="dlgFoot">
+  <button class="btn" onclick="closeSettings()">关闭</button>
   <button class="btn primary" onclick="saveSettings()">保存设置</button>
 </div>`;
 
@@ -322,6 +405,7 @@ function Dashboard(){
     <div class="stat"><div class="k">网关注册</div><div class="v">${state.gateway}</div></div>
     <div class="stat"><div class="k">当前模式</div><div class="v">${state.mode}</div></div>
     <div class="stat"><div class="k">通话状态</div><div class="v">${state.call}</div></div>
+    <div class="stat"><div class="k">电话汇报</div><div class="v">${state.report.state}</div></div>
   </div>
   ${DEV_PANE}
   ${LOG_PANE}`;
@@ -354,6 +438,7 @@ function simMenu(a){
   if(a==="start"){ if(!state.sipRunning) toggleSip(); else pushLog("服务已在运行","sip"); }
   else if(a==="stop"){ if(state.sipRunning) toggleSip(); else pushLog("服务已停止","sip"); }
   else if(a==="show"){ pushLog("显示主窗口","sip"); }
+  else if(a==="report"){ simReport(); }
   else if(a==="quit"){
     pushLog("应用退出（原型模拟）","sip");
     document.getElementById("stage").innerHTML =
@@ -371,9 +456,11 @@ function closeSettings(){document.getElementById("settingsModal").classList.add(
 function saveSettings(){
   const o=document.getElementById("offHookCmd");
   const n=document.getElementById("onHookCmd");
+  const t=document.getElementById("reportTarget");
   if(o) state.offHookCmd=o.value;
   if(n) state.onHookCmd=n.value;
-  pushLog("设置已保存（含 Hook 命令）","sip");
+  if(t) state.reportTarget=t.value;
+  pushLog("设置已保存（含 电话汇报 RPC 配置）","report");
   closeSettings();
 }
 document.getElementById("settingsModal").addEventListener("click",(e)=>{
