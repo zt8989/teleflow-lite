@@ -6,6 +6,7 @@ requires network and is intentionally not asserted in CI (native/network-only).
 """
 
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -54,9 +55,9 @@ def test_clean_markdown_handles_structure_and_tables() -> None:
 
 
 def test_edge_tts_backend_finds_ffmpeg_on_path(monkeypatch) -> None:
-    monkeypatch.setattr(shutil, "which", lambda _name: "/bin/cat")
+    monkeypatch.setattr(shutil, "which", lambda _name: sys.executable)
     backend = EdgeTtsBackend(ffmpeg_path="", cache_dir=Path("/tmp/teleflow-tts-test"))
-    assert backend._ffmpeg_bin() == "/bin/cat"
+    assert backend._ffmpeg_bin() == sys.executable
 
 
 def test_edge_tts_backend_uses_configured_ffmpeg_path(tmp_path: Path) -> None:
@@ -76,11 +77,9 @@ def test_edge_tts_backend_raises_when_ffmpeg_missing(monkeypatch) -> None:
 
 
 def test_edge_tts_backend_transcode_failure_raises(tmp_path: Path) -> None:
-    # A present-but-failing binary stands in for ffmpeg exiting non-zero.
-    script = tmp_path / "ffmpeg_fail"
-    script.write_text("#!/bin/sh\nexit 3\n")
-    script.chmod(0o755)
-    backend = EdgeTtsBackend(ffmpeg_path=str(script), cache_dir=tmp_path)
+    # A present-but-failing binary stands in for ffmpeg exiting non-zero: the
+    # Python interpreter rejects ffmpeg's flags and exits non-zero on any OS.
+    backend = EdgeTtsBackend(ffmpeg_path=sys.executable, cache_dir=tmp_path)
     mp3 = tmp_path / "in.mp3"
     mp3.write_bytes(b"fake")
     wav = tmp_path / "out.wav"
