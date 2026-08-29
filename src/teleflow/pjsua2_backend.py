@@ -95,13 +95,27 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
     """Build the pjsua2 Account/Call subclasses wired to this backend."""
 
     class Call(pj.Call):  # type: ignore[misc, valid-type]
-        def __init__(self, account: Any) -> None:
-            pj.Call.__init__(self, account)
+        def __init__(self, account: Any, call_id: int = -1) -> None:
+            # For an inbound call the object must be constructed with the
+            # real incoming call id; pjsua2 only attaches this Call to the
+            # SIP call (and gives it a usable id) when call_id is valid — see
+            # Call::Call in pjsua2's call.cpp, which sets the call's user
+            # data only when call_id != PJSUA_INVALID_ID. Outbound calls
+            # pass the default so makeCall assigns the id itself.
+            pj.Call.__init__(self, account, call_id)
 
         def onCallState(self, prm: Any) -> None:  # noqa: ARG002 - prm unused
             info = self.getInfo()
             if info.state == pj.PJSIP_INV_STATE_DISCONNECTED:
-                backend._calls.pop(str(info.id), None)
+                call_id = str(info.id)
+                backend._calls.pop(call_id, None)
+                # Tell the service the call ended so it can reset its call state;
+                # otherwise the UI stays stuck on "通话中" after a hang-up. pjsua2
+                # dispatches this callback to the attached Call object once the
+                # call is torn down. A report call drives its own lifecycle via
+                # "report_eof", so it must not emit the normal call-ended event.
+                if not getattr(self, "_is_report", False) and backend._handler is not None:
+                    backend._handler("bye", {"call_id": call_id})
 
         def onCallMediaState(self, prm: Any) -> None:  # noqa: ARG002 - prm unused
             info = self.getInfo()
@@ -137,7 +151,11 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
             pj.Account.__init__(self)
 
         def onIncomingCall(self, prm: Any) -> None:
-            call = Call(self)
+            # Attach the Call object to the real incoming call id so the
+            # service-driven backend.answer() (and audio bridging in
+            # onCallMediaState) can actually reach the caller. Without this the
+            # Call is detached and the inbound call can never be answered.
+            call = Call(self, call_id=int(prm.callId))
             call_id = str(prm.callId)
             backend._calls[call_id] = call
             # Do NOT answer here: SipCoreService drives the answer via
