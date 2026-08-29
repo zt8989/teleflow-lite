@@ -268,6 +268,11 @@ class DashboardWidget(QWidget):
         for device in self._manager.playback_devices():
             self._playback_cb.addItem(device.name, device.id)
         self._capture_cb.clear()
+        # A leading "no capture" entry lets the user pick one-way (downstream
+        # only) operation — matching MicroSIP, where the microphone is only
+        # opened when an input device is explicitly selected. Its userData is
+        # the empty string, which set_selection normalises to "one-way".
+        self._capture_cb.addItem("不采集（单向）", "")
         for device in self._manager.capture_devices():
             self._capture_cb.addItem(device.name, device.id)
         self._select(self._playback_cb, playback_id)

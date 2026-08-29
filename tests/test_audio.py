@@ -39,16 +39,30 @@ def test_selection_persists_across_reload(tmp_path) -> None:
     assert reloaded.current_selection() == ("vb-cable", "blackhole")
 
 
-def test_selection_of_null_or_negative_one_is_rejected(tmp_path) -> None:
+def test_playback_null_or_negative_one_is_rejected(tmp_path) -> None:
     mgr = _manager(tmp_path)
     with pytest.raises(ValueError):
         mgr.set_selection(None, "blackhole")
     with pytest.raises(ValueError):
-        mgr.set_selection("vb-cable", "-1")
-    with pytest.raises(ValueError):
         mgr.set_selection("", "blackhole")
     with pytest.raises(ValueError):
-        mgr.set_selection("vb-cable", -1)
+        mgr.set_selection("-1", "blackhole")
+
+
+def test_capture_empty_means_one_way_and_persists(tmp_path) -> None:
+    mgr = _manager(tmp_path)
+    # An empty / null / -1 capture id is the valid one-way (downstream only)
+    # choice, matching MicroSIP — not an error. It normalises to "" and persists.
+    mgr.set_selection("vb-cable", "")
+    assert mgr.current_selection() == ("vb-cable", "")
+    mgr.set_selection("vb-cable", None)
+    assert mgr.current_selection() == ("vb-cable", "")
+    mgr.set_selection("vb-cable", "-1")
+    assert mgr.current_selection() == ("vb-cable", "")
+    mgr.set_selection("vb-cable", -1)
+    assert mgr.current_selection() == ("vb-cable", "")
+    reloaded = AudioDeviceManager(FakeAudioBackend(), ConfigStore(tmp_path / "config.json"))
+    assert reloaded.current_selection() == ("vb-cable", "")
 
 
 def test_refresh_picks_up_devices_added_after_launch(tmp_path) -> None:
@@ -69,10 +83,13 @@ def test_debug_preset_selects_physical_headset(tmp_path) -> None:
     assert mgr.current_selection() == ("hw:0,0", "hw:0,0")
 
 
-def test_production_preset_selects_virtual_sound_card(tmp_path) -> None:
+def test_production_preset_selects_virtual_playback_only(tmp_path) -> None:
     mgr = _manager(tmp_path)
     mgr.apply_preset("production")
-    assert mgr.current_selection() == ("vb-cable", "vb-cable")
+    # Production mode feeds the virtual cable's playback end only; capture is
+    # left empty (one-way) so the OS never opens a microphone endpoint — this is
+    # the MicroSIP-style behaviour the user asked for.
+    assert mgr.current_selection() == ("vb-cable", "")
 
 
 def test_handle_hotplug_re_enumerates_and_signals_change(tmp_path) -> None:

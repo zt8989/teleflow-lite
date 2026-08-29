@@ -7,7 +7,12 @@ pjsua2 library or any hardware.
 
 from __future__ import annotations
 
-from teleflow.media import AudioDeviceController, AudioRoute, MediaBridge
+from teleflow.media import (
+    AudioDeviceController,
+    AudioRoute,
+    MediaBridge,
+    capture_device_selected,
+)
 
 
 class FakeAudioDeviceController:
@@ -63,3 +68,15 @@ def test_apply_per_leg_routes_only_that_direction() -> None:
     bridge.apply_capture("hw:1,0")
     assert controller.capture == "hw:1,0"
     assert controller.playback == "hw:0,0"  # unchanged
+
+
+def test_capture_device_selected_gates_microphone_by_device_choice() -> None:
+    # The single source of truth for "open the mic or not": matching MicroSIP,
+    # an empty / "-1" / None capture id is one-way (downstream only) and must NOT
+    # open a capture endpoint. Any concrete device id enables the upstream bridge.
+    assert capture_device_selected("vb-cable") is True
+    assert capture_device_selected("0") is True
+    assert capture_device_selected("") is False
+    assert capture_device_selected("-1") is False
+    assert capture_device_selected(None) is False
+    assert capture_device_selected(-1) is False

@@ -217,26 +217,51 @@ class AudioDeviceManager:
         return (settings.playback_device_id, settings.capture_device_id)
 
     def set_selection(self, playback_id: str | None, capture_id: str | None) -> None:
-        if playback_id in _INVALID_IDS or capture_id in _INVALID_IDS:
-            raise ValueError("device selection must not be null or -1")
+        # The playback (downstream) device is mandatory — TeleFlow is no use with
+        # nowhere to send call audio. The capture (upstream) device is optional:
+        # an empty / "-1" / None id selects one-way (downstream only) operation,
+        # matching MicroSIP, where the microphone is only opened when an input
+        # device is actually selected. We normalise that to "" rather than
+        # rejecting it, so the one-way choice persists through ConfigStore.
+        if playback_id in _INVALID_IDS:
+            raise ValueError("playback device selection must not be null or -1")
+        normalised_capture = "" if capture_id in _INVALID_IDS else str(capture_id)
         settings = self.store.load()
         settings.playback_device_id = str(playback_id)
-        settings.capture_device_id = str(capture_id)
+        settings.capture_device_id = normalised_capture
         self.store.save(settings)
         self._emit(EVENT_DEVICE_SELECTED, settings.playback_device_id, settings.capture_device_id)
 
     def apply_preset(self, preset: str) -> tuple[str, str]:
         if preset not in ("debug", "production"):
             raise ValueError(f"unknown preset: {preset!r}")
-        kind = DeviceKind.PHYSICAL if preset == "debug" else DeviceKind.VIRTUAL
+        if preset == "debug":
+            # Debug mode is two-way through the physical headset: playback and
+            # capture both on a real device, so you can actually talk on the phone.
+            playback = next(
+                (d for d in self._devices if d.kind is DeviceKind.PHYSICAL and d.supports_playback),
+                None,
+            )
+            capture = next(
+                (d for d in self._devices if d.kind is DeviceKind.PHYSICAL and d.supports_capture),
+                None,
+            )
+            if playback is None or capture is None:
+                raise ValueError(f"no physical device available for preset {preset!r}")
+            self.set_selection(playback.id, capture.id)
+            self._emit(EVENT_PRESET_APPLIED, preset)
+            return (playback.id, capture.id)
+        # Production mode is the "feed a virtual cable, another app consumes it as
+        # a mic" relay (e.g. landline -> ATA -> FreeSWITCH -> TeleFlow -> VB-Cable
+        # -> third-party app). Playback goes to the virtual device; capture is left
+        # empty (one-way) so the OS never opens a microphone endpoint — matching
+        # MicroSIP, where capture is only opened when an input device is selected.
         playback = next(
-            (d for d in self._devices if d.kind is kind and d.supports_playback), None
+            (d for d in self._devices if d.kind is DeviceKind.VIRTUAL and d.supports_playback),
+            None,
         )
-        capture = next(
-            (d for d in self._devices if d.kind is kind and d.supports_capture), None
-        )
-        if playback is None or capture is None:
-            raise ValueError(f"no {kind.value} device available for preset {preset!r}")
-        self.set_selection(playback.id, capture.id)
+        if playback is None:
+            raise ValueError("no virtual playback device available for preset 'production'")
+        self.set_selection(playback.id, None)
         self._emit(EVENT_PRESET_APPLIED, preset)
-        return (playback.id, capture.id)
+        return (playback.id, "")

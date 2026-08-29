@@ -27,6 +27,23 @@ class AudioRoute:
     capture_device_id: str
 
 
+def capture_device_selected(device_id: str | None) -> bool:
+    """True when a real capture (input) device is selected.
+
+    An empty / "-1" / None id means one-way (downstream only): the microphone
+    bridge must not be opened, matching MicroSIP, where the OS microphone prompt
+    only appears when an input device is actually selected. Centralised here so
+    the backend's startup route and the per-call media-state handler agree on the
+    rule — and so the decision is unit-testable without the native pjsua2 lib.
+
+    Defensive against ``-1`` arriving as either the int or the ``"-1"`` string
+    (the audio layer normalises both to ``""`` before persisting, but the call
+    sites may pass an un-normalised id).
+    """
+
+    return device_id is not None and str(device_id) not in ("", "-1")
+
+
 @runtime_checkable
 class AudioDeviceController(Protocol):
     """The minimal audio-device surface the bridge needs.

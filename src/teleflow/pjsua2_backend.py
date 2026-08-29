@@ -21,7 +21,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from teleflow.config import ConfigStore
-from teleflow.media import AudioDeviceController, MediaBridge
+from teleflow.media import AudioDeviceController, MediaBridge, capture_device_selected
 from teleflow.sip import SipBackend
 
 
@@ -157,7 +157,17 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
                 # Downstream: decoded call audio -> selected playback device.
                 call_audio.startTransmit(dev_mgr.getPlaybackDevMedia())
                 # Upstream: selected capture device -> call audio (to telephone).
-                dev_mgr.getCaptureDevMedia().startTransmit(call_audio)
+                # Only when a capture device is actually selected — an empty
+                # capture id is one-way (downstream only), matching MicroSIP, so
+                # we must NOT open a capture endpoint or the OS microphone prompt
+                # fires and we'd transmit silence back. Re-apply the capture
+                # device here so a preceding report call's null-sink selection
+                # does not leak into this normal call.
+                cap = backend._store.load().capture_device_id
+                bridge = backend._bridge
+                if capture_device_selected(cap) and bridge is not None:
+                    bridge.apply_capture(cap)
+                    dev_mgr.getCaptureDevMedia().startTransmit(call_audio)
 
         def onDtmfDigit(self, prm: Any) -> None:  # noqa: ARG002 - pjsua2 callback signature
             # Forward an inbound DTMF keypress to the service so the IVR can act
@@ -341,8 +351,18 @@ class Pjsua2Backend:
         # effect; we never forward "-1" to pjsua2, which would disable audio.
         if pb not in ("", "-1", None):
             self._bridge.apply_playback(pb)
-        if cap not in ("", "-1", None):
+        # A capture device is only opened when one is actually selected. An empty
+        # capture id is one-way (downstream only), matching MicroSIP: opening no
+        # capture endpoint keeps the OS microphone prompt from firing. We pin the
+        # capture device to the null sink so getCaptureDevMedia() can never fall
+        # back to the default microphone and open a real input stream.
+        if capture_device_selected(cap):
             self._bridge.apply_capture(cap)
+        else:
+            try:
+                self._ep.audDevManager().setCaptureDev(self._pj.PJSUA_SND_NULL_DEV)
+            except Exception:  # noqa: BLE001 - best-effort; downstream still bridges
+                pass
 
     def start(self, port: int, handler: Callable[[str, dict], None]) -> None:  # pragma: no cover
         self._handler = handler
