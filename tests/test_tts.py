@@ -135,3 +135,13 @@ def test_caching_backend_renders_per_voice(tmp_path: Path) -> None:
     rendered = len(inner.synthesized)
     cache.synthesize_to_wav("你好", "voiceB")
     assert len(inner.synthesized) == rendered + 1
+
+
+def test_caching_backend_logs_hit_and_miss(tmp_path: Path) -> None:
+    inner = _FileFakeTts(fake_wav=tmp_path / "inner.wav")
+    logged: list[str] = []
+    cache = CachingTtsBackend(inner, cache_dir=tmp_path / "cache", logger=logged.append)
+    cache.synthesize_to_wav("你好", "v")  # miss -> 合成
+    cache.synthesize_to_wav("你好", "v")  # hit  -> 复用
+    assert any("缓存未命中" in m for m in logged)
+    assert any("缓存命中" in m for m in logged)

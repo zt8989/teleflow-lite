@@ -21,7 +21,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
 
 from teleflow.config import DEFAULT_CONFIG_PATH
 
@@ -174,10 +174,16 @@ class CachingTtsBackend:
     the inner backend, and only a text/voice change (different hash) re-renders.
     """
 
-    def __init__(self, inner: TtsBackend, cache_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        inner: TtsBackend,
+        cache_dir: Path | None = None,
+        logger: Callable[[str], None] | None = None,
+    ) -> None:
         self._inner = inner
         self._cache_dir = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE_DIR
         self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self.logger = logger
         # Recorded for tests: (text, voice) tuples that actually reached the inner
         # backend (i.e. cache misses / changes).
         self.rendered: list[tuple[str, str]] = []
@@ -192,11 +198,16 @@ class CachingTtsBackend:
         h.update(voice.encode("utf-8"))
         return h.hexdigest()[:16]
 
-    def synthesize_to_wav(self, text: str, voice: str) -> Path:
+    def synthesize_to_wav(self, text: str, voice: str, prefix: str = "ivr") -> Path:
         key = self._cache_key(text, voice)
-        wav_path = self._cache_dir / f"ivr_{key}.wav"
+        wav_path = self._cache_dir / f"{prefix}_{key}.wav"
         if wav_path.exists():
+            # Cache hit: no edge-tts / ffmpeg, return the previously rendered wav.
+            if self.logger is not None:
+                self.logger(f"[TTS] 缓存命中: {prefix}_{key}.wav")
             return wav_path
+        if self.logger is not None:
+            self.logger(f"[TTS] 缓存未命中, 开始合成: {prefix}_{key}.wav")
         mp3 = self._inner.synthesize(clean_markdown(text), voice)
         wav = self._inner.transcode(mp3, wav_path)
         self.rendered.append((text, voice))

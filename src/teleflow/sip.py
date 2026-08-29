@@ -99,15 +99,6 @@ class SipBackend(Protocol):
         """
         ...
 
-    def mark_ivr(self, call_id: str) -> None:
-        """Tag an inbound call as IVR so the backend skips the mic bridge."""
-        ...
-
-    def unmark_ivr(self, call_id: str) -> None:
-        """Leave IVR mode: restore the normal two-way mic bridge (used when a
-        digit key ends the menu and starts a real conversation, e.g. Vibe Coding)."""
-        ...
-
     def reroute(self) -> None:
         """Re-apply the current device selection to a live call (mid-call switch)."""
         ...
@@ -234,8 +225,6 @@ class FakeSipBackend:
         self.rerouted: list[str] = []
         self.report_calls: list[tuple[str, str]] = []
         self.report_played: list[tuple[str, str]] = []
-        self.ivr_marked: list[str] = []
-        self.ivr_unmarked: list[str] = []
         self.device_change_callbacks: list[Callable[[], None]] = []
 
     def start(self, port: int, handler: Callable[[str, dict], None]) -> None:
@@ -308,14 +297,6 @@ class FakeSipBackend:
     def reroute(self) -> None:
         # Scripted fake has no live call audio to re-route, but records the call.
         self.rerouted.append("reroute")
-
-    def mark_ivr(self, call_id: str) -> None:
-        """Scripted fake has no mic bridge to suppress; recorded for parity."""
-        self.ivr_marked.append(call_id)
-
-    def unmark_ivr(self, call_id: str) -> None:
-        """Scripted fake has no mic bridge to restore; recorded for parity."""
-        self.ivr_unmarked.append(call_id)
 
     def set_device_change_callback(self, cb: Callable[[], None]) -> None:
         self.device_change_callbacks.append(cb)
@@ -494,7 +475,9 @@ class SipCoreService:
 
         # Resolve the wav to play: provided file, or synthesize from text.
         try:
-            wav_path = self._resolve_wav(text, audio_path, voice, settings)
+            wav_path = self._resolve_wav(
+                text, audio_path, voice, settings, prefix="report"
+            )
         except TtsError as exc:
             reason = "ffmpeg" if "ffmpeg" in str(exc).lower() else "tts"
             self._fail_report(reason)
@@ -511,14 +494,31 @@ class SipCoreService:
         self._backend.place_report_call(resolved_target, str(wav_path))
         return report_id
 
-    def _resolve_wav(self, text, audio_path, voice, settings) -> Path:
+    def _resolve_wav(
+        self, text, audio_path, voice, settings, prefix: str = "ivr"
+    ) -> Path:
         if audio_path:
             self._log_line(f"[REPORT] 使用外部音频: {audio_path}")
             return Path(audio_path)
         tts = self._tts or self._default_tts(settings)
         voice_name = voice or settings.tts_voice
+        cleaned = clean_markdown(text)
+        if isinstance(tts, CachingTtsBackend):
+            # Route through the caching backend so the report/play prompt reuses a
+            # previously rendered wav (and surfaces a [TTS] cache hit/miss line),
+            # matching the inbound IVR path. 合成完成 / 转码完成 are only emitted on
+            # a real miss so a cache hit isn't mislabelled as a fresh render.
+            cache_file = tts._cache_dir / f"{prefix}_{CachingTtsBackend._cache_key(cleaned, voice_name)}.wav"
+            was_cached = cache_file.exists()
+            wav_path = tts.synthesize_to_wav(cleaned, voice_name, prefix=prefix)
+            if not was_cached:
+                self._log_line(f"[TTS] 合成完成: {wav_path}")
+                self._log_line(f"[FFMPEG] 转码完成: {wav_path}")
+            return wav_path
+        # Non-caching backend (tests' FakeTtsBackend): keep the original
+        # synthesize + transcode path with its own synthesis/transcode logs.
         self._log_line(f"[TTS] 合成中: voice={voice_name}")
-        mp3 = tts.synthesize(clean_markdown(text), voice_name)
+        mp3 = tts.synthesize(cleaned, voice_name)
         self._log_line(f"[TTS] 合成完成: {mp3}")
         wav_path = tts.transcode(mp3, mp3.with_suffix(".wav"))
         self._log_line(f"[FFMPEG] 转码完成: {wav_path}")
@@ -530,7 +530,9 @@ class SipCoreService:
         # cache so IVR replays of the same welcome/menu text reuse the wav.
         from teleflow.tts import EdgeTtsBackend
 
-        self._tts = CachingTtsBackend(EdgeTtsBackend(ffmpeg_path=settings.ffmpeg_path))
+        self._tts = CachingTtsBackend(
+            EdgeTtsBackend(ffmpeg_path=settings.ffmpeg_path), logger=self._log_line
+        )
         return self._tts
 
     def _on_report_connected(self, call_id: str) -> None:
@@ -602,8 +604,9 @@ class SipCoreService:
         except TtsError as exc:
             self._log_line(f"[IVR] TTS 失败, 跳过 IVR: {exc}")
             return
-        # TTS succeeded: suppress the mic bridge and start the menu.
-        self._backend.mark_ivr(call_id)
+        # TTS succeeded: start the menu. The call is bridged two-way throughout
+        # (the mic is never suppressed during IVR), so the AI side can talk back
+        # or barge in at any time.
         self._ivr_active = True
         self._ivr_call_id = call_id
         self._ivr_queue = queue
@@ -682,7 +685,7 @@ class SipCoreService:
             raise ValueError("text or audio_path required")
         if audio_path and not Path(audio_path).exists():
             raise FileNotFoundError(f"audio file not found: {audio_path}")
-        wav_path = self._resolve_wav(text, audio_path, voice, settings)
+        wav_path = self._resolve_wav(text, audio_path, voice, settings, prefix="ivr")
         started = self._backend.play_file_to_call(call_id, str(wav_path), hangup_on_eof=hangup_on_eof)
         if not started:
             # Call exists but its media isn't in a playable state (should not
@@ -719,29 +722,10 @@ class SipCoreService:
         self._ivr_listening = False
         self._last_digit = digit
         self._log_line(f"[IVR] 收到按键 {digit} (call {call_id})")
-        # Pressing the configured "exit IVR" key (ivr_exit_digit, default "0")
-        # ends the menu and turns the call into a normal two-way call so the
-        # caller's voice is bridged upstream (e.g. WorkBuddy can hear it). Other
-        # keys replay the menu via their hook, so IVR mode is kept.
-        settings = self._store.load()
-        if digit and digit == settings.ivr_exit_digit:
-            self._exit_ivr_to_call(call_id)
+        # Every digit fires its per-digit hook; the call stays bridged two-way
+        # (the mic is never suppressed during IVR), so the AI side can talk back
+        # or barge in at any time. IVR menu mode ends only when the call hangs up.
         self._emit(EVENT_IVR_DIGIT, call_id=call_id, digit=digit)
-
-    def _exit_ivr_to_call(self, call_id: str) -> None:
-        """Leave IVR menu mode and restore a normal two-way call.
-
-        The call stays CONNECTED (it ends normally on BYE); we just stop
-        suppressing the mic so the caller's voice flows both ways. CALL_ENDED
-        still fires on hang-up, so the on-hook hook (Ctrl+D+Enter for key 0)
-        keeps working.
-        """
-        self._ivr_active = False
-        self._ivr_call_id = None
-        self._ivr_queue = []
-        self._ivr_listening = False
-        self._ivr_digit_fired = False
-        self._backend.unmark_ivr(call_id)
 
     def _reset_ivr(self) -> None:
         self._ivr_active = False

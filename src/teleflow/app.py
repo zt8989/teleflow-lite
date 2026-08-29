@@ -843,7 +843,9 @@ class MainWindow(QMainWindow):
             try:
                 from teleflow.tts import CachingTtsBackend, EdgeTtsBackend
 
-                tts = CachingTtsBackend(EdgeTtsBackend(ffmpeg_path=ffmpeg))
+                tts = CachingTtsBackend(
+                    EdgeTtsBackend(ffmpeg_path=ffmpeg), logger=self.append_log_line
+                )
                 mp3 = tts.synthesize(text, voice)
                 wav = tts.transcode(mp3, mp3.with_suffix(".wav"))
                 self._pending_report_mp3 = str(mp3)
@@ -1064,6 +1066,7 @@ def build_app(
     manager = AudioDeviceManager(audio_backend, store)
     tts = CachingTtsBackend(EdgeTtsBackend(ffmpeg_path=settings.ffmpeg_path))
     service = SipCoreService(sip_backend, store, tts=tts)
+    tts.logger = service._log_line  # surface cache hit/miss in the dashboard log
     window = MainWindow(manager, service, store)
 
     logger = EventLogger(level=LogLevel[settings.log_level], sink=window.append_log_line)
