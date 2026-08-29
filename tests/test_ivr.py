@@ -49,7 +49,6 @@ def test_ivr_plays_welcome_and_menu_in_order_skips_empty(tmp_path: Path) -> None
     service.on(EVENT_CALL_ENDED, lambda call_id, last_digit="": ended.append((call_id, last_digit)))
 
     backend.receive_invite("C1")  # plays welcome + "1" + "3", then listens
-    assert backend.ivr_marked == ["C1"]
     # welcome, "1", "3" played; digit "2" has empty text and is skipped.
     assert len(backend.report_played) == 3
     backend.receive_dtmf("C1", "3")
@@ -87,7 +86,6 @@ def test_ivr_disabled_keeps_normal_behavior(tmp_path: Path) -> None:
 
     assert received == []
     assert ended == [""]
-    assert backend.ivr_marked == []
 
 
 def test_ivr_only_first_digit_triggers(tmp_path: Path) -> None:
@@ -104,9 +102,10 @@ def test_ivr_only_first_digit_triggers(tmp_path: Path) -> None:
     digit_calls = [(c, ctx) for (c, ctx) in recorder.calls if c]
     assert ("k1 {digit}", {"call_id": "C1", "digit": "1"}) in digit_calls
     assert ("k2 {digit}", {"call_id": "C1", "digit": "2"}) not in digit_calls
-    # last_digit is "1", so the on-hook (stop Vibe Coding) guard skips it —
-    # no on-hook context with last_digit is emitted.
-    assert not any("last_digit" in ctx for (_c, ctx) in recorder.calls)
+    # The IVR call is always bridged two-way, so there is no "exit" gate: the
+    # on-hook command fires on every hang-up, carrying the last pressed digit.
+    on_hook_ctx = [ctx for (_c, ctx) in recorder.calls if "last_digit" in ctx]
+    assert on_hook_ctx == [{"call_id": "C1", "last_digit": "1"}]
 
 
 def test_ivr_per_digit_hook_empty_skips(tmp_path: Path) -> None:
@@ -123,87 +122,30 @@ def test_ivr_per_digit_hook_empty_skips(tmp_path: Path) -> None:
     assert all("digit" not in ctx for (_c, ctx) in recorder.calls)
 
 
-def test_on_hook_sends_keys_only_when_last_digit_is_zero(tmp_path: Path) -> None:
-    # Regression: on-hook must fire its command (Ctrl+D+Enter to stop Vibe
-    # Coding) only when the last IVR digit was "0". The guard is enforced in the
-    # app, not as a shell `[ ... ]` test — the latter silently failed under
-    # Windows cmd.exe, so the hangup keys were never sent.
+def test_on_hook_fires_on_every_hangup_with_last_digit(tmp_path: Path) -> None:
+    # Regression: with the IVR call always bridged two-way there is no "exit"
+    # gate, so the on-hook command must fire on every hang-up, carrying the last
+    # IVR digit pressed (or "" if none was pressed).
     settings = Settings(ivr_enabled=True, off_hook_cmd="", on_hook_cmd="STOP_HOOK")
     service, backend, tts = _build(tmp_path, settings)
     recorder = _RecordingHookRunner()
     attach_hooks(service, recorder, ConfigStore(tmp_path / "c.json"))
 
-    # No digit pressed -> on-hook must NOT fire.
+    # No digit pressed -> on-hook fires with last_digit "".
     backend.receive_invite("C1")
     backend.receive_bye("C1")
-    assert not any(c == "STOP_HOOK" for (c, _ctx) in recorder.calls)
+    on_hook = [ctx for (c, ctx) in recorder.calls if c == "STOP_HOOK"]
+    assert on_hook == [{"call_id": "C1", "last_digit": ""}]
 
-    # Pressed "1" then hung up -> last_digit="1" -> on-hook must NOT fire.
+    # Pressed "1" then hung up -> on-hook fires with last_digit "1".
     backend.receive_invite("C2")
     backend.receive_dtmf("C2", "1")
     backend.receive_bye("C2")
-    assert not any(c == "STOP_HOOK" for (c, _ctx) in recorder.calls)
-
-    # Pressed "0" then hung up -> last_digit="0" -> on-hook fires.
-    backend.receive_invite("C3")
-    backend.receive_dtmf("C3", "0")
-    backend.receive_bye("C3")
-    on_hook_calls = [(c, ctx) for (c, ctx) in recorder.calls if c == "STOP_HOOK"]
-    assert len(on_hook_calls) == 1
-    assert on_hook_calls[0][1]["last_digit"] == "0"
-    assert on_hook_calls[0][1]["call_id"] == "C3"
-
-
-def test_pressing_zero_exits_ivr_to_two_way_call(tmp_path: Path) -> None:
-    # Pressing the Vibe Coding key (0) must end the one-way IVR menu and restore
-    # a normal two-way call, otherwise the mic stays suppressed and nothing is
-    # heard upstream (WorkBuddy can't detect the caller's voice). The call stays
-    # connected so the conversation continues; only IVR mode is left.
-    settings = Settings(
-        ivr_enabled=True,
-        ivr_digit_text={"0": "开始 Vibe Coding"},
-        ivr_digit_hook={"0": "START_VIBE"},
-    )
-    service, backend, tts = _build(tmp_path, settings)
-    received: list[str] = []
-    service.on(EVENT_IVR_DIGIT, lambda call_id, digit: received.append(digit))
-
-    backend.receive_invite("C1")
-    assert backend.ivr_marked == ["C1"]
-    assert service._ivr_active is True
-
-    backend.receive_dtmf("C1", "0")  # start Vibe Coding
-    assert backend.ivr_unmarked == ["C1"]  # backend told to re-bridge two-way
-    assert service._ivr_active is False  # IVR menu mode ended
-    assert service._ivr_call_id is None
-    # Call remains connected (not hung up) so the conversation can continue.
-    assert service.active_call_id == "C1"
-    # The per-digit hook still fired (sends Ctrl+D to WorkBuddy).
-    assert received == ["0"]
-
-
-def test_ivr_exit_digit_is_configurable(tmp_path: Path) -> None:
-    # The IVR-exit / bridge key must come from settings (ivr_exit_digit), not be
-    # hard-coded to "0". Here "7" is the bridge key; pressing "0" must NOT exit
-    # IVR (it just replays the menu via its hook), pressing "7" must.
-    settings = Settings(
-        ivr_enabled=True,
-        ivr_exit_digit="7",
-        ivr_digit_text={"7": "x", "0": "y"},
-        ivr_digit_hook={"7": "K7", "0": "K0"},
-    )
-    service, backend, tts = _build(tmp_path, settings)
-
-    backend.receive_invite("C1")
-    backend.receive_dtmf("C1", "7")  # configured bridge key
-    assert backend.ivr_unmarked == ["C1"]
-    assert service._ivr_active is False
-
-    service2, backend2, _ = _build(tmp_path, settings)
-    backend2.receive_invite("C2")
-    backend2.receive_dtmf("C2", "0")  # not the bridge key -> stays in IVR
-    assert backend2.ivr_unmarked == []  # unchanged
-    assert service2._ivr_active is True
+    on_hook = [ctx for (c, ctx) in recorder.calls if c == "STOP_HOOK"]
+    assert on_hook == [
+        {"call_id": "C1", "last_digit": ""},
+        {"call_id": "C2", "last_digit": "1"},
+    ]
 
 
 def test_play_to_call_synthesizes_and_plays_into_active_call(tmp_path: Path) -> None:
@@ -354,7 +296,6 @@ def test_ivr_defers_playback_until_media_active(tmp_path: Path) -> None:
 
     backend.receive_invite("C1")
     # At answer time the menu is queued but NOT played (media not up yet).
-    assert backend.ivr_marked == ["C1"]
     assert backend.report_played == []
     assert len(service._ivr_queue) == 2  # welcome + "1" still queued
     assert service._ivr_started is False

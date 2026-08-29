@@ -82,3 +82,44 @@ def test_log_rotates_when_file_exceeds_max_bytes(tmp_path: Path) -> None:
         (tmp_path / b).read_text(encoding="utf-8").count("\n") for b in backups
     )
     assert total_lines < 20
+
+
+def test_unified_log_line_routes_same_content_to_file_and_sink(tmp_path: Path) -> None:
+    # The unified API: service/hook/TTS style "[CAT] message" lines go through
+    # log_line so the UI panel (sink) and the log file record the same lines.
+    sink: list[str] = []
+    logger = EventLogger(path=tmp_path / "app.log", sink=sink.append)
+    logger.log_line("[IVR] 启动菜单: call=0")
+    logger.log_line("[HOOK][ERROR] 命令执行失败: boom")
+
+    file_lines = (tmp_path / "app.log").read_text(encoding="utf-8").splitlines()
+    assert sink == file_lines
+    assert "INFO [IVR] 启动菜单: call=0" in file_lines[0]
+    # Nested "[ERROR]" is honored as the level, not duplicated in the message.
+    assert "ERROR [HOOK] 命令执行失败: boom" in file_lines[1]
+
+
+def test_unified_log_line_defaults_to_info_and_nested_warning(tmp_path: Path) -> None:
+    sink: list[str] = []
+    logger = EventLogger(path=tmp_path / "app.log", sink=sink.append)
+    logger.log_line("[SIP] 自动选择本地端口 5062")            # no level marker -> INFO
+    logger.log_line("[HOOK][WARN] 命令慢")                    # nested [WARN] -> WARNING
+    logger.log_line("没有方括号的裸行")                        # fallback category APP
+
+    file_lines = (tmp_path / "app.log").read_text(encoding="utf-8").splitlines()
+    assert sink == file_lines
+    assert "INFO [SIP] 自动选择本地端口 5062" in file_lines[0]
+    assert "WARNING [HOOK] 命令慢" in file_lines[1]
+    assert "INFO [APP] 没有方括号的裸行" in file_lines[2]
+
+
+def test_console_output_mirrors_file_when_enabled(tmp_path: Path, capsys: object) -> None:
+    # console=True is an optional terminal mirror; when enabled it prints the
+    # exact same line the file records.
+    logger = EventLogger(path=tmp_path / "app.log", console=True)
+    logger.info("CALL", "call connected: 0")
+    logger.log_line("[IVR] 收到按键 1")
+
+    out = capsys.readouterr().out.strip().splitlines()  # type: ignore[attr-defined]
+    file_lines = (tmp_path / "app.log").read_text(encoding="utf-8").strip().splitlines()
+    assert out == file_lines

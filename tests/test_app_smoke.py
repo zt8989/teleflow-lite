@@ -169,30 +169,16 @@ def test_settings_dialog_round_trips_sip_account(tmp_path) -> None:
     window.close()
 
 
-def test_settings_dialog_ivr_exit_digit_checkbox_round_trip(tmp_path) -> None:
+def test_settings_dialog_ivr_digit_edits_round_trip(tmp_path) -> None:
     app, window, service, manager, _ = _make_window(tmp_path)
     dialog = SettingsDialog(manager, window)
-    dialog.ivr_exit_checkboxes["0"].setChecked(True)
+    dialog.ivr_digit_text_edits["1"].setText("菜单一")
+    dialog.ivr_digit_hook_edits["1"].setText("hook1 {digit}")
     dialog._save_and_close()
 
     reloaded = ConfigStore(tmp_path / "config.json").load()
-    assert reloaded.ivr_exit_digit == "0"
-    # Reload into a fresh dialog: only digit "0" is checked.
-    dialog2 = SettingsDialog(manager, window)
-    assert dialog2.ivr_exit_checkboxes["0"].isChecked() is True
-    assert all(
-        not cb.isChecked() for d, cb in dialog2.ivr_exit_checkboxes.items() if d != "0"
-    )
-    window.close()
-
-
-def test_settings_dialog_ivr_exit_checkbox_single_selection(tmp_path) -> None:
-    app, window, service, manager, _ = _make_window(tmp_path)
-    dialog = SettingsDialog(manager, window)
-    dialog.ivr_exit_checkboxes["1"].setChecked(True)
-    dialog.ivr_exit_checkboxes["0"].setChecked(True)  # must uncheck "1"
-    checked = [d for d, cb in dialog.ivr_exit_checkboxes.items() if cb.isChecked()]
-    assert checked == ["0"]
+    assert reloaded.ivr_digit_text == {"1": "菜单一"}
+    assert reloaded.ivr_digit_hook == {"1": "hook1 {digit}"}
     window.close()
 
 

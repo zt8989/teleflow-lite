@@ -106,20 +106,22 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
 
         def onCallState(self, prm: Any) -> None:  # noqa: ARG002 - prm unused
             info = self.getInfo()
-            if info.state == pj.PJSIP_INV_STATE_DISCONNECTED:
-                call_id = str(info.id)
-                backend._calls.pop(call_id, None)
-                # A report/IVR call's player is no longer needed once the call is
-                # torn down; release it so the underlying C++ object is freed.
-                if getattr(self, "_is_report", False) or getattr(self, "_is_ivr", False):
-                    _release_report_player(backend, call_id)
-                # Tell the service the call ended so it can reset its call state;
-                # otherwise the UI stays stuck on "通话中" after a hang-up. pjsua2
-                # dispatches this callback to the attached Call object once the
-                # call is torn down. A report call drives its own lifecycle via
-                # "report_eof", so it must not emit the normal call-ended event.
-                if not getattr(self, "_is_report", False) and backend._handler is not None:
-                    backend._handler("bye", {"call_id": call_id})
+            if info.state != pj.PJSIP_INV_STATE_DISCONNECTED:
+                return
+            call_id = str(info.id)
+            backend._calls.pop(call_id, None)
+            # Any call that played a file (report or IVR menu) owns a player that
+            # must be released once the call is torn down, so the underlying C++
+            # object is freed.
+            if call_id in backend._report_players:
+                _release_report_player(backend, call_id)
+            # Tell the service the call ended so it can reset its call state;
+            # otherwise the UI stays stuck on "通话中" after a hang-up. pjsua2
+            # dispatches this callback to the attached Call object once the
+            # call is torn down. A report call drives its own lifecycle via
+            # "report_eof", so it must not emit the normal call-ended event.
+            if not getattr(self, "_is_report", False) and backend._handler is not None:
+                backend._handler("bye", {"call_id": call_id})
 
         def onCallMediaState(self, prm: Any) -> None:  # noqa: ARG002 - prm unused
             info = self.getInfo()
@@ -140,18 +142,14 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
                                 "report_connected", {"call_id": str(info.id)}
                             )
                     return
-                # IVR call: one-way welcome/menu playback only, no mic/speaker
-                # bridge; the service drives playback and listens for DTMF.
-                if getattr(self, "_is_ivr", False):
-                    # The service tries to start playback at answer time, but the
-                    # audio media usually isn't ACTIVE yet then, so play_file_to_call
-                    # returns False. Signal media-active so it can (re)start now.
-                    if backend._handler is not None:
-                        backend._handler("call_media_active", {"call_id": str(info.id)})
-                    return
-                # Normal call: bridge the call's audio to the selected devices
-                # through the conference bridge: downstream call -> playback
-                # device, upstream capture device -> call. No recorder / transform.
+            # Inbound calls (incl. IVR) are always bridged two-way. Tell the
+            # service the media is active so it can (re)start IVR playback; a
+            # plain call ignores that event, so firing it here is harmless.
+            if backend._handler is not None:
+                backend._handler("call_media_active", {"call_id": str(info.id)})
+            # Bridge the call's audio to the selected devices through the
+            # conference bridge: downstream call -> playback device, upstream
+            # capture device -> call. No recorder / transform.
                 call_audio = self.getAudioMedia(media.index)
                 dev_mgr = backend._ep.audDevManager()
                 # Downstream: decoded call audio -> selected playback device.
@@ -491,38 +489,6 @@ class Pjsua2Backend:
         # Keep the player alive for the whole playback (see _report_players).
         self._report_players[call_id] = player
         return True
-
-    def mark_ivr(self, call_id: str) -> None:  # pragma: no cover
-        """Tag an inbound call as IVR so ``onCallMediaState`` skips the mic
-        bridge (one-way welcome/menu playback instead of a two-way bridge)."""
-        call = self._calls.get(call_id)
-        if call is not None:
-            call._is_ivr = True
-
-    def unmark_ivr(self, call_id: str) -> None:  # pragma: no cover
-        """Leave IVR mode: clear the one-way flag and (re)establish the normal
-        two-way bridge. Called when a digit key ends the menu and starts a real
-        conversation (e.g. Vibe Coding) so the caller's voice flows both ways —
-        without this, the mic stays suppressed and nothing is heard upstream.
-
-        Media is already ACTIVE by the time a key is pressed, so bridge now
-        rather than waiting for a (non-)existing media-state change.
-        """
-        call = self._calls.get(call_id)
-        if call is None:
-            return
-        call._is_ivr = False
-        info = call.getInfo()
-        for media in info.media:
-            if (
-                media.type == self._pj.PJMEDIA_TYPE_AUDIO
-                and media.status == self._pj.PJSUA_CALL_MEDIA_ACTIVE
-            ):
-                call_audio = call.getAudioMedia(media.index)
-                dev_mgr = self._ep.audDevManager()
-                call_audio.startTransmit(dev_mgr.getPlaybackDevMedia())
-                dev_mgr.getCaptureDevMedia().startTransmit(call_audio)
-                break
 
     def reroute(self) -> None:  # pragma: no cover
         """Re-apply the current device selection to a live call (mid-call switch)."""

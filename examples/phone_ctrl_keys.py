@@ -7,8 +7,11 @@ resident listener) into a one-shot command that TeleFlow's call-lifecycle
 hooks invoke:
 
   * ``connect``  (off-hook  / CALL_CONNECTED)  -> Ctrl+D        (start recording)
-  * ``hangup``   (on-hook   / CALL_ENDED)      -> Ctrl+D + wait 1s + Enter
-                                                (stop recording + confirm)
+  * ``hangup``   (on-hook   / CALL_ENDED)      -> Ctrl+D + wait 1s + Enter,
+                                                  but ONLY when the last IVR
+                                                  digit was "0" (i.e. a Vibe
+                                                  Coding session actually
+                                                  started via key 0)
 
 TeleFlow already fires the off-hook / on-hook events, so this script only has
 to perform the keystroke action; the "resident listener" role is handled by the
@@ -19,9 +22,11 @@ Wiring (in ``~/.config/teleflow/config.json``):
 
     {
       "off_hook_cmd": "python \"<repo>/examples/phone_ctrl_keys.py\" connect",
-      "on_hook_cmd":  "python \"<repo>/examples/phone_ctrl_keys.py\" hangup"
+      "on_hook_cmd":  "python \"<repo>/examples/phone_ctrl_keys.py\" hangup --last-digit {last_digit}"
     }
 
+``{last_digit}`` is substituted by TeleFlow with the last IVR digit pressed in
+the call ("" if none); the script only sends the stop keys when it is "0".
 You may append ``{call_id}`` in the command and add ``--call-id {call_id}`` to
 log which call triggered the keystroke.
 
@@ -173,6 +178,12 @@ def main(argv: list[str] | None = None) -> int:
         help="connect=摘机(start recording); hangup=挂机(stop recording + confirm)",
     )
     parser.add_argument("--call-id", default="", help="可选的 call_id，仅用于日志")
+    parser.add_argument(
+        "--last-digit",
+        default="",
+        help="挂机时 TeleFlow 传入的最后一个 IVR 按键；仅当为 0（按过 0 开始过"
+        " Vibe Coding）才发送停止键，否则跳过",
+    )
     args = parser.parse_args(argv)
 
     tag = f" call_id={args.call_id}" if args.call_id else ""
@@ -181,6 +192,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.action == "connect":
         _send_ctrl_d()
     elif args.action == "hangup":
+        # Vibe Coding 会话只由按 0 发起（digit hook "connect"）；挂机时只有
+        # last_digit == "0" 才需要发停止键，其它情况（按过 1/2 或没按键）
+        # 直接跳过，避免误发 Ctrl+D+Enter。
+        if args.last_digit != "0":
+            print(
+                f"[{time.strftime('%H:%M:%S')}] 挂机: last_digit={args.last_digit!r} "
+                "!= 0，不是 Vibe Coding 会话，跳过停止键",
+                flush=True,
+            )
+            return 0
         _send_ctrl_d()
         time.sleep(1)
         _send_enter()

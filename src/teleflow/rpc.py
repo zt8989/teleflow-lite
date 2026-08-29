@@ -40,11 +40,21 @@ DEFAULT_RPC_PORT = 8731
 _MAX_BODY = 1_000_000  # 1 MB cap on request bodies
 
 
-def _make_handler(service: SipCoreService, store: ConfigStore, scheduler: Callable[[Callable[[], object]], object]):
+def _make_handler(
+    service: SipCoreService,
+    store: ConfigStore,
+    scheduler: Callable[[Callable[[], object]], object],
+    log: Callable[[str], None] | None = None,
+):
     class _Handler(BaseHTTPRequestHandler):
-        # Quiet by default; the app's logger records report steps, not HTTP hits.
+        # We log our own clean per-request lines via the unified log API (see
+        # _send_json), so keep BaseHTTPRequestHandler's stderr chatter off.
         def log_message(self, *args) -> None:  # noqa: D401 - override noise
             pass
+
+        def _rpc_log(self, line: str) -> None:
+            if log is not None:
+                log(line)
 
         def _token(self) -> str:
             return store.load().rpc_token
@@ -63,6 +73,11 @@ def _make_handler(service: SipCoreService, store: ConfigStore, scheduler: Callab
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            # Every RPC response lands in the unified log (file + UI panel).
+            # Only method/path/status are recorded — never headers or the body,
+            # so the bearer token can't leak into the log.
+            marker = "[WARN]" if code >= 400 else ""
+            self._rpc_log(f"[RPC]{marker} {self.command} {self.path} -> {code}")
 
         def do_GET(self) -> None:  # noqa: N802 - http.server naming
             if self.path != "/v1/status":
@@ -230,10 +245,12 @@ class RpcServer:
         service: SipCoreService,
         store: ConfigStore,
         scheduler: Callable[[Callable[[], object]], object] | None = None,
+        log: Callable[[str], None] | None = None,
     ) -> None:
         self._service = service
         self._store = store
         self._scheduler = scheduler or (lambda fn: fn())
+        self._log = log
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -244,7 +261,9 @@ class RpcServer:
         if not settings.rpc_token:
             settings.rpc_token = secrets.token_hex(16)
             self._store.save(settings)
-        handler = _make_handler(self._service, self._store, self._scheduler)
+        # Per-request [RPC] lines are emitted by the handler via ``log`` (the
+        # unified logger; file + UI panel).
+        handler = _make_handler(self._service, self._store, self._scheduler, log=self._log)
         self._httpd = ThreadingHTTPServer(("127.0.0.1", settings.rpc_port), handler)
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()

@@ -2,10 +2,11 @@
 
 A hook is a user-configured local shell command executed when a call-lifecycle
 event fires — here, "摘机" (off-hook): the moment the current SIP auto-answers an
-incoming call. The command is rendered with a small context (currently
-``{call_id}``) and launched fire-and-forget in a background thread so it never
-stalls the SIP signalling or UI thread; a failed command is logged and swallowed
-so a misconfigured hook can never disturb an active call.
+incoming call. The command is rendered with a small context (``{call_id}`` on
+every event, ``{last_digit}`` on hang-up, ``{digit}`` on an IVR key) and
+launched fire-and-forget in a background thread so it never stalls the SIP
+signalling or UI thread; a failed command is logged and swallowed so a
+misconfigured hook can never disturb an active call.
 
 The runner is injected behind the ``HookRunner`` protocol, so the SIP core and
 the app stay unit-testable with a fake — no subprocess is spawned in tests.
@@ -97,16 +98,11 @@ def attach_hooks(service: SipCoreService, runner: HookRunner, store: ConfigStore
         runner.run(store.load().off_hook_cmd, {"call_id": call_id})
 
     def _on_hook(call_id: str, last_digit: str = "") -> None:
-        settings = store.load()
-        # Only fire the on-hook command when the last IVR digit was the configured
-        # "exit IVR" key (ivr_exit_digit, default "0"): that key began the
-        # recording via its per-digit hook, so hanging up must stop + confirm it.
-        # The guard lives here in Python rather than as a ``[ "{last_digit}" = "0" ]``
-        # test embedded in the command, because on Windows ``shell=True`` runs under
-        # cmd.exe where ``[`` is not a command and the ``&&`` would short-circuit it.
-        if not settings.ivr_exit_digit or last_digit != settings.ivr_exit_digit:
-            return
-        runner.run(settings.on_hook_cmd, {"call_id": call_id, "last_digit": last_digit})
+        # Fire the on-hook command on every call hang-up. The call is bridged
+        # two-way throughout the IVR (there is no separate "exit" key to gate on),
+        # so the command runs regardless of which digit was last pressed. It reads
+        # live config, so a settings change takes effect on the next call.
+        runner.run(store.load().on_hook_cmd, {"call_id": call_id, "last_digit": last_digit})
 
     def _on_digit(call_id: str, digit: str) -> None:
         # Per-digit IVR command; empty => no command configured for this key, so

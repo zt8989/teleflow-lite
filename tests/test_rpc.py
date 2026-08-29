@@ -237,3 +237,42 @@ def test_ivr_replay_without_active_call_returns_404(tmp_path: Path) -> None:
     except urllib.error.HTTPError as e:
         assert e.code == 404
         assert json.loads(e.read())["error"] == "no active call"
+
+
+def test_rpc_requests_log_to_unified_logger(tmp_path: Path) -> None:
+    # Every RPC response is recorded via the unified log API (file + UI panel
+    # get the same line): 2xx as INFO, 4xx as WARNING — and never the token.
+    lines: list[str] = []
+    store = ConfigStore(tmp_path / "config.json")
+    s = store.load()
+    s.rpc_enabled = True
+    s.rpc_token = "tok"
+    s.rpc_port = 0
+    store.save(s)
+    svc = SipCoreService(FakeSipBackend(), store, tts=FakeTtsBackend())
+    svc.start()
+    rpc = RpcServer(svc, store, log=lines.append)
+    rpc.start()
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{rpc.port}/v1/status",
+            headers={"Authorization": "Bearer tok"},
+        )
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+        assert "[RPC] GET /v1/status -> 200" in lines
+
+        bad = urllib.request.Request(
+            f"http://127.0.0.1:{rpc.port}/v1/status",
+            headers={"Authorization": "Bearer nope"},
+        )
+        try:
+            urllib.request.urlopen(bad, timeout=5)
+            assert False, "expected 401"
+        except urllib.error.HTTPError as e:
+            assert e.code == 401
+        assert any("[RPC][WARN] GET /v1/status -> 401" in l for l in lines)
+        # The bearer token must never appear in a log line.
+        assert all("tok" not in l for l in lines)
+    finally:
+        rpc.stop()

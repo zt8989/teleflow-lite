@@ -6,6 +6,13 @@ filtering is applied at log time. The ``attach`` helper wires the SIP service an
 Audio Device Manager events into one logger so SIP signaling, media state, and
 device binding all land in the same place — file + UI — as the spec requires.
 
+Unified log API: every app log line — attach()'s SIP/CALL/AUDIO events AND the
+ad-hoc "[CATEGORY] message" lines produced by the service, IVR, hooks, and TTS
+(cache hits, reports…, via ``log_line``) — flows through the same EventLogger so
+the UI panel and the log file always record the same content. A terminal (console)
+stream is optional (``console=True``), for runs that want app lines on stdout too;
+the terminal may still show extra lines (pjsua2's own C logs), which is fine.
+
 The logger deliberately has no Qt dependency so it is unit-testable headless.
 """
 
@@ -66,10 +73,12 @@ class EventLogger:
         sink: MessageSink | None = None,
         max_bytes: int = 1 << 20,
         backup_count: int = 5,
+        console: bool = False,
     ) -> None:
         self._path = path or DEFAULT_LOG_PATH
         self._level = level
         self._sink = sink
+        self._console = console
         # Bounded file growth for 7x24 operation: rotate by size, keep N backups.
         self._max_bytes = max_bytes
         self._backup_count = backup_count
@@ -95,8 +104,47 @@ class EventLogger:
                 fh.write(line + "\n")
         except OSError:
             pass
+        if self._console:
+            # Optional terminal mirror; the same line, so the console shows the
+            # app's log content (the terminal may additionally show pjsua2's own
+            # C-level logs — that extra noise is expected, not a drift).
+            try:
+                print(line, flush=True)
+            except OSError:
+                pass
         if self._sink is not None:
             self._sink(line)
+
+    def log_line(self, line: str) -> None:
+        """Route a pre-formatted ``[CATEGORY] message`` line (the service /
+        hook / TTS style) through the same file(+console)+sink path.
+
+        This is the funnel for ad-hoc app logs (``[IVR] …``, ``[HOOK] …``,
+        ``[REPORT] …``, ``[TTS] …``): what the UI panel shows is exactly what
+        the log file records. Level markers embedded in the line (``[ERROR]``,
+        ``[WARN...]``) are honored; everything else is INFO.
+        """
+        upper = line.upper()
+        if "[ERROR]" in upper:
+            level = LogLevel.ERROR
+        elif "[WARN" in upper:
+            level = LogLevel.WARNING
+        else:
+            level = LogLevel.INFO
+        category = "APP"
+        message = line
+        start = line.find("[")
+        end = line.find("]", start + 1) if start != -1 else -1
+        if start != -1 and end != -1:
+            category = line[start + 1 : end].strip() or category
+            message = line[end + 1 :].lstrip()
+            # Drop a nested "[ERROR]"/"[WARN]" marker left in the message, so
+            # "[HOOK][ERROR] boom" renders as "ERROR [HOOK] boom", not twice.
+            for tag in ("[ERROR]", "[WARNING]", "[WARN]"):
+                if message.upper().startswith(tag):
+                    message = message[len(tag) :].lstrip()
+                    break
+        self.log(level, category, message)
 
     def _maybe_rotate(self, extra: int) -> None:
         if self._max_bytes <= 0 or self._backup_count <= 0:

@@ -328,13 +328,19 @@ class DashboardWidget(QWidget):
             "[TTS]": QColor("#663399"),
             "[FFMPEG]": QColor("#663399"),
             "[REPORT]": QColor("#663399"),
+            "[RPC]": QColor("#007070"),
             "[ERROR]": QColor("#cc0000"),
         }
         fmt = QTextCharFormat()
-        for prefix, colour in colour_map.items():
-            if prefix in line:
-                fmt.setForeground(colour)
-                break
+        # Unified log lines carry a level token ("… ERROR [HOOK] …"); keep both
+        # that rendered form and raw "[ERROR]"-prefixed lines red.
+        if " ERROR " in line or "[ERROR]" in line:
+            fmt.setForeground(QColor("#cc0000"))
+        else:
+            for prefix, colour in colour_map.items():
+                if prefix in line:
+                    fmt.setForeground(colour)
+                    break
         self._log_view.setCurrentCharFormat(fmt)
         self._log_view.appendPlainText(line)
         scrollbar = self._log_view.verticalScrollBar()
@@ -488,18 +494,15 @@ class SettingsDialog(QDialog):
         ivl.addWidget(self.ivr_welcome)
         ivl.addWidget(
             QLabel("每个数字键（1-9-0）的播报词与命令：播报词留空则该键不播报，"
-                   "命令留空则该键被按下时不执行。最右「退出↔双向桥接」勾选框表示："
-                   "按此键后退出菜单、通话切回双向（用于开始 Vibe Coding），同一时刻只能勾一个。")
+                   "命令留空则该键被按下时不执行。通话始终双向桥接，AI 侧可随时插话或打断。")
         )
         digit_grid = QGridLayout()
         digit_grid.setSpacing(4)
         digit_grid.addWidget(QLabel("键"), 0, 0)
         digit_grid.addWidget(QLabel("播报词"), 0, 1)
         digit_grid.addWidget(QLabel("命令"), 0, 2)
-        digit_grid.addWidget(QLabel("退出↔双向桥接"), 0, 3)
         self.ivr_digit_text_edits: dict[str, QLineEdit] = {}
         self.ivr_digit_hook_edits: dict[str, QLineEdit] = {}
-        self.ivr_exit_checkboxes: dict[str, QCheckBox] = {}
         for row, digit in enumerate("1234567890", start=1):
             digit_grid.addWidget(QLabel(digit), row, 0)
             text_edit = QLineEdit()
@@ -508,14 +511,8 @@ class SettingsDialog(QDialog):
             hook_edit.setPlaceholderText("命令（留空不执行）")
             digit_grid.addWidget(text_edit, row, 1)
             digit_grid.addWidget(hook_edit, row, 2)
-            exit_cb = QCheckBox("退出")
-            exit_cb.toggled.connect(
-                lambda _checked, d=digit: self._on_ivr_exit_toggled(d)
-            )
-            digit_grid.addWidget(exit_cb, row, 3)
             self.ivr_digit_text_edits[digit] = text_edit
             self.ivr_digit_hook_edits[digit] = hook_edit
-            self.ivr_exit_checkboxes[digit] = exit_cb
         ivl.addLayout(digit_grid)
         ivl.addStretch()
 
@@ -649,19 +646,6 @@ class SettingsDialog(QDialog):
         self.log_level.setCurrentText(settings.log_level)
         self.autostart.setChecked(settings.autostart)
         self.start_minimized.setChecked(settings.start_minimized)
-        # Reflect the configured "exit IVR -> two-way bridge" key as a checked
-        # row (ivr_exit_digit is a single value, so at most one row is checked).
-        for digit, cb in self.ivr_exit_checkboxes.items():
-            cb.setChecked(digit == settings.ivr_exit_digit)
-
-    def _on_ivr_exit_toggled(self, digit: str) -> None:
-        # ivr_exit_digit is a single key: checking one row clears the others so
-        # only one digit can be the bridge/exit key at a time.
-        if not self.ivr_exit_checkboxes[digit].isChecked():
-            return
-        for other, cb in self.ivr_exit_checkboxes.items():
-            if other != digit:
-                cb.setChecked(False)
 
     def _save_and_close(self) -> None:
         settings = self._store.load()
@@ -679,10 +663,6 @@ class SettingsDialog(QDialog):
         settings.ivr_digit_hook = {
             d: v for d, e in self.ivr_digit_hook_edits.items() if (v := e.text().strip())
         }
-        # The single checked "exit/bridge" row is ivr_exit_digit; none checked => "".
-        settings.ivr_exit_digit = next(
-            (d for d, cb in self.ivr_exit_checkboxes.items() if cb.isChecked()), ""
-        )
         settings.rpc_enabled = self.rpc_enabled.isChecked()
         settings.rpc_port = self.rpc_port.value()
         settings.rpc_token = self.rpc_token.text().strip()
@@ -715,6 +695,11 @@ class MainWindow(QMainWindow):
     # QTimer.singleShot has no receiver overload, signals are the safe route).
     _synth_done = pyqtSignal()
     _synth_timed_out = pyqtSignal()
+    # Any-thread -> GUI-thread dispatcher. pjsua2 callbacks (invite/bye/dtmf/
+    # media-state) fire on pjsua2's worker threads and log lines / dashboard
+    # updates flow from there; PyQt widgets must only be touched on the GUI
+    # thread, or QPlainTextEdit etc. can access-violate (Qt6Gui.dll 0xc0000005).
+    _gui_task = pyqtSignal(object)
 
     def __init__(
         self,
@@ -731,6 +716,7 @@ class MainWindow(QMainWindow):
         self._tray: QSystemTrayIcon | None = None
         self._tray_sip: QAction | None = None
         self._settings_dialog: SettingsDialog | None = None
+        self._logger: EventLogger | None = None
         # Worker->GUI handoff for the async test-report path (_test_report).
         self._pending_report_text = ""
         self._pending_report_mp3 = ""
@@ -738,6 +724,7 @@ class MainWindow(QMainWindow):
         self._pending_report_error: str | None = None
         self._synth_done.connect(self._finish_test_report)
         self._synth_timed_out.connect(self._log_synth_timeout)
+        self._gui_task.connect(self._run_gui_task)
         self.setWindowTitle("TeleFlow — 座机声音流转助手")
         self.setWindowIcon(_load_icon())
         self.resize(680, 520)
@@ -759,8 +746,34 @@ class MainWindow(QMainWindow):
         self._setup_tray()
         self._wire_service()
 
+    def gui(self, fn: Callable[[], None]) -> None:
+        """Queued-handoff ``fn`` onto the GUI thread.
+
+        Safe to call from any thread: pjsua2 worker threads and hook threads
+        must never touch widgets directly; the queued signal runs ``fn`` on the
+        Qt main thread. From the GUI thread itself the call is direct.
+        """
+        self._gui_task.emit(fn)
+
+    def _run_gui_task(self, fn: Callable[[], None]) -> None:
+        fn()
+
     def append_log_line(self, line: str) -> None:
-        self.dashboard.append_log_line(line)
+        """Public log entry: routed through the unified logger so the UI panel
+        and the log file record exactly the same lines. Without a logger (tests)
+        it falls back to UI-only."""
+        if self._logger is not None:
+            self._logger.log_line(line)
+        else:
+            self._append_ui_log_line(line)
+
+    def _append_ui_log_line(self, line: str) -> None:
+        """UI-panel-only append; this is the EventLogger sink target."""
+        self.gui(lambda: self.dashboard.append_log_line(line))
+
+    def attach_logger(self, logger: EventLogger) -> None:
+        """Wire the unified logger; append_log_line then reaches file + UI."""
+        self._logger = logger
 
     def _build_service_actions(self) -> None:
         """One set of QActions shared by the dashboard menu and the system-tray
@@ -905,57 +918,64 @@ class MainWindow(QMainWindow):
 
     def _wire_service(self) -> None:
         svc = self._service
-        svc.on(EVENT_SIP_STARTED, lambda: self._sync_sip_button())
-        svc.on(EVENT_SIP_STOPPED, lambda: self._sync_sip_button())
+        # All handlers are marshaled to the GUI thread via self.gui: service
+        # events fire from pjsua2 worker threads on a live call, and touching
+        # dashboard widgets there crashes Qt (Qt6Gui.dll access violation).
+        svc.on(EVENT_SIP_STARTED, lambda: self.gui(self._sync_sip_button))
+        svc.on(EVENT_SIP_STOPPED, lambda: self.gui(self._sync_sip_button))
         svc.on(
             EVENT_SIP_REGISTERED,
-            lambda contact: self.dashboard.set_sip_registration("已注册"),
+            lambda contact: self.gui(lambda: self.dashboard.set_sip_registration("已注册")),
         )
         svc.on(
             EVENT_SIP_UNREGISTERED,
-            lambda: self.dashboard.set_sip_registration("未注册"),
+            lambda: self.gui(lambda: self.dashboard.set_sip_registration("未注册")),
         )
         svc.on(
             EVENT_SIP_REGISTER_FAILED,
-            lambda code, reason: self.dashboard.set_sip_registration(
-                f"注册失败 ({code})" if code else "注册失败"
+            lambda code, reason: self.gui(
+                lambda: self.dashboard.set_sip_registration(
+                    f"注册失败 ({code})" if code else "注册失败"
+                )
             ),
         )
         svc.on(
             EVENT_SIP_PORT_CONFLICT,
-            lambda requested, selected: self._notify_port_conflict(requested, selected),
+            lambda requested, selected: self.gui(
+                lambda: self._notify_port_conflict(requested, selected)
+            ),
         )
         svc.on(
             EVENT_CALL_INCOMING,
-            lambda call_id: self.dashboard.set_call_state(CallState.INCOMING),
+            lambda call_id: self.gui(lambda: self.dashboard.set_call_state(CallState.INCOMING)),
         )
         svc.on(
             EVENT_CALL_CONNECTED,
-            lambda call_id: self.dashboard.set_call_state(CallState.CONNECTED),
+            lambda call_id: self.gui(lambda: self.dashboard.set_call_state(CallState.CONNECTED)),
         )
         svc.on(
             EVENT_CALL_ENDED,
-            lambda call_id, last_digit="": self.dashboard.set_call_state(CallState.ENDED),
+            lambda call_id, last_digit="": self.gui(lambda: self.dashboard.set_call_state(CallState.ENDED)),
         )
         svc.on(
             EVENT_REPORT_STARTED,
-            lambda report_id, target: self.dashboard.set_report_state(ReportState.DIALING),
+            lambda report_id, target: self.gui(lambda: self.dashboard.set_report_state(ReportState.DIALING)),
         )
         svc.on(
             EVENT_REPORT_CONNECTED,
-            lambda call_id: self.dashboard.set_report_state(ReportState.PLAYING),
+            lambda call_id: self.gui(lambda: self.dashboard.set_report_state(ReportState.PLAYING)),
         )
         svc.on(
             EVENT_REPORT_PLAYING,
-            lambda call_id: self.dashboard.set_report_state(ReportState.PLAYING),
+            lambda call_id: self.gui(lambda: self.dashboard.set_report_state(ReportState.PLAYING)),
         )
         svc.on(
             EVENT_REPORT_COMPLETED,
-            lambda report_id, call_id: self.dashboard.set_report_state(ReportState.COMPLETED),
+            lambda report_id, call_id: self.gui(lambda: self.dashboard.set_report_state(ReportState.COMPLETED)),
         )
         svc.on(
             EVENT_REPORT_FAILED,
-            lambda reason, report_id: self.dashboard.set_report_state(ReportState.FAILED),
+            lambda reason, report_id: self.gui(lambda: self.dashboard.set_report_state(ReportState.FAILED)),
         )
         self.dashboard.set_test_report_callback(self._test_report)
         self._sync_sip_button()
@@ -1066,14 +1086,24 @@ def build_app(
     manager = AudioDeviceManager(audio_backend, store)
     tts = CachingTtsBackend(EdgeTtsBackend(ffmpeg_path=settings.ffmpeg_path))
     service = SipCoreService(sip_backend, store, tts=tts)
-    tts.logger = service._log_line  # surface cache hit/miss in the dashboard log
+    # tts.logger is wired to the unified logger below, after it exists.
     window = MainWindow(manager, service, store)
 
-    logger = EventLogger(level=LogLevel[settings.log_level], sink=window.append_log_line)
+    # Unified log API: one EventLogger writes EVERY line to the log file and to
+    # the UI panel (via the UI-only sink), so both always record the same
+    # content. The terminal may additionally show more (pjsua2's own C logs,
+    # request traffic) — that extra noise is expected, not a drift.
+    logger = EventLogger(
+        level=LogLevel[settings.log_level],
+        sink=window._append_ui_log_line,
+    )
+    window.attach_logger(logger)
     attach(logger, service, manager)
 
-    # Route phone-report sub-step logs ([REPORT]/[TTS]/[FFMPEG]) to the dashboard.
-    service._log = window.append_log_line
+    # Route the service's ad-hoc lines ([IVR]/[REPORT]/[TTS]/[FFMPEG]) and the
+    # hook runner's [HOOK] lines through the same logger (file + UI panel).
+    service._log = logger.log_line
+    tts.logger = logger.log_line
 
     # Re-route a live call when the user switches the playback/capture device.
     def _on_device_selected(_playback: str, _capture: str) -> None:
@@ -1091,12 +1121,12 @@ def build_app(
     # Hook commands: run the user-configured 摘机 command when the current SIP
     # auto-answers an incoming call. Non-blocking; failures are logged, never
     # raised into the call path.
-    hook_runner = SubprocessHookRunner(store, log=window.append_log_line)
+    hook_runner = SubprocessHookRunner(store, log=logger.log_line)
     attach_hooks(service, hook_runner, store)
 
     # Local loopback RPC control channel (feature teleflow-phone-report). Bound to
     # 127.0.0.1 only, bearer-token authenticated. Skipped if disabled in settings.
-    rpc = RpcServer(service, store)
+    rpc = RpcServer(service, store, log=logger.log_line)
     rpc.start()
 
     if settings.autostart:

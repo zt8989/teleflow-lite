@@ -96,11 +96,6 @@ class Settings:
     ivr_welcome: str = ""
     ivr_digit_text: dict[str, str] = field(default_factory=dict)
     ivr_digit_hook: dict[str, str] = field(default_factory=dict)
-    # The digit that, when pressed during the menu, ends the IVR flow and bridges
-    # the call two-way (e.g. to start Vibe Coding with a real conversation). Empty
-    # means no digit exits IVR. Must be one of "1".."9","0"; it is intentionally a
-    # setting (not hard-coded) so the Vibe-Coding / bridge key is user-chosen.
-    ivr_exit_digit: str = "0"
     # Phone-report RPC (feature teleflow-phone-report). TeleFlow can be told by an
     # external hook to dial the desk phone and play a report; these persist that
     # control channel + synthesis settings.

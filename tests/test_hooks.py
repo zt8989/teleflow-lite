@@ -35,6 +35,23 @@ def test_render_substitutes_call_id() -> None:
     )
 
 
+def test_render_substitutes_last_digit_for_on_hook_script() -> None:
+    # The on-hook command may pass the last IVR digit to the script so it can
+    # decide whether the Vibe Coding session (key 0) actually started.
+    assert (
+        SubprocessHookRunner._render(
+            "stop.sh --last-digit {last_digit}", {"call_id": "C1", "last_digit": "0"}
+        )
+        == "stop.sh --last-digit 0"
+    )
+    assert (
+        SubprocessHookRunner._render(
+            "stop.sh --last-digit {last_digit}", {"call_id": "C2", "last_digit": ""}
+        )
+        == "stop.sh --last-digit "
+    )
+
+
 def test_run_is_nonblocking_and_renders_command(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -173,11 +190,10 @@ def test_on_hook_fires_on_call_ended_when_last_digit_zero(tmp_path: Path) -> Non
     assert ("on-hangup.sh {call_id}", {"call_id": "C1", "last_digit": "0"}) in recorder.calls
 
 
-def test_on_hook_skips_when_last_digit_not_zero(tmp_path: Path) -> None:
-    # On-hook must NOT fire for a call whose last IVR digit was not "0" (e.g. a
-    # different key was pressed, or none) — only the "0" session-start key arms
-    # the stop+confirm on hang-up. The guard is enforced in the app (attach_hooks)
-    # so it works under Windows cmd.exe.
+def test_on_hook_fires_on_every_hangup(tmp_path: Path) -> None:
+    # The IVR call is always bridged two-way, so the on-hook command fires on
+    # every hang-up (no exit-digit gate). The last digit pressed is carried in
+    # the context.
     store = ConfigStore(tmp_path / "c.json")
     settings = store.load()
     settings.ivr_enabled = True
@@ -190,41 +206,13 @@ def test_on_hook_skips_when_last_digit_not_zero(tmp_path: Path) -> None:
     attach_hooks(service, recorder, store)
 
     service.start()
-    # No key pressed at all.
-    backend.receive_invite("C1")
-    backend.receive_bye("C1")
-    assert all(c[0] != "on-hangup.sh {call_id}" for c in recorder.calls)
-
-    # Pressed "1" (weather) then hung up.
-    backend.receive_invite("C2")
-    backend.receive_dtmf("C2", "1")
-    backend.receive_bye("C2")
-    assert all(c[0] != "on-hangup.sh {call_id}" for c in recorder.calls)
-
-
-def test_on_hook_guard_uses_configured_exit_digit(tmp_path: Path) -> None:
-    # The on-hook guard must key on ivr_exit_digit (not a hard-coded "0"): a
-    # different last digit must not fire, while the configured exit digit must.
-    store = ConfigStore(tmp_path / "c.json")
-    settings = store.load()
-    settings.ivr_enabled = True
-    settings.ivr_exit_digit = "7"
-    settings.on_hook_cmd = "on-hangup.sh {call_id}"
-    store.save(settings)
-
-    backend = FakeSipBackend()
-    service = SipCoreService(backend, store, tts=FakeTtsBackend())
-    recorder = _RecordingHookRunner()
-    attach_hooks(service, recorder, store)
-
-    service.start()
-    # Last digit "0" but the exit digit is "7" -> on-hook must NOT fire.
+    # Last digit "0" -> on-hook still fires (no guard).
     backend.receive_invite("C1")
     backend.receive_dtmf("C1", "0")
     backend.receive_bye("C1")
-    assert all(c[0] != "on-hangup.sh {call_id}" for c in recorder.calls)
+    assert ("on-hangup.sh {call_id}", {"call_id": "C1", "last_digit": "0"}) in recorder.calls
 
-    # Pressing the configured exit digit "7" -> on-hook fires.
+    # Pressing "7" then hang up -> on-hook fires again.
     backend.receive_invite("C2")
     backend.receive_dtmf("C2", "7")
     backend.receive_bye("C2")
