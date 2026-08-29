@@ -380,10 +380,16 @@ class SipCoreService:
         if not self._running:
             self._fail_report("sip_not_running")
             raise RuntimeError("SIP service is not running")
-        resolved_target = target or settings.report_target
+        default_target = (
+            f"sip:{settings.report_extension}@{settings.report_host}"
+            f":{settings.report_port}"
+            if settings.report_host and settings.report_extension
+            else ""
+        )
+        resolved_target = target or default_target
         if not resolved_target:
             self._fail_report("no_target")
-            raise RuntimeError("no report_target configured")
+            raise RuntimeError("no report target configured")
         if audio_path and not Path(audio_path).exists():
             self._fail_report("file_missing")
             raise RuntimeError("audio file not found")

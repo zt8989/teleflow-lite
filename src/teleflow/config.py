@@ -14,6 +14,36 @@ from pathlib import Path
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "teleflow" / "config.json"
 
 
+def _split_sip_uri(uri: object) -> tuple[str, str, int]:
+    """Split a legacy ``sip:user@host:port`` URI into (user, host, port).
+
+    Accepts bare ``host[:port]`` forms and IPv6 ``[::1]:5060`` brackets; a
+    missing user or port falls back to ("", host, 5060). Used only to migrate
+    the old single-URI settings (``sip_server`` / ``report_target``).
+    """
+    text = str(uri or "").strip()
+    if text.lower().startswith("sip:"):
+        text = text[4:]
+    if "@" in text:
+        user, _, text = text.partition("@")
+    else:
+        user = ""
+    if text.startswith("["):  # IPv6 literal
+        host, _, rest = text[1:].partition("]")
+        port = rest[1:] if rest.startswith(":") else ""
+    elif ":" in text:
+        host, _, port = text.rpartition(":")
+    else:
+        host, port = text, ""
+    try:
+        port_num = int(port)
+        if not 1 <= port_num <= 65535:
+            port_num = 5060
+    except ValueError:
+        port_num = 5060
+    return user, host, port_num
+
+
 @dataclass
 class Settings:
     """The full set of persisted TeleFlow settings.
@@ -29,8 +59,13 @@ class Settings:
     # non-empty value is a preferred port, honoured only when free; otherwise
     # the user is warned and a free port is picked automatically.
     sip_port: str = ""
-    # SIP client account — TeleFlow registers to this registrar/proxy as this user.
-    sip_server: str = ""  # registrar/proxy URI, e.g. "sip:provider.example.com:5060"
+    # SIP client account — TeleFlow registers to this gateway as this user.
+    #   sip_host         — gateway domain or IP, e.g. "192.168.1.189".
+    #   sip_server_port  — gateway SIP port (default 5060).
+    #   sip_user         — extension / AOR on the gateway, e.g. "1002".
+    #   sip_password     — auth password.
+    sip_host: str = ""
+    sip_server_port: int = 5060
     sip_user: str = ""  # AOR / auth username
     sip_password: str = ""  # auth password
     playback_device_id: str = ""
@@ -55,8 +90,9 @@ class Settings:
     #   rpc_enabled   — whether the local HTTP control channel is on.
     #   rpc_port      — localhost port for the RPC server (bound to 127.0.0.1 only).
     #   rpc_token     — bearer token; empty => auto-generated & persisted on first run.
-    #   report_target — SIP URI of the desk phone / FXS extension to dial
-    #                   (e.g. sip:8000@192.168.1.116). Empty => /v1/report errors.
+    #   report_host      — desk phone / FXS gateway domain or IP to dial.
+    #   report_port      — SIP port of the desk phone (default 5060).
+    #   report_extension — desk phone extension / AOR on that gateway, e.g. "8000".
     #   report_caller_id — caller display name for the outbound report call.
     #   report_hangup_on_eof — hang up automatically when playback finishes.
     #   tts_voice     — default edge-tts voice/timbre for report synthesis.
@@ -64,7 +100,9 @@ class Settings:
     rpc_enabled: bool = True
     rpc_port: int = 8731
     rpc_token: str = ""
-    report_target: str = ""
+    report_host: str = ""
+    report_port: int = 5060
+    report_extension: str = ""
     report_caller_id: str = "TeleFlow"
     report_hangup_on_eof: bool = True
     tts_voice: str = "zh-CN-XiaoxiaoNeural"
@@ -109,6 +147,20 @@ class ConfigStore:
                 known["sip_port"] = ""
             else:
                 known["sip_port"] = str(stored).strip()
+        # Migration from the single-URI era (gateway-config-split): the gateway
+        # and the report target used to be one ``sip:user@host:port`` string
+        # each; they are now stored as host / port / extension fields. Parse
+        # the old URIs so existing configs keep working unchanged; explicit new
+        # fields in the file take precedence (setdefault).
+        if "sip_server" in raw:
+            _user, host, port = _split_sip_uri(raw["sip_server"])
+            known.setdefault("sip_host", host)
+            known.setdefault("sip_server_port", port)
+        if "report_target" in raw:
+            user, host, port = _split_sip_uri(raw["report_target"])
+            known.setdefault("report_extension", user)
+            known.setdefault("report_host", host)
+            known.setdefault("report_port", port)
         # Field migration from the pre-sip-softphone schema (and the intermediate
         # ata-registration branch). The old design was a SIP *server* the gateway
         # registered to; the new design is a SIP *client* that registers to an

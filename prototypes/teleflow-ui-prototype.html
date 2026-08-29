@@ -222,13 +222,14 @@ const state = {
   registration:"未注册",     // 未注册 | 已注册 | 注册失败 (403)
   mode:"生产模式",
   port:5060,
-  server:"", user:"", password:"",
+  gatewayHost:"192.168.1.189", gatewayPort:5060,
+  user:"", password:"",
   playback:2, capture:12,
   call:CALL.IDLE,
   callId:"",
   offHookCmd:"", onHookCmd:"",
   rpcToken:"",
-  reportTarget:"sip:8000@192.168.1.116",
+  reportHost:"192.168.1.116", reportPort:5060, reportExt:"8000",
   report:{state:"空闲", id:""},
   log:[],
 };
@@ -269,9 +270,9 @@ function setMode(m){
 
 /* --- SIP client registration simulation (no PBX / registrar in this design) --- */
 function simRegisterOk(){
-  if(!state.server.trim()){ pushLog("未配置 SIP 服务器，无法注册","err"); return; }
+  if(!state.gatewayHost.trim()){ pushLog("未配置网关地址，无法注册","err"); return; }
   state.registration="已注册";
-  pushLog(`向 ${state.server} 发送 REGISTER，收到 200 OK，身份 ${state.user||'(匿名)'}`,"sip");
+  pushLog(`向 ${state.gatewayHost}:${state.gatewayPort} 发送 REGISTER，收到 200 OK，身份 ${state.user||'(匿名)'}`,"sip");
   render();
 }
 function simRegisterFail(){
@@ -329,7 +330,7 @@ function simReport(){
   if(!state.sipRunning){ pushLog("SIP 未运行，无法汇报（请先启动服务）","report"); return; }
   state.report.id="RPT-"+Math.random().toString(36).slice(2,6).toUpperCase();
   state.report.state="拨号中…"; render();
-  pushLog(`[REPORT] 启动汇报: target=${state.reportTarget} voice=zh-CN-XiaoxiaoNeural`,"report");
+  pushLog(`[REPORT] 启动汇报: target=${state.reportExt}@${state.reportHost}:${state.reportPort} voice=zh-CN-XiaoxiaoNeural`,"report");
   setTimeout(()=>{
     pushLog("[TTS] 合成中: voice=zh-CN-XiaoxiaoNeural","tts");
     pushLog("[TTS] 合成完成: report_xxxx.mp3","tts");
@@ -385,9 +386,10 @@ const SETTINGS_PANE = `<div class="dlgLayout">
   </div>
   <div style="flex:1;min-width:0">
     <div class="dlgPanel" id="p-acct">
-      <label class="fld"><span>SIP 服务器（注册地址，例如 sip:provider.example.com:5060，留空则不注册）</span><input type="text" id="sipServer" value="${state.server}" placeholder="sip:provider.example.com:5060"></label>
+      <label class="fld"><span>网关地址（域名或 IP，留空则不注册）</span><input type="text" id="sipHost" value="${state.gatewayHost}" placeholder="例如 192.168.1.189"></label>
       <div class="row">
-        <label class="fld"><span>SIP 账号（认证用户名 / AOR，例如 2001）</span><input type="text" id="sipUser" value="${state.user}" placeholder="例如 2001"></label>
+        <label class="fld"><span>网关端口</span><input type="number" id="sipServerPort" value="${state.gatewayPort}"></label>
+        <label class="fld"><span>分机号（SIP 账号 / AOR）</span><input type="text" id="sipUser" value="${state.user}" placeholder="例如 1002"></label>
         <label class="fld"><span>SIP 密码</span><input type="password" id="sipPassword" value="${state.password}" placeholder="认证密码"></label>
       </div>
     </div>
@@ -404,7 +406,11 @@ const SETTINGS_PANE = `<div class="dlgLayout">
           <input type="text" id="rpcToken" value="${state.rpcToken}" readonly placeholder="自动生成">
           <button class="btn" onclick="resetToken()">重置 Token</button>
         </div></label>
-      <label class="fld"><span>座机目标 SIP URI</span><input type="text" id="reportTarget" value="${state.reportTarget}" placeholder="例如 sip:8000@192.168.1.116"></label>
+      <label class="fld"><span>座机地址（域名或 IP，对外打电话）</span><input type="text" id="reportHost" value="${state.reportHost}" placeholder="例如 192.168.1.116"></label>
+      <div class="row">
+        <label class="fld"><span>座机端口</span><input type="number" id="reportPort" value="${state.reportPort}"></label>
+        <label class="fld"><span>座机分机号</span><input type="text" id="reportExt" value="${state.reportExt}" placeholder="例如 8000"></label>
+      </div>
       <label class="fld"><span>主叫显示名</span><input type="text" value="TeleFlow" placeholder="默认 TeleFlow"></label>
       <label class="fld"><span>TTS 音色</span><input type="text" value="zh-CN-XiaoxiaoNeural" placeholder="例如 zh-CN-XiaoxiaoNeural"></label>
       <label class="fld"><span>ffmpeg 路径（可选）</span><input type="text" placeholder="自动发现: /opt/homebrew/bin/ffmpeg"></label>
@@ -516,13 +522,16 @@ function openSettings(){
 function closeSettings(){document.getElementById("settingsModal").classList.add("hidden");}
 function saveSettings(){
   const g=(id)=>document.getElementById(id);
-  if(g("sipServer")) state.server=g("sipServer").value.trim();
+  if(g("sipHost")) state.gatewayHost=g("sipHost").value.trim();
+  if(g("sipServerPort")) state.gatewayPort=+g("sipServerPort").value||5060;
   if(g("sipUser")) state.user=g("sipUser").value.trim();
   if(g("sipPassword")) state.password=g("sipPassword").value;
   if(g("offHookCmd")) state.offHookCmd=g("offHookCmd").value;
   if(g("onHookCmd")) state.onHookCmd=g("onHookCmd").value;
-  if(g("reportTarget")) state.reportTarget=g("reportTarget").value;
-  pushLog(`设置已保存：SIP 服务器=${state.server||'(无)'}，账号=${state.user||'(无)'}；电话汇报 RPC 已配置`,"sip");
+  if(g("reportHost")) state.reportHost=g("reportHost").value.trim();
+  if(g("reportPort")) state.reportPort=+g("reportPort").value||5060;
+  if(g("reportExt")) state.reportExt=g("reportExt").value.trim();
+  pushLog(`设置已保存：网关=${state.gatewayHost||'(无)'}，账号=${state.user||'(无)'}；电话汇报 RPC 已配置`,"sip");
   closeSettings();
 }
 document.getElementById("settingsModal").addEventListener("click",(e)=>{

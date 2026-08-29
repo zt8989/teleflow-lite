@@ -86,24 +86,9 @@ class Pjsua2AudioController:
         self._mgr.setCaptureDev(int(device_id))
 
 
-def _sip_uri(server: str) -> str:
-    """Normalize a user-entered registrar address into a ``sip:`` URI."""
-    s = server.strip()
-    if not s:
-        return ""
-    if s.startswith("sip:"):
-        return s
-    return f"sip:{s}"
-
-
-def _host_of(server: str) -> str:
-    """Extract the host part from a ``sip:`` URI or a bare ``host[:port]``."""
-    s = server.strip()
-    if s.startswith("sip:"):
-        s = s[4:]
-    if "@" in s:  # strip user@ if present
-        s = s.split("@", 1)[1]
-    return s.split(":", 1)[0]
+def _registrar_uri(host: str, port: int) -> str:
+    """Compose the registrar URI from the gateway host/port settings."""
+    return f"sip:{host}:{port}"
 
 
 def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
@@ -271,13 +256,15 @@ class Pjsua2Backend:
         acc_cfg = self._pj.AccountConfig()
         settings = self._store.load()
         # Local account URI (the AOR). Anchor the host to the configured
-        # registrar when present so the identity matches the server's realm;
+        # gateway when present so the identity matches the server's realm;
         # otherwise fall back to a local peer identity (direct IP calling).
-        host = _host_of(settings.sip_server) or "localhost"
+        host = settings.sip_host or "localhost"
         acc_cfg.idUri = f"sip:{settings.sip_user or 'teleflow'}@{host}"
-        # Register to the configured SIP server as a client, with digest auth.
-        if settings.sip_server:
-            acc_cfg.regConfig.registrarUri = _sip_uri(settings.sip_server)
+        # Register to the configured gateway as a client, with digest auth.
+        if settings.sip_host:
+            acc_cfg.regConfig.registrarUri = _registrar_uri(
+                settings.sip_host, settings.sip_server_port
+            )
             acc_cfg.regConfig.register = True
             if settings.sip_user:
                 cred = self._pj.AuthCredInfo(

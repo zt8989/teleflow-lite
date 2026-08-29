@@ -20,7 +20,8 @@ def _rpc(tmp_path: Path, token="tok"):
     s.rpc_enabled = True
     s.rpc_token = token
     s.rpc_port = 0  # bind a free port
-    s.report_target = "sip:8000@192.168.1.116"
+    s.report_host = "192.168.1.116"
+    s.report_extension = "8000"
     store.save(s)
     backend = FakeSipBackend()
     tts = FakeTtsBackend()
@@ -48,7 +49,7 @@ def test_report_post_triggers_outbound_call(tmp_path: Path) -> None:
         body = json.loads(resp.read())
         assert "report_id" in body
     assert backend.report_calls, "expected an outbound report call to be placed"
-    assert backend.report_calls[0][0] == "sip:8000@192.168.1.116"
+    assert backend.report_calls[0][0] == "sip:8000@192.168.1.116:5060"
     assert backend.report_calls[0][1].endswith(".wav")
 
 

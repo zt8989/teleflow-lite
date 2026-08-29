@@ -17,7 +17,8 @@ def test_load_returns_defaults_when_file_missing(tmp_path: Path) -> None:
     settings = store.load()
     assert settings == Settings()
     assert settings.sip_port == ""
-    assert settings.sip_server == ""
+    assert settings.sip_host == ""
+    assert settings.sip_server_port == 5060
     assert settings.sip_user == ""
     assert settings.sip_password == ""
 
@@ -39,7 +40,8 @@ def test_round_trip_preserves_all_fields(tmp_path: Path) -> None:
         autostart=True,
         start_minimized=True,
         log_level="DEBUG",
-        sip_server="sip:proxy.example.com:5060",
+        sip_host="proxy.example.com",
+        sip_server_port=5062,
         sip_user="2002",
         sip_password="secret",
     )
@@ -51,7 +53,8 @@ def test_sip_client_fields_default_on_fresh_file(tmp_path: Path) -> None:
     store = ConfigStore(tmp_path / "config.json")
     settings = store.load()
     assert settings.sip_port == ""  # "" = auto-detect
-    assert settings.sip_server == ""
+    assert settings.sip_host == ""
+    assert settings.sip_server_port == 5060
     assert settings.sip_user == ""
     assert settings.sip_password == ""
     assert settings.sip_auto_connect is True  # auto-connect gateway on launch
@@ -142,7 +145,9 @@ def test_phone_report_fields_default_on_fresh_file(tmp_path: Path) -> None:
     assert settings.rpc_enabled is True
     assert settings.rpc_port == 8731
     assert settings.rpc_token == ""
-    assert settings.report_target == ""
+    assert settings.report_host == ""
+    assert settings.report_port == 5060
+    assert settings.report_extension == ""
     assert settings.report_caller_id == "TeleFlow"
     assert settings.report_hangup_on_eof is True
     assert settings.tts_voice == "zh-CN-XiaoxiaoNeural"
@@ -155,7 +160,9 @@ def test_phone_report_fields_round_trip(tmp_path: Path) -> None:
         rpc_enabled=False,
         rpc_port=9123,
         rpc_token="s3cr3t",
-        report_target="sip:8000@192.168.1.116",
+        report_host="192.168.1.116",
+        report_port=5080,
+        report_extension="8000",
         report_caller_id="WorkBuddy",
         report_hangup_on_eof=False,
         tts_voice="zh-CN-YunyangNeural",
@@ -175,6 +182,69 @@ def test_old_file_without_phone_report_fields_uses_defaults(tmp_path: Path) -> N
     loaded = store.load()
     assert loaded.rpc_enabled is True
     assert loaded.rpc_port == 8731
-    assert loaded.report_target == ""
+    assert loaded.report_host == ""
+    assert loaded.report_port == 5060
+    assert loaded.report_extension == ""
     assert loaded.tts_voice == "zh-CN-XiaoxiaoNeural"
     assert loaded.ffmpeg_path == ""
+
+
+def test_legacy_sip_server_and_report_target_split_into_fields(
+    tmp_path: Path,
+) -> None:
+    """Old single-URI ``sip_server`` / ``report_target`` values migrate to the
+    split host/port/extension fields; explicit new fields win."""
+    store = ConfigStore(tmp_path / "config.json")
+    store.path.write_text(
+        json.dumps(
+            {
+                "sip_server": "sip:192.168.1.189:5060",
+                "report_target": "sip:8000@192.168.1.116:5080",
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = store.load()
+    assert loaded.sip_host == "192.168.1.189"
+    assert loaded.sip_server_port == 5060
+    assert loaded.report_extension == "8000"
+    assert loaded.report_host == "192.168.1.116"
+    assert loaded.report_port == 5080
+    # New fields are not present as Settings fields anymore.
+    assert not hasattr(loaded, "sip_server")
+    assert not hasattr(loaded, "report_target")
+
+
+def test_legacy_uri_without_port_and_without_user(tmp_path: Path) -> None:
+    store = ConfigStore(tmp_path / "config.json")
+    store.path.write_text(
+        json.dumps(
+            {
+                "sip_server": "sip:gateway.example.com",
+                "report_target": "192.168.1.116",  # bare host, no scheme
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = store.load()
+    assert loaded.sip_host == "gateway.example.com"
+    assert loaded.sip_server_port == 5060  # default
+    assert loaded.report_host == "192.168.1.116"
+    assert loaded.report_port == 5060
+    assert loaded.report_extension == ""
+
+
+def test_new_split_fields_win_over_legacy_uri(tmp_path: Path) -> None:
+    store = ConfigStore(tmp_path / "config.json")
+    store.path.write_text(
+        json.dumps(
+            {
+                "sip_server": "sip:old.example.com:5099",
+                "sip_host": "new.example.com",
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = store.load()
+    assert loaded.sip_host == "new.example.com"  # explicit field wins
+    assert loaded.sip_server_port == 5099  # port still migrated from old URI

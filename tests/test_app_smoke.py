@@ -155,14 +155,16 @@ def test_sip_registration_updates_dashboard_card(tmp_path) -> None:
 def test_settings_dialog_round_trips_sip_account(tmp_path) -> None:
     app, window, service, manager, _ = _make_window(tmp_path)
     dialog = SettingsDialog(manager, window)
-    dialog.sip_server.setText("sip:provider.example.com:5060")
-    dialog.sip_user.setText("2001")
+    dialog.sip_host.setText("192.168.1.189")
+    dialog.sip_server_port.setValue(5062)
+    dialog.sip_user.setText("1002")
     dialog.sip_password.setText("secret")
     dialog._save_and_close()
 
     reloaded = ConfigStore(tmp_path / "config.json").load()
-    assert reloaded.sip_server == "sip:provider.example.com:5060"
-    assert reloaded.sip_user == "2001"
+    assert reloaded.sip_host == "192.168.1.189"
+    assert reloaded.sip_server_port == 5062
+    assert reloaded.sip_user == "1002"
     assert reloaded.sip_password == "secret"
     window.close()
 
@@ -213,7 +215,7 @@ def test_auto_start_connects_when_config_complete(
     monkeypatch.setattr("teleflow.sip._udp_port_available", lambda port: True)
     store = ConfigStore(tmp_path / "config.json")
     settings = store.load()
-    settings.sip_server = "sip:192.168.1.189:5060"
+    settings.sip_host = "192.168.1.189"
     settings.sip_user = "1002"
     settings.sip_password = "1234"
     store.save(settings)
@@ -230,7 +232,7 @@ def test_auto_start_connects_when_config_complete(
 def test_auto_start_stays_stopped_on_incomplete_config(tmp_path) -> None:
     store = ConfigStore(tmp_path / "config.json")
     settings = store.load()
-    settings.sip_server = "sip:192.168.1.189:5060"  # no sip_user
+    settings.sip_host = "192.168.1.189"  # no sip_user
     store.save(settings)
 
     service = SipCoreService(FakeSipBackend(), store)
@@ -248,7 +250,7 @@ def test_auto_start_falls_back_to_stopped_on_startup_error(
 ) -> None:
     store = ConfigStore(tmp_path / "config.json")
     settings = store.load()
-    settings.sip_server = "sip:192.168.1.189:5060"
+    settings.sip_host = "192.168.1.189"
     settings.sip_user = "1002"
     store.save(settings)
 
@@ -270,7 +272,7 @@ def test_auto_start_falls_back_to_stopped_on_startup_error(
 def test_auto_start_respects_disabled_flag(tmp_path) -> None:
     store = ConfigStore(tmp_path / "config.json")
     settings = store.load()
-    settings.sip_server = "sip:192.168.1.189:5060"
+    settings.sip_host = "192.168.1.189"
     settings.sip_user = "1002"
     settings.sip_auto_connect = False
     store.save(settings)

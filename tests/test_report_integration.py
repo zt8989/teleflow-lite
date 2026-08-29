@@ -35,7 +35,8 @@ def _tmp_store(tmp_path: Path) -> ConfigStore:
     settings.rpc_enabled = True
     settings.rpc_token = ""  # auto-generate on RPC start
     settings.rpc_port = 0  # ephemeral port for the test
-    settings.report_target = "sip:8000@192.168.1.116"
+    settings.report_host = "192.168.1.116"
+    settings.report_extension = "8000"
     store.save(settings)
     return store
 
@@ -116,7 +117,7 @@ def test_hook_like_report_drives_full_flow(tmp_path: Path) -> None:
         # Outbound report call placed to the configured desk phone.
         assert backend.report_calls, "no outbound report call was placed"
         target, wav = backend.report_calls[0]
-        assert target == "sip:8000@192.168.1.116"
+        assert target == "sip:8000@192.168.1.116:5060"
         # TTS ran (synthesize + transcode) because no audio_path was supplied.
         assert tts.synthesized and tts.transcoded
         assert service.report_state.value == "dialing"
