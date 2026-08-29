@@ -20,3 +20,6 @@ packaging/macos/dmgroot/
 # Local config / logs written at runtime
 .config/
 *.log
+
+# Git worktree isolation directory
+.worktrees/
