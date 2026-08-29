@@ -55,7 +55,18 @@ class SubprocessHookRunner:
     def _execute(self, command: str) -> None:
         try:
             subprocess.run(
-                command, shell=True, capture_output=True, text=True, check=False
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                # Output is discarded, but a hook command may print bytes that
+                # are invalid in UTF-8 (e.g. a tool emitting the system code
+                # page). Without errors="replace", subprocess's reader thread
+                # raises UnicodeDecodeError and crashes (the exception lands in
+                # a daemon thread, outside this try/except). Replace keeps the
+                # decode lossy instead of fatal.
+                errors="replace",
+                check=False,
             )
         except Exception as exc:  # noqa: BLE001 - a hook must never break the call
             self._log_line(f"[HOOK][ERROR] 命令执行失败: {exc}")
@@ -86,8 +97,16 @@ def attach_hooks(service: SipCoreService, runner: HookRunner, store: ConfigStore
         runner.run(store.load().off_hook_cmd, {"call_id": call_id})
 
     def _on_hook(call_id: str, last_digit: str = "") -> None:
-        # {last_digit} is the first DTMF key of an IVR call (empty if none).
-        runner.run(store.load().on_hook_cmd, {"call_id": call_id, "last_digit": last_digit})
+        settings = store.load()
+        # Only fire the on-hook command when the last IVR digit was the configured
+        # "exit IVR" key (ivr_exit_digit, default "0"): that key began the
+        # recording via its per-digit hook, so hanging up must stop + confirm it.
+        # The guard lives here in Python rather than as a ``[ "{last_digit}" = "0" ]``
+        # test embedded in the command, because on Windows ``shell=True`` runs under
+        # cmd.exe where ``[`` is not a command and the ``&&`` would short-circuit it.
+        if not settings.ivr_exit_digit or last_digit != settings.ivr_exit_digit:
+            return
+        runner.run(settings.on_hook_cmd, {"call_id": call_id, "last_digit": last_digit})
 
     def _on_digit(call_id: str, digit: str) -> None:
         # Per-digit IVR command; empty => no command configured for this key, so

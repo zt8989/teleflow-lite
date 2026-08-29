@@ -1,10 +1,18 @@
-"""Local HTTP RPC control channel for phone reports (ticket 05).
+"""Local HTTP RPC control channel for phone reports (ticket 05) and inbound
+IVR hooks (tickets 07/08).
 
-TeleFlow listens on ``127.0.0.1`` only and serves two endpoints:
+TeleFlow listens on ``127.0.0.1`` only and serves these endpoints:
 
 * ``POST /v1/report`` — body ``{"text": ..., "audio_path"?: ..., "voice"?: ...,
   "target"?: ..., "caller_id"?: ...}`` with ``Authorization: Bearer <token>``.
   Triggers ``SipCoreService.start_report`` and returns ``202 {"report_id"}``.
+* ``POST /v1/play`` — body ``{"call_id": ..., "text"?: ..., "audio_path"?: ...,
+  "voice"?: ..., "hangup_on_eof"?: ...}``. Plays a prompt into the live inbound
+  call identified by ``call_id`` (``SipCoreService.play_to_call``); returns
+  ``202 {"call_id"}`` or ``404`` when there is no active call.
+* ``POST /v1/ivr/replay`` — body ``{"call_id": ...}``. Re-announces the IVR
+  digit menu and resumes listening (``SipCoreService.replay_ivr_menu``); returns
+  ``202 {"call_id"}`` or ``404`` when the call is not an active IVR call.
 * ``GET /v1/status`` — returns a JSON snapshot of RPC/SIP/report state.
 
 The server runs in a background thread. ``report`` work is handed to an
@@ -25,7 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 
 from teleflow.config import ConfigStore
-from teleflow.sip import ReportBusyError, SipCoreService
+from teleflow.sip import NoActiveCallError, ReportBusyError, SipCoreService
 from teleflow.tts import TtsError
 
 DEFAULT_RPC_PORT = 8731
@@ -71,6 +79,7 @@ def _make_handler(service: SipCoreService, store: ConfigStore, scheduler: Callab
                     "sip_running": service.running,
                     "gateway_registered": service.registered_contact is not None,
                     "call_state": service.call_state.value,
+                    "active_call_id": service.active_call_id,
                     "report_in_progress": service.report_in_progress,
                     "tts_voice": settings.tts_voice,
                     "ffmpeg_path": settings.ffmpeg_path,
@@ -78,6 +87,12 @@ def _make_handler(service: SipCoreService, store: ConfigStore, scheduler: Callab
             )
 
         def do_POST(self) -> None:  # noqa: N802 - http.server naming
+            if self.path == "/v1/play":
+                self._do_play()
+                return
+            if self.path == "/v1/ivr/replay":
+                self._do_ivr_replay()
+                return
             if self.path != "/v1/report":
                 self._send_json(404, {"error": "not found"})
                 return
@@ -120,6 +135,89 @@ def _make_handler(service: SipCoreService, store: ConfigStore, scheduler: Callab
                 return
 
             self._send_json(202, {"report_id": report_id})
+
+        def _do_play(self) -> None:
+            """``POST /v1/play`` — play a prompt into a live inbound call.
+
+            Body: ``{"call_id", "text"?, "audio_path"?, "voice"?, "hangup_on_eof"?}``.
+            Maps a missing/inactive call to 404, missing text+audio to 400, and
+            synthesis/file errors to 400; success returns 202 ``{"call_id"}``.
+            """
+            if not self._authorized():
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            raw = self.rfile.read(length) if 0 < length <= _MAX_BODY else b""
+            try:
+                payload = json.loads(raw or b"{}")
+            except json.JSONDecodeError:
+                self._send_json(400, {"error": "invalid json"})
+                return
+            if not isinstance(payload, dict):
+                self._send_json(400, {"error": "invalid json"})
+                return
+            call_id = payload.get("call_id")
+            if not call_id or not str(call_id).strip():
+                self._send_json(400, {"error": "call_id required"})
+                return
+            call_id = str(call_id).strip()
+            text = payload.get("text")
+            audio_path = payload.get("audio_path")
+            text = "" if text is None else str(text)
+            if not text and not audio_path:
+                self._send_json(400, {"error": "text or audio_path required"})
+                return
+            try:
+                scheduler(
+                    lambda: service.play_to_call(
+                        call_id,
+                        text=text or None,
+                        audio_path=audio_path,
+                        voice=payload.get("voice"),
+                        hangup_on_eof=bool(payload.get("hangup_on_eof", False)),
+                    )
+                )
+            except NoActiveCallError:
+                self._send_json(404, {"error": "no active call"})
+                return
+            except (RuntimeError, TtsError, ValueError, FileNotFoundError, KeyError) as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            self._send_json(202, {"call_id": call_id})
+
+        def _do_ivr_replay(self) -> None:
+            """``POST /v1/ivr/replay`` — return an active IVR call to its menu.
+
+            Body: ``{"call_id"}``. Maps a missing/inactive IVR call to 404 and
+            other errors to 400; success returns 202 ``{"call_id"}``.
+            """
+            if not self._authorized():
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            raw = self.rfile.read(length) if 0 < length <= _MAX_BODY else b""
+            try:
+                payload = json.loads(raw or b"{}")
+            except json.JSONDecodeError:
+                self._send_json(400, {"error": "invalid json"})
+                return
+            if not isinstance(payload, dict):
+                self._send_json(400, {"error": "invalid json"})
+                return
+            call_id = payload.get("call_id")
+            if not call_id or not str(call_id).strip():
+                self._send_json(400, {"error": "call_id required"})
+                return
+            call_id = str(call_id).strip()
+            try:
+                scheduler(lambda: service.replay_ivr_menu(call_id))
+            except NoActiveCallError:
+                self._send_json(404, {"error": "no active call"})
+                return
+            except (RuntimeError, ValueError, KeyError) as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            self._send_json(202, {"call_id": call_id})
 
     return _Handler
 

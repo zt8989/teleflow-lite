@@ -38,6 +38,11 @@ EVENT_REPORT_FAILED = "report_failed"
 # Inbound IVR (feature teleflow-call-ivr): emitted when the first DTMF key of an
 # IVR call is pressed (the service then stops listening for further keys).
 EVENT_IVR_DIGIT = "ivr_digit"
+# Fired by the real backend when an inbound call's audio media becomes ACTIVE.
+# IVR playback is attempted at answer time (in _maybe_start_ivr), but on the
+# real pjsua2 backend the media isn't ACTIVE yet then, so play_file_to_call
+# returns False; this event lets the service retry playback once it's ready.
+EVENT_CALL_MEDIA_ACTIVE = "call_media_active"
 
 
 class CallState(str, Enum):
@@ -59,6 +64,11 @@ class ReportBusyError(Exception):
     """Raised when a report is requested while another report is in progress."""
 
 
+class NoActiveCallError(Exception):
+    """Raised when playback/replay is requested for a call that is not a live,
+    currently-connected inbound call (e.g. already hung up or unknown id)."""
+
+
 
 
 @runtime_checkable
@@ -77,17 +87,25 @@ class SipBackend(Protocol):
         to the user's sound devices."""
         ...
 
-    def play_file_to_call(self, call_id: str, wav_path: str, *, hangup_on_eof: bool = False) -> None:
+    def play_file_to_call(self, call_id: str, wav_path: str, *, hangup_on_eof: bool = False) -> bool:
         """Play ``wav_path`` one-way into the given call (file -> call).
 
         ``hangup_on_eof=True`` (report call) makes the backend hang up on EOF;
         ``False`` (IVR menu item) signals ``playback_done`` so the service can
-        play the next item without hanging up.
+        play the next item without hanging up. Returns ``True`` if playback was
+        actually started, ``False`` if the call/media was not in a state where
+        it could be played (so callers can surface that instead of silently
+        doing nothing).
         """
         ...
 
     def mark_ivr(self, call_id: str) -> None:
         """Tag an inbound call as IVR so the backend skips the mic bridge."""
+        ...
+
+    def unmark_ivr(self, call_id: str) -> None:
+        """Leave IVR mode: restore the normal two-way mic bridge (used when a
+        digit key ends the menu and starts a real conversation, e.g. Vibe Coding)."""
         ...
 
     def reroute(self) -> None:
@@ -217,6 +235,7 @@ class FakeSipBackend:
         self.report_calls: list[tuple[str, str]] = []
         self.report_played: list[tuple[str, str]] = []
         self.ivr_marked: list[str] = []
+        self.ivr_unmarked: list[str] = []
         self.device_change_callbacks: list[Callable[[], None]] = []
 
     def start(self, port: int, handler: Callable[[str, dict], None]) -> None:
@@ -266,12 +285,13 @@ class FakeSipBackend:
     def place_report_call(self, target: str, wav_path: str) -> None:
         self.report_calls.append((target, wav_path))
 
-    def play_file_to_call(self, call_id: str, wav_path: str, *, hangup_on_eof: bool = False) -> None:
+    def play_file_to_call(self, call_id: str, wav_path: str, *, hangup_on_eof: bool = False) -> bool:
         self.report_played.append((call_id, wav_path))
         # Simulate EOF immediately (no real player): report calls keep the
         # explicit receive_report_playback_done hook; IVR chains on playback_done.
         if not hangup_on_eof:
             self._fire("playback_done", call_id=call_id)
+        return True
 
     def receive_report_connected(self, call_id: str) -> None:
         """Simulate the desk phone answering the report call (test hook)."""
@@ -292,6 +312,10 @@ class FakeSipBackend:
     def mark_ivr(self, call_id: str) -> None:
         """Scripted fake has no mic bridge to suppress; recorded for parity."""
         self.ivr_marked.append(call_id)
+
+    def unmark_ivr(self, call_id: str) -> None:
+        """Scripted fake has no mic bridge to restore; recorded for parity."""
+        self.ivr_unmarked.append(call_id)
 
     def set_device_change_callback(self, cb: Callable[[], None]) -> None:
         self.device_change_callbacks.append(cb)
@@ -348,6 +372,12 @@ class SipCoreService:
         self._ivr_listening = False
         self._ivr_digit_fired = False
         self._last_digit = ""
+        # True once the first IVR menu item has actually started playing. Guards
+        # the media-active retry so each item plays exactly once.
+        self._ivr_started = False
+        # Currently-connected inbound call id (set on INVITE, cleared on BYE).
+        # Used to validate that ad-hoc playback/replay targets a live call.
+        self._active_call_id: str | None = None
         # Optional log sink for report sub-steps (wired by the app shell to the
         # dashboard/log view). Kept optional so headless tests stay quiet.
         self._log: Callable[..., None] | None = None
@@ -386,6 +416,11 @@ class SipCoreService:
     @property
     def report_in_progress(self) -> bool:
         return self._report_active
+
+    @property
+    def active_call_id(self) -> str:
+        """The currently-connected inbound call id, or "" when no call is up."""
+        return self._active_call_id or ""
 
     def start(self) -> None:
         settings = self._store.load()
@@ -537,6 +572,21 @@ class SipCoreService:
     # then listen for the first DTMF key to fire EVENT_IVR_DIGIT and stop
     # listening. {last_digit} is surfaced on CALL_ENDED for the on-hook hook.
     # ------------------------------------------------------------------
+    def _build_ivr_digit_queue(self, settings: Settings) -> list[str]:
+        """Synthesize the per-digit menu prompts in 1~9~0 order (empty text
+        skipped). Each item is announced as ``"{text} 请按{digit}"`` so the
+        caller hears the option first and then which key triggers it.
+        """
+        assert self._tts is not None  # callers guard _tts before queueing playback
+        queue: list[str] = []
+        for digit in "1234567890":
+            text = settings.ivr_digit_text.get(digit, "").strip()
+            if not text:
+                continue
+            prompt = f"{text} 请按{digit}"
+            queue.append(str(self._tts.synthesize_to_wav(prompt, settings.tts_voice)))
+        return queue
+
     def _maybe_start_ivr(self, call_id: str) -> None:
         settings = self._store.load()
         if not settings.ivr_enabled or self._tts is None:
@@ -548,10 +598,7 @@ class SipCoreService:
             queue: list[str] = []
             if settings.ivr_welcome.strip():
                 queue.append(str(self._tts.synthesize_to_wav(settings.ivr_welcome, voice)))
-            for digit in "1234567890":
-                text = settings.ivr_digit_text.get(digit, "").strip()
-                if text:
-                    queue.append(str(self._tts.synthesize_to_wav(text, voice)))
+            queue.extend(self._build_ivr_digit_queue(settings))
         except TtsError as exc:
             self._log_line(f"[IVR] TTS 失败, 跳过 IVR: {exc}")
             return
@@ -574,12 +621,93 @@ class SipCoreService:
             self._ivr_listening = True
             self._log_line(f"[IVR] 菜单播报完成, 开始监听按键 (call {self._ivr_call_id})")
             return
+        # Pop the front item. The fake backend starts playback and fires
+        # playback_done synchronously, so on success the chain advances to the
+        # next item. On the real pjsua2 backend the audio media is usually not
+        # ACTIVE yet at answer time, so play_file_to_call returns False: re-queue
+        # the item at the front so the media-active retry can replay it (instead
+        # of silently dropping it as a naive pop-then-play would).
         wav = self._ivr_queue.pop(0)
-        self._backend.play_file_to_call(self._ivr_call_id, wav, hangup_on_eof=False)
+        started = self._backend.play_file_to_call(self._ivr_call_id, wav, hangup_on_eof=False)
+        if not started:
+            self._ivr_queue.insert(0, wav)
+            return
+        self._ivr_started = True
 
     def _on_ivr_playback_done(self, call_id: str) -> None:
         if not self._ivr_active or call_id != self._ivr_call_id:
             return
+        self._ivr_play_next()
+
+    def _on_call_media_active(self, call_id: str) -> None:
+        # The real backend signals this once an inbound call's audio media is up.
+        # IVR playback may have been attempted (and failed) at answer time; retry
+        # the front of the queue now. Only triggers once — once anything has
+        # started playing, the playback_done chain owns the rest.
+        if not self._ivr_active or call_id != self._ivr_call_id:
+            return
+        if self._ivr_started:
+            return
+        self._ivr_play_next()
+
+    # ------------------------------------------------------------------
+    # Ad-hoc playback / menu replay (RPC-driven, used by per-digit IVR hooks).
+    # ------------------------------------------------------------------
+    def _is_active_call(self, call_id: str) -> bool:
+        return self._state is CallState.CONNECTED and call_id == self._active_call_id
+
+    def play_to_call(
+        self,
+        call_id: str,
+        *,
+        text: str | None = None,
+        audio_path: str | None = None,
+        voice: str | None = None,
+        hangup_on_eof: bool = False,
+    ) -> None:
+        """Play a prompt (TTS-synthesized or a provided WAV) one-way into a live
+        inbound call.
+
+        Driven by the per-digit IVR hook via ``POST /v1/play`` so a digit key's
+        command can speak back into the call that is currently connected. There
+        must be a currently-connected inbound call for ``call_id`` — otherwise
+        ``NoActiveCallError`` is raised so the RPC layer can return 404 rather
+        than silently playing into a dead/unknown call.
+        """
+        if not self._is_active_call(call_id):
+            raise NoActiveCallError(f"no active call for call_id={call_id!r}")
+        settings = self._store.load()
+        text = "" if text is None else str(text)
+        if not text and not audio_path:
+            raise ValueError("text or audio_path required")
+        if audio_path and not Path(audio_path).exists():
+            raise FileNotFoundError(f"audio file not found: {audio_path}")
+        wav_path = self._resolve_wav(text, audio_path, voice, settings)
+        started = self._backend.play_file_to_call(call_id, str(wav_path), hangup_on_eof=hangup_on_eof)
+        if not started:
+            # Call exists but its media isn't in a playable state (should not
+            # happen for the always-connected use case); surface it rather than
+            # pretend the playback succeeded.
+            raise RuntimeError(f"playback could not start for call_id={call_id!r}")
+
+    def replay_ivr_menu(self, call_id: str) -> None:
+        """Return an active IVR call to its digit menu: re-announce the 1~9~0
+        prompts and resume listening, so the caller can press another key.
+
+        Only valid while an IVR call is active for ``call_id``; otherwise raises
+        ``NoActiveCallError`` (mapped to HTTP 404 by the RPC layer).
+        """
+        if not (self._ivr_active and call_id == self._ivr_call_id):
+            raise NoActiveCallError(f"no active IVR call for call_id={call_id!r}")
+        if self._tts is None:
+            raise NoActiveCallError("ivr tts not initialized")
+        settings = self._store.load()
+        queue = self._build_ivr_digit_queue(settings)
+        self._ivr_digit_fired = False
+        self._ivr_listening = False
+        self._ivr_started = False
+        self._ivr_queue = queue
+        self._log_line(f"[IVR] 重播菜单: call={call_id} 条目数={len(queue)}")
         self._ivr_play_next()
 
     def _on_dtmf(self, call_id: str, digit: str) -> None:
@@ -591,7 +719,29 @@ class SipCoreService:
         self._ivr_listening = False
         self._last_digit = digit
         self._log_line(f"[IVR] 收到按键 {digit} (call {call_id})")
+        # Pressing the configured "exit IVR" key (ivr_exit_digit, default "0")
+        # ends the menu and turns the call into a normal two-way call so the
+        # caller's voice is bridged upstream (e.g. WorkBuddy can hear it). Other
+        # keys replay the menu via their hook, so IVR mode is kept.
+        settings = self._store.load()
+        if digit and digit == settings.ivr_exit_digit:
+            self._exit_ivr_to_call(call_id)
         self._emit(EVENT_IVR_DIGIT, call_id=call_id, digit=digit)
+
+    def _exit_ivr_to_call(self, call_id: str) -> None:
+        """Leave IVR menu mode and restore a normal two-way call.
+
+        The call stays CONNECTED (it ends normally on BYE); we just stop
+        suppressing the mic so the caller's voice flows both ways. CALL_ENDED
+        still fires on hang-up, so the on-hook hook (Ctrl+D+Enter for key 0)
+        keeps working.
+        """
+        self._ivr_active = False
+        self._ivr_call_id = None
+        self._ivr_queue = []
+        self._ivr_listening = False
+        self._ivr_digit_fired = False
+        self._backend.unmark_ivr(call_id)
 
     def _reset_ivr(self) -> None:
         self._ivr_active = False
@@ -600,6 +750,7 @@ class SipCoreService:
         self._ivr_listening = False
         self._ivr_digit_fired = False
         self._last_digit = ""
+        self._ivr_started = False
 
     def reroute(self) -> None:
         """Re-apply the current device selection to a live call (mid-call switch).
@@ -656,6 +807,7 @@ class SipCoreService:
             self._emit(EVENT_CALL_INCOMING, call_id=call_id)
             self._backend.answer(call_id)
             self._state = CallState.CONNECTED
+            self._active_call_id = call_id
             self._emit(EVENT_CALL_CONNECTED, call_id=call_id)
             self._maybe_start_ivr(call_id)
         elif name in ("bye", "cancel"):
@@ -664,6 +816,7 @@ class SipCoreService:
                 EVENT_CALL_ENDED, call_id=str(data.get("call_id", "")), last_digit=self._last_digit
             )
             self._state = CallState.IDLE
+            self._active_call_id = None
             self._reset_ivr()
         elif name == "dtmf":
             self._on_dtmf(str(data["call_id"]), str(data["digit"]))
@@ -675,5 +828,7 @@ class SipCoreService:
             self._on_report_connected(str(data["call_id"]))
         elif name == "report_eof":
             self._on_report_eof(str(data["call_id"]))
+        elif name == "call_media_active":
+            self._on_call_media_active(str(data["call_id"]))
         elif name == "media_error":
             self._emit(EVENT_MEDIA_ERROR, message=str(data.get("message", "")))

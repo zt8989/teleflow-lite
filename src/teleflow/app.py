@@ -483,15 +483,18 @@ class SettingsDialog(QDialog):
         ivl.addWidget(self.ivr_welcome)
         ivl.addWidget(
             QLabel("每个数字键（1-9-0）的播报词与命令：播报词留空则该键不播报，"
-                   "命令留空则该键被按下时不执行。")
+                   "命令留空则该键被按下时不执行。最右「退出↔双向桥接」勾选框表示："
+                   "按此键后退出菜单、通话切回双向（用于开始 Vibe Coding），同一时刻只能勾一个。")
         )
         digit_grid = QGridLayout()
         digit_grid.setSpacing(4)
         digit_grid.addWidget(QLabel("键"), 0, 0)
         digit_grid.addWidget(QLabel("播报词"), 0, 1)
         digit_grid.addWidget(QLabel("命令"), 0, 2)
+        digit_grid.addWidget(QLabel("退出↔双向桥接"), 0, 3)
         self.ivr_digit_text_edits: dict[str, QLineEdit] = {}
         self.ivr_digit_hook_edits: dict[str, QLineEdit] = {}
+        self.ivr_exit_checkboxes: dict[str, QCheckBox] = {}
         for row, digit in enumerate("1234567890", start=1):
             digit_grid.addWidget(QLabel(digit), row, 0)
             text_edit = QLineEdit()
@@ -500,8 +503,14 @@ class SettingsDialog(QDialog):
             hook_edit.setPlaceholderText("命令（留空不执行）")
             digit_grid.addWidget(text_edit, row, 1)
             digit_grid.addWidget(hook_edit, row, 2)
+            exit_cb = QCheckBox("退出")
+            exit_cb.toggled.connect(
+                lambda _checked, d=digit: self._on_ivr_exit_toggled(d)
+            )
+            digit_grid.addWidget(exit_cb, row, 3)
             self.ivr_digit_text_edits[digit] = text_edit
             self.ivr_digit_hook_edits[digit] = hook_edit
+            self.ivr_exit_checkboxes[digit] = exit_cb
         ivl.addLayout(digit_grid)
         ivl.addStretch()
 
@@ -635,6 +644,19 @@ class SettingsDialog(QDialog):
         self.log_level.setCurrentText(settings.log_level)
         self.autostart.setChecked(settings.autostart)
         self.start_minimized.setChecked(settings.start_minimized)
+        # Reflect the configured "exit IVR -> two-way bridge" key as a checked
+        # row (ivr_exit_digit is a single value, so at most one row is checked).
+        for digit, cb in self.ivr_exit_checkboxes.items():
+            cb.setChecked(digit == settings.ivr_exit_digit)
+
+    def _on_ivr_exit_toggled(self, digit: str) -> None:
+        # ivr_exit_digit is a single key: checking one row clears the others so
+        # only one digit can be the bridge/exit key at a time.
+        if not self.ivr_exit_checkboxes[digit].isChecked():
+            return
+        for other, cb in self.ivr_exit_checkboxes.items():
+            if other != digit:
+                cb.setChecked(False)
 
     def _save_and_close(self) -> None:
         settings = self._store.load()
@@ -652,6 +674,10 @@ class SettingsDialog(QDialog):
         settings.ivr_digit_hook = {
             d: v for d, e in self.ivr_digit_hook_edits.items() if (v := e.text().strip())
         }
+        # The single checked "exit/bridge" row is ivr_exit_digit; none checked => "".
+        settings.ivr_exit_digit = next(
+            (d for d, cb in self.ivr_exit_checkboxes.items() if cb.isChecked()), ""
+        )
         settings.rpc_enabled = self.rpc_enabled.isChecked()
         settings.rpc_port = self.rpc_port.value()
         settings.rpc_token = self.rpc_token.text().strip()
