@@ -34,6 +34,117 @@ python -m teleflow.app     # 启动 GUI
 
 ---
 
+## 音频路由：双向调试 vs 单向中继（生产模式）
+
+TeleFlow 只做**纯音频路由器**：把已建立的 RTP 会话桥到所选设备——下行（电话 → 播放设备）、上行（采集设备 → 电话）。播放与采集设备**可独立选择**，派生出两种典型用法：
+
+| 模式 | 播放设备 | 采集设备 | 行为 | 系统麦克风提示 |
+|------|----------|----------|------|----------------|
+| 调试模式（耳机） | 物理耳机 | 物理麦克风 | 双向：用座机正常通话 | 会（用了真麦克风） |
+| 生产模式（虚拟声卡） | VB-Cable / BlackHole | **不采集（空）** | **单向**：仅把座机语音写出到虚拟声卡 | **不会**（没开任何采集端点） |
+
+**生产模式 = MicroSIP 风格**：是否打开麦克风完全由"是否选了输入设备"决定。采集设备留空即单向，TeleFlow 不打开任何音频输入端点（内部置 `PJSUA_SND_NULL_DEV`），系统不弹麦克风隐私提示。
+
+### 典型部署：座机语音经 VB-Cable 喂给三方 APP
+
+把座机通话语音实时送到另一个程序（语音助手 / 转写 / 录音）当麦克风输入：
+
+```
+固定座机
+   │ 模拟电话线
+   ▼
+ATA（模拟电话适配器，转 SIP）
+   │ SIP
+   ▼
+FreeSWITCH（IP-PBX，路由 / 注册）
+   │ SIP INVITE
+   ▼
+TeleFlow（本程序，自动应答）
+   │ 下行音频（仅播放，不采集）
+   ▼
+VB-Cable（虚拟声卡 · 播放端）
+   │ 系统把其"录音端"呈现为麦克风
+   ▼
+三方 APP（把 VB-Cable 录音端选作"麦克风"输入）
+```
+
+- TeleFlow 在此链路里只是 VB-Cable 的**写入方**：选「生产模式（虚拟声卡）」后，播放 = VB-Cable、采集 = 空。
+- VB-Cable **播放端**被 TeleFlow 写入（输出，不触发麦克风提示）；其**录音端**由三方 APP 打开当麦克风——那一侧的提示属于三方 APP，理应保留。
+- 红线不变：TeleFlow 仍不录音、不做 DSP，仅透传座机语音到虚拟声卡。
+
+---
+
+## 呼入 IVR：欢迎语 + 每数字键播报 / Hook
+
+呼入自动应答后，TeleFlow 可进入一段简单 IVR：先单向播放**欢迎语**，再按 `1-9-0` 顺序逐项播放每个数字键**各自**的配置文字（菜单），然后监听来电者的首个 DTMF 按键，触发**该键**对应的 hook 命令。每个键独立配置 `text`（播报词）与 `hook`（命令），文字为空的键跳过不播、无 hook 的键按下时不执行命令。`ivr_enabled` 为总开关（默认开），关闭即回到纯音频路由器。
+
+```
+座机来电（INVITE）
+   │
+   ▼
+TeleFlow 自动应答（CALL_CONNECTED）
+   │  ivr_enabled = True
+   ▼
+单向播放 欢迎语（TTS → 8k mono wav，可缓存）
+   │
+   ▼
+按 1-9-0 顺序播放各键 text（空文字键跳过不播）
+   │
+   ▼
+开启 DTMF 监听，等待首个按键
+   │
+   ▼
+来电者按 <键>
+   ├── 该键 text 非空 → 菜单里已播过（无需重播）
+   ├── 该键 hook 非空 → 执行该键命令（{call_id} / {digit}）   ← 每键独立
+   └── 停止监听后续按键；last_digit = 该键
+   │
+   ▼
+挂机（CALL_ENDED）
+   │
+   ▼
+执行 on_hook_cmd（{last_digit} 被替换，未按键则为空串）
+```
+
+- **每键独立**：`ivr_digit_text` / `ivr_digit_hook` 均以 `"1".."9"`、`"0"` 为键；某键无文字则菜单中不播，某键无 hook 则按下时不执行命令。
+- **语音缓存**：欢迎语与各键 `text` 首次 TTS 后按 `hash(clean_markdown(text)+voice)` 缓存 wav，同文本再次呼入直接复用。
+- **退出 IVR 进入双向通话**：`ivr_exit_digit`（默认 `0`）被按下时，结束 IVR 并把通话桥接为双向（接回麦克风/声卡），用于转人工或真人对话。
+- 红线不变：IVR 播报期间不桥接麦克风；DTMF 仅读取按键信令，不录音、不做 DSP。
+
+---
+
+## 电话汇报（外呼 + 单向播放）：本地 RPC 控制通道
+
+TeleFlow 不仅能接呼入，还能**主动外呼**物理座机并播放一段汇报。外部脚本（如 AI 助手的 Stop hook）用一条带 token 的本地 HTTP 请求（`POST /v1/report`）把**文本**交给 TeleFlow，由它内部完成 TTS 合成、转码、外呼、播放、播完挂断——外部脚本无需自己实现 TTS 或 SIP。这就是「通过 hook 反向给对应号码打电话」。
+
+```
+外部脚本 / hook（AI 助手任务完成）
+   │ POST /v1/report  { "text": "…", "voice"?: "…" }
+   │ Authorization: Bearer <rpc_token>
+   ▼
+TeleFlow 本地 RPC 服务（127.0.0.1:<rpc_port>，默认 8731）
+   │ 校验 token / SIP 状态 / 座机目标 report_target
+   ▼
+TTS 合成（edge-tts）→ ffmpeg 转 8kHz 单声道 wav（可缓存）
+   │
+   ▼
+TeleFlow makeCall → 座机（report_target，如 sip:8000@192.168.1.116）
+   │ 座机摘机（EVENT_CALL_CONNECTED）
+   ▼
+单向播放 wav 进通话（不桥接麦克风）
+   │ 播放结束 EOF
+   ▼
+自动挂断（EVENT_REPORT_COMPLETED）
+```
+
+- **本地、受控**：RPC 仅绑 `127.0.0.1`，需 `Authorization: Bearer <rpc_token>`；token 首次启动随机生成并持久化，可在设置查看/重置。并发汇报返回 `409`（单汇报槽）。
+- **文本即一切**：RPC 只发文本（+ 可选 `voice` 覆盖），合成/转码/拨号全在 TeleFlow 内；也支持 `audio_path` 覆盖跳过 TTS 直接播放。
+- **配置**：`report_target`（座机目标 SIP URI）、`report_caller_id`、`tts_voice`、`ffmpeg_path`（空 = `PATH` 自动查找）、`rpc_enabled` / `rpc_port` / `rpc_token`，以及面板上的「测试汇报」按钮。
+- 红线不变：汇报是**单向播放合成文件**，不录音通话、不写通话 WAV、不做 DSP。
+- 另有 `POST /v1/play`（向活动呼入播放提示）与 `POST /v1/ivr/replay`（重播 IVR 菜单），以及 `GET /v1/status` 探测就绪状态。
+
+---
+
 ## Hook 命令（摘机 / 挂机）
 
 TeleFlow 可以在通话生命周期的关键时刻执行 **你配置的本地命令/脚本**。这是把来电事件接入外部自动化（弹窗通知、开门、写数据库、触发录音等）的最简单方式。
