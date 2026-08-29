@@ -410,7 +410,16 @@ class SipCoreService:
         resolved_target = target or default_target
         if not resolved_target:
             self._fail_report("no_target")
-            raise RuntimeError("no report target configured")
+            if not settings.report_extension.strip():
+                detail = "未填写分机号（report_extension），无法拨打"
+            elif target:
+                detail = "指定的 target 为空"
+            else:
+                detail = (
+                    "未配置座机地址（report_host）且未配置网关（sip_host），"
+                    "无法确定拨打目标"
+                )
+            raise RuntimeError(f"no report target configured: {detail}")
         if audio_path and not Path(audio_path).exists():
             self._fail_report("file_missing")
             raise RuntimeError("audio file not found")
