@@ -109,6 +109,10 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
             if info.state == pj.PJSIP_INV_STATE_DISCONNECTED:
                 call_id = str(info.id)
                 backend._calls.pop(call_id, None)
+                # A report/IVR call's player is no longer needed once the call is
+                # torn down; release it so the underlying C++ object is freed.
+                if getattr(self, "_is_report", False) or getattr(self, "_is_ivr", False):
+                    _release_report_player(backend, call_id)
                 # Tell the service the call ended so it can reset its call state;
                 # otherwise the UI stays stuck on "通话中" after a hang-up. pjsua2
                 # dispatches this callback to the attached Call object once the
@@ -136,6 +140,10 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
                                 "report_connected", {"call_id": str(info.id)}
                             )
                     return
+                # IVR call: one-way welcome/menu playback only, no mic/speaker
+                # bridge; the service drives playback and listens for DTMF.
+                if getattr(self, "_is_ivr", False):
+                    return
                 # Normal call: bridge the call's audio to the selected devices
                 # through the conference bridge: downstream call -> playback
                 # device, upstream capture device -> call. No recorder / transform.
@@ -145,6 +153,19 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
                 call_audio.startTransmit(dev_mgr.getPlaybackDevMedia())
                 # Upstream: selected capture device -> call audio (to telephone).
                 dev_mgr.getCaptureDevMedia().startTransmit(call_audio)
+
+        def onDtmfDigit(self, prm: Any) -> None:  # noqa: ARG002 - pjsua2 callback signature
+            # Forward an inbound DTMF keypress to the service so the IVR can act
+            # on it. pjsua2 passes the digit via ``OnDtmfDigitParam.digit`` (an
+            # int ASCII code); defensively convert to a single-character string.
+            digit = getattr(prm, "digit", None)
+            if digit is None:
+                return
+            if isinstance(digit, int):
+                digit = chr(digit)
+            digit = str(digit)
+            if backend._handler is not None:
+                backend._handler("dtmf", {"call_id": str(self.getId()), "digit": digit})
 
     class Account(pj.Account):  # type: ignore[misc, valid-type]
         def __init__(self) -> None:
@@ -189,16 +210,52 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
     return Call, Account
 
 
-def _make_report_eof_callback(pj: Any, backend: "Pjsua2Backend", call_id: str) -> Any:  # pragma: no cover
-    """Build a pjsua2 ``AudioMediaPlayer`` EOF callback that tells the backend
-    the report playback finished (so the service can hang up). Native-only."""
+def _make_report_player(pj: Any, backend: "Pjsua2Backend", call_id: str, *, hangup_on_eof: bool = False) -> Any:  # pragma: no cover
+    """Build a pjsua2 ``AudioMediaPlayer`` subclass whose virtual ``onEof2``
+    tells the backend playback finished.
 
-    class _ReportEofCallback(pj.AudioMediaPlayerEOFCallback):  # type: ignore[misc, valid-type]
-        def onEOF(self) -> None:  # noqa: ARG002 - pjsua2 callback signature
-            if backend._handler is not None:
-                backend._handler("report_eof", {"call_id": call_id})
+    ``hangup_on_eof=True`` (report call): emit ``report_eof`` so the service
+    hangs up. ``hangup_on_eof=False`` (IVR menu item): emit ``playback_done``
+    so the service plays the next menu item — no hang-up.
 
-    return _ReportEofCallback()
+    This binding predates ``AudioMediaPlayer.setEOFCallback``; the supported
+    mechanism is to subclass the player and override the ``onEof2`` director
+    method. Native-only.
+    """
+
+    class ReportPlayer(pj.AudioMediaPlayer):  # type: ignore[misc, valid-type]
+        def __init__(self) -> None:
+            pj.AudioMediaPlayer.__init__(self)
+            self._backend = backend
+            self._call_id = call_id
+            self._sink: Any = None
+            self._eof_fired = False
+            self._hangup_on_eof = hangup_on_eof
+
+        def onEof2(self) -> None:  # noqa: ARG002 - pjsua2 callback signature
+            if self._eof_fired:
+                return
+            self._eof_fired = True
+            # Release the conference slot before reporting EOF; destroying the
+            # player while a transmission is still live can crash pjsua2.
+            if self._sink is not None:
+                try:
+                    self.stopTransmit(self._sink)
+                except Exception:  # noqa: BLE001 - best-effort
+                    pass
+            if self._backend._handler is None:
+                return
+            if self._hangup_on_eof:
+                self._backend._handler("report_eof", {"call_id": self._call_id})
+            else:
+                self._backend._handler("playback_done", {"call_id": self._call_id})
+
+    return ReportPlayer()
+
+
+def _release_report_player(backend: "Pjsua2Backend", call_id: str) -> None:  # pragma: no cover
+    """Drop our reference to a report player once its call is gone."""
+    backend._report_players.pop(call_id, None)
 
 
 def _new_call_op(pj: Any) -> Any:
@@ -237,6 +294,10 @@ class Pjsua2Backend:
         self._account: Any = None
         self._bridge: MediaBridge | None = None
         self._calls: dict[str, Any] = {}
+        # Report players must outlive playback; pjsua2's conference bridge only
+        # holds a port reference, not the Python director object, so we keep the
+        # player alive here until its EOF fires and the call is torn down.
+        self._report_players: dict[str, Any] = {}
         self._lib_created = False
         self._call_cls: type | None = None
         self._account_cls: type | None = None
@@ -374,9 +435,11 @@ class Pjsua2Backend:
         except Exception:  # noqa: BLE001 - best-effort; the call still works
             pass
 
-    def play_file_to_call(self, call_id: str, wav_path: str) -> None:  # pragma: no cover
+    def play_file_to_call(self, call_id: str, wav_path: str, *, hangup_on_eof: bool = False) -> None:  # pragma: no cover
         # One-way playback: file -> call audio only. No capture device, no
-        # recorder. Registers an EOF callback that tells the service to hang up.
+        # recorder. The player subclassed below fires ``onEof2`` when the file
+        # ends: for a report call that signals EOF (service hangs up); for an
+        # IVR menu item it signals ``playback_done`` (service plays the next).
         call = self._calls.get(call_id)
         if call is None:
             return
@@ -392,10 +455,23 @@ class Pjsua2Backend:
         if media_index is None:
             return
         call_audio = call.getAudioMedia(media_index)
-        player = self._pj.AudioMediaPlayer()
+        # Drop any previous player for this call (a finished IVR menu item); the
+        # previous one already fired EOF and released its sink, so losing the
+        # reference is safe.
+        self._report_players.pop(call_id, None)
+        player = _make_report_player(self._pj, self, call_id, hangup_on_eof=hangup_on_eof)
         player.createPlayer(wav_path)
+        player._sink = call_audio
         player.startTransmit(call_audio)
-        player.setEOFCallback(_make_report_eof_callback(self._pj, self, call_id))
+        # Keep the player alive for the whole playback (see _report_players).
+        self._report_players[call_id] = player
+
+    def mark_ivr(self, call_id: str) -> None:  # pragma: no cover
+        """Tag an inbound call as IVR so ``onCallMediaState`` skips the mic
+        bridge (one-way welcome/menu playback instead of a two-way bridge)."""
+        call = self._calls.get(call_id)
+        if call is not None:
+            call._is_ivr = True
 
     def reroute(self) -> None:  # pragma: no cover
         """Re-apply the current device selection to a live call (mid-call switch)."""

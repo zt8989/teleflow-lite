@@ -82,8 +82,20 @@ class Settings:
     # moments, with {call_id} substituted. Empty means no hook.
     #   off_hook_cmd — when the current SIP auto-answers an incoming call (摘机).
     #   on_hook_cmd  — when the call ends, e.g. the landline hangs up (挂机).
+    #                 Also receives {last_digit} (the first DTMF key pressed
+    #                 during an IVR call, empty string if none).
     off_hook_cmd: str = ""
     on_hook_cmd: str = ""
+    # Inbound IVR (feature teleflow-call-ivr): after auto-answer, play a welcome
+    # message then a per-digit-key menu, listen for the first DTMF key to fire
+    # that key's command, and pass the last key to the on-hook command. Keys are
+    # the digit chars "1".."9","0" (1234567890 = all number keys, not an
+    # extension). _text maps a digit to its announcement; _hook maps a digit to
+    # the command run when that digit is pressed (empty => skip).
+    ivr_enabled: bool = True
+    ivr_welcome: str = ""
+    ivr_digit_text: dict[str, str] = field(default_factory=dict)
+    ivr_digit_hook: dict[str, str] = field(default_factory=dict)
     # Phone-report RPC (feature teleflow-phone-report). TeleFlow can be told by an
     # external hook to dial the desk phone and play a report; these persist that
     # control channel + synthesis settings.

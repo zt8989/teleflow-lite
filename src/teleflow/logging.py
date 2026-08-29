@@ -154,7 +154,7 @@ def attach(logger: EventLogger, service: SipCoreService, manager: AudioDeviceMan
     )
     service.on(EVENT_CALL_INCOMING, lambda call_id: logger.info("CALL", f"incoming call: {call_id}"))
     service.on(EVENT_CALL_CONNECTED, lambda call_id: logger.info("CALL", f"call connected: {call_id}"))
-    service.on(EVENT_CALL_ENDED, lambda call_id: logger.info("CALL", f"call ended: {call_id}"))
+    service.on(EVENT_CALL_ENDED, lambda call_id, last_digit="": logger.info("CALL", f"call ended: {call_id}"))
     service.on(EVENT_MEDIA_ERROR, lambda message: logger.error("MEDIA", message))
 
     manager.on(EVENT_DEVICES_ENUMERATED, lambda count: logger.info("AUDIO", f"enumerated {count} audio devices"))

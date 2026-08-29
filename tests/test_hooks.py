@@ -136,7 +136,7 @@ def test_on_hook_fires_on_call_ended(tmp_path: Path) -> None:
     backend.receive_invite("C1")
     backend.receive_bye("C1")  # landline hangs up
 
-    assert ("on-hangup.sh {call_id}", {"call_id": "C1"}) in recorder.calls
+    assert ("on-hangup.sh {call_id}", {"call_id": "C1", "last_digit": ""}) in recorder.calls
 
 
 def test_on_hook_fires_only_after_call_ends(tmp_path: Path) -> None:
@@ -157,4 +157,4 @@ def test_on_hook_fires_only_after_call_ends(tmp_path: Path) -> None:
     assert all(c[0] != "on-hangup.sh {call_id}" for c in recorder.calls)
 
     backend.receive_bye("C1")
-    assert ("on-hangup.sh {call_id}", {"call_id": "C1"}) in recorder.calls
+    assert ("on-hangup.sh {call_id}", {"call_id": "C1", "last_digit": ""}) in recorder.calls

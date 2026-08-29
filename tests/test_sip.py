@@ -73,7 +73,7 @@ def test_bye_resets_state_to_idle(tmp_path) -> None:
     backend.receive_register("sip:ata@192.168.1.50:5060")
     backend.receive_invite("call-1")
     ended = []
-    svc.on(EVENT_CALL_ENDED, lambda call_id: ended.append(call_id))
+    svc.on(EVENT_CALL_ENDED, lambda call_id, last_digit="": ended.append(call_id))
 
     backend.receive_bye("call-1")
 

@@ -14,6 +14,7 @@ import pytest
 from teleflow.tts import (
     FfmpegError,
     FfmpegNotFound,
+    CachingTtsBackend,
     EdgeTtsBackend,
     FakeTtsBackend,
     clean_markdown,
@@ -95,3 +96,42 @@ def test_fake_tts_backend_records_calls(tmp_path: Path) -> None:
     assert backend.synthesized == [("hello", "zh-CN-XiaoxiaoNeural")]
     assert backend.transcoded == [(mp3, tmp_path / "out.wav")]
     assert wav == tmp_path / "out.wav"
+
+
+class _FileFakeTts(FakeTtsBackend):
+    """Fake TTS whose transcode materializes the wav file (like ffmpeg), so the
+    cache layer's file-existence check behaves as it will in production."""
+
+    def transcode(self, mp3_path: Path, wav_path: Path) -> Path:
+        Path(wav_path).write_bytes(b"x")
+        return wav_path
+
+
+def test_caching_backend_reuses_wav_on_identical_text(tmp_path: Path) -> None:
+    inner = _FileFakeTts(fake_wav=tmp_path / "inner.wav")
+    cache = CachingTtsBackend(inner, cache_dir=tmp_path / "cache")
+    first = cache.synthesize_to_wav("你好", "zh-CN-XiaoxiaoNeural")
+    rendered = len(inner.synthesized)
+    second = cache.synthesize_to_wav("你好", "zh-CN-XiaoxiaoNeural")
+    # Cache hit: inner backend not re-rendered, same wav returned.
+    assert len(inner.synthesized) == rendered
+    assert first == second
+    assert first.name.startswith("ivr_")
+
+
+def test_caching_backend_rerenders_on_text_change(tmp_path: Path) -> None:
+    inner = _FileFakeTts(fake_wav=tmp_path / "inner.wav")
+    cache = CachingTtsBackend(inner, cache_dir=tmp_path / "cache")
+    cache.synthesize_to_wav("你好", "v")
+    rendered = len(inner.synthesized)
+    cache.synthesize_to_wav("再见", "v")
+    assert len(inner.synthesized) == rendered + 1
+
+
+def test_caching_backend_renders_per_voice(tmp_path: Path) -> None:
+    inner = _FileFakeTts(fake_wav=tmp_path / "inner.wav")
+    cache = CachingTtsBackend(inner, cache_dir=tmp_path / "cache")
+    cache.synthesize_to_wav("你好", "voiceA")
+    rendered = len(inner.synthesized)
+    cache.synthesize_to_wav("你好", "voiceB")
+    assert len(inner.synthesized) == rendered + 1

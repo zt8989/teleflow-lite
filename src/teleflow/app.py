@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QFormLayout,
+    QGridLayout,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -80,7 +81,7 @@ from teleflow.sip import (
     SipCoreService,
 )
 from teleflow.rpc import RpcServer
-from teleflow.tts import EdgeTtsBackend
+from teleflow.tts import CachingTtsBackend, EdgeTtsBackend
 
 
 # ---------------------------------------------------------------------------
@@ -463,11 +464,46 @@ class SettingsDialog(QDialog):
         self.off_hook_cmd = QLineEdit()
         self.off_hook_cmd.setPlaceholderText("例如 /usr/local/bin/on-answer.sh {call_id}")
         hl.addWidget(self.off_hook_cmd)
-        hl.addWidget(QLabel("挂机命令（通话结束时执行，可用 {call_id} 表示来电 ID）:"))
+        hl.addWidget(QLabel("挂机命令（通话结束时执行，可用 {call_id} 表示来电 ID；IVR 下额外可用 {last_digit} 表示首个按键）:"))
         self.on_hook_cmd = QLineEdit()
-        self.on_hook_cmd.setPlaceholderText("例如 /usr/local/bin/on-hangup.sh {call_id}")
+        self.on_hook_cmd.setPlaceholderText("例如 /usr/local/bin/on-hangup.sh {call_id} {last_digit}")
         hl.addWidget(self.on_hook_cmd)
         hl.addStretch()
+
+        # --- Page: 呼入 IVR ---
+        ivr_page = QWidget()
+        ivl = QVBoxLayout(ivr_page)
+        ivl.setContentsMargins(12, 12, 12, 12)
+        ivl.setSpacing(6)
+        self.ivr_enabled = QCheckBox("启用呼入 IVR（接通后播报菜单并监听按键）")
+        ivl.addWidget(self.ivr_enabled)
+        ivl.addWidget(QLabel("欢迎语（接通后先播，留空则不播）:"))
+        self.ivr_welcome = QLineEdit()
+        self.ivr_welcome.setPlaceholderText("例如 您好，请按数字键选择")
+        ivl.addWidget(self.ivr_welcome)
+        ivl.addWidget(
+            QLabel("每个数字键（1-9-0）的播报词与命令：播报词留空则该键不播报，"
+                   "命令留空则该键被按下时不执行。")
+        )
+        digit_grid = QGridLayout()
+        digit_grid.setSpacing(4)
+        digit_grid.addWidget(QLabel("键"), 0, 0)
+        digit_grid.addWidget(QLabel("播报词"), 0, 1)
+        digit_grid.addWidget(QLabel("命令"), 0, 2)
+        self.ivr_digit_text_edits: dict[str, QLineEdit] = {}
+        self.ivr_digit_hook_edits: dict[str, QLineEdit] = {}
+        for row, digit in enumerate("1234567890", start=1):
+            digit_grid.addWidget(QLabel(digit), row, 0)
+            text_edit = QLineEdit()
+            text_edit.setPlaceholderText("播报词（留空跳过）")
+            hook_edit = QLineEdit()
+            hook_edit.setPlaceholderText("命令（留空不执行）")
+            digit_grid.addWidget(text_edit, row, 1)
+            digit_grid.addWidget(hook_edit, row, 2)
+            self.ivr_digit_text_edits[digit] = text_edit
+            self.ivr_digit_hook_edits[digit] = hook_edit
+        ivl.addLayout(digit_grid)
+        ivl.addStretch()
 
         # --- Page: 电话汇报 (RPC) ---
         report_page = QWidget()
@@ -543,6 +579,7 @@ class SettingsDialog(QDialog):
         for title, page in [
             ("SIP 账号", acct_page),
             ("钩子命令", hook_page),
+            ("呼入 IVR", ivr_page),
             ("电话汇报 (RPC)", report_page),
             ("日志与启动", log_page),
         ]:
@@ -580,6 +617,12 @@ class SettingsDialog(QDialog):
         self.sip_password.setText(settings.sip_password)
         self.off_hook_cmd.setText(settings.off_hook_cmd)
         self.on_hook_cmd.setText(settings.on_hook_cmd)
+        self.ivr_enabled.setChecked(settings.ivr_enabled)
+        self.ivr_welcome.setText(settings.ivr_welcome)
+        for digit, edit in self.ivr_digit_text_edits.items():
+            edit.setText(settings.ivr_digit_text.get(digit, ""))
+        for digit, edit in self.ivr_digit_hook_edits.items():
+            edit.setText(settings.ivr_digit_hook.get(digit, ""))
         self.rpc_enabled.setChecked(settings.rpc_enabled)
         self.rpc_port.setValue(settings.rpc_port)
         self.rpc_token.setText(settings.rpc_token)
@@ -601,6 +644,14 @@ class SettingsDialog(QDialog):
         settings.sip_password = self.sip_password.text()
         settings.off_hook_cmd = self.off_hook_cmd.text().strip()
         settings.on_hook_cmd = self.on_hook_cmd.text().strip()
+        settings.ivr_enabled = self.ivr_enabled.isChecked()
+        settings.ivr_welcome = self.ivr_welcome.text().strip()
+        settings.ivr_digit_text = {
+            d: v for d, e in self.ivr_digit_text_edits.items() if (v := e.text().strip())
+        }
+        settings.ivr_digit_hook = {
+            d: v for d, e in self.ivr_digit_hook_edits.items() if (v := e.text().strip())
+        }
         settings.rpc_enabled = self.rpc_enabled.isChecked()
         settings.rpc_port = self.rpc_port.value()
         settings.rpc_token = self.rpc_token.text().strip()
@@ -759,9 +810,9 @@ class MainWindow(QMainWindow):
 
         def _synthesize() -> None:
             try:
-                from teleflow.tts import EdgeTtsBackend
+                from teleflow.tts import CachingTtsBackend, EdgeTtsBackend
 
-                tts = EdgeTtsBackend(ffmpeg_path=ffmpeg)
+                tts = CachingTtsBackend(EdgeTtsBackend(ffmpeg_path=ffmpeg))
                 mp3 = tts.synthesize(text, voice)
                 wav = tts.transcode(mp3, mp3.with_suffix(".wav"))
                 self._pending_report_mp3 = str(mp3)
@@ -851,7 +902,7 @@ class MainWindow(QMainWindow):
         )
         svc.on(
             EVENT_CALL_ENDED,
-            lambda call_id: self.dashboard.set_call_state(CallState.ENDED),
+            lambda call_id, last_digit="": self.dashboard.set_call_state(CallState.ENDED),
         )
         svc.on(
             EVENT_REPORT_STARTED,
@@ -980,7 +1031,7 @@ def build_app(
     audio_backend = audio_backend or _default_audio_backend()
     sip_backend = sip_backend or _default_sip_backend()
     manager = AudioDeviceManager(audio_backend, store)
-    tts = EdgeTtsBackend(ffmpeg_path=settings.ffmpeg_path)
+    tts = CachingTtsBackend(EdgeTtsBackend(ffmpeg_path=settings.ffmpeg_path))
     service = SipCoreService(sip_backend, store, tts=tts)
     window = MainWindow(manager, service, store)
 

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
 from teleflow.config import ConfigStore, Settings
-from teleflow.tts import TtsBackend, TtsError, clean_markdown
+from teleflow.tts import CachingTtsBackend, TtsBackend, TtsError, clean_markdown
 
 # Domain events emitted to subscribers.
 EVENT_SIP_STARTED = "sip_started"
@@ -35,6 +35,9 @@ EVENT_REPORT_CONNECTED = "report_connected"
 EVENT_REPORT_PLAYING = "report_playing"
 EVENT_REPORT_COMPLETED = "report_completed"
 EVENT_REPORT_FAILED = "report_failed"
+# Inbound IVR (feature teleflow-call-ivr): emitted when the first DTMF key of an
+# IVR call is pressed (the service then stops listening for further keys).
+EVENT_IVR_DIGIT = "ivr_digit"
 
 
 class CallState(str, Enum):
@@ -74,8 +77,17 @@ class SipBackend(Protocol):
         to the user's sound devices."""
         ...
 
-    def play_file_to_call(self, call_id: str, wav_path: str) -> None:
-        """Play ``wav_path`` one-way into the given call (file -> call)."""
+    def play_file_to_call(self, call_id: str, wav_path: str, *, hangup_on_eof: bool = False) -> None:
+        """Play ``wav_path`` one-way into the given call (file -> call).
+
+        ``hangup_on_eof=True`` (report call) makes the backend hang up on EOF;
+        ``False`` (IVR menu item) signals ``playback_done`` so the service can
+        play the next item without hanging up.
+        """
+        ...
+
+    def mark_ivr(self, call_id: str) -> None:
+        """Tag an inbound call as IVR so the backend skips the mic bridge."""
         ...
 
     def reroute(self) -> None:
@@ -204,6 +216,7 @@ class FakeSipBackend:
         self.rerouted: list[str] = []
         self.report_calls: list[tuple[str, str]] = []
         self.report_played: list[tuple[str, str]] = []
+        self.ivr_marked: list[str] = []
         self.device_change_callbacks: list[Callable[[], None]] = []
 
     def start(self, port: int, handler: Callable[[str, dict], None]) -> None:
@@ -253,8 +266,12 @@ class FakeSipBackend:
     def place_report_call(self, target: str, wav_path: str) -> None:
         self.report_calls.append((target, wav_path))
 
-    def play_file_to_call(self, call_id: str, wav_path: str) -> None:
+    def play_file_to_call(self, call_id: str, wav_path: str, *, hangup_on_eof: bool = False) -> None:
         self.report_played.append((call_id, wav_path))
+        # Simulate EOF immediately (no real player): report calls keep the
+        # explicit receive_report_playback_done hook; IVR chains on playback_done.
+        if not hangup_on_eof:
+            self._fire("playback_done", call_id=call_id)
 
     def receive_report_connected(self, call_id: str) -> None:
         """Simulate the desk phone answering the report call (test hook)."""
@@ -264,9 +281,17 @@ class FakeSipBackend:
         """Simulate playback EOF for the report call (test hook)."""
         self._fire("report_eof", call_id=call_id)
 
+    def receive_dtmf(self, call_id: str, digit: str) -> None:
+        """Simulate an inbound DTMF key press (test hook)."""
+        self._fire("dtmf", call_id=call_id, digit=digit)
+
     def reroute(self) -> None:
         # Scripted fake has no live call audio to re-route, but records the call.
         self.rerouted.append("reroute")
+
+    def mark_ivr(self, call_id: str) -> None:
+        """Scripted fake has no mic bridge to suppress; recorded for parity."""
+        self.ivr_marked.append(call_id)
 
     def set_device_change_callback(self, cb: Callable[[], None]) -> None:
         self.device_change_callbacks.append(cb)
@@ -315,6 +340,14 @@ class SipCoreService:
         self._report_id: str | None = None
         self._report_call_id: str | None = None
         self._report_wav: Path | None = None
+        # Inbound IVR state (feature teleflow-call-ivr): after auto-answer, play a
+        # welcome message then a per-digit menu, then act on the first DTMF key.
+        self._ivr_active = False
+        self._ivr_call_id: str | None = None
+        self._ivr_queue: list[str] = []
+        self._ivr_listening = False
+        self._ivr_digit_fired = False
+        self._last_digit = ""
         # Optional log sink for report sub-steps (wired by the app shell to the
         # dashboard/log view). Kept optional so headless tests stay quiet.
         self._log: Callable[..., None] | None = None
@@ -458,10 +491,11 @@ class SipCoreService:
 
     def _default_tts(self, settings) -> TtsBackend:
         # Imported lazily so the real backend (edge-tts) is only constructed when
-        # actually needed; tests inject a FakeTtsBackend instead.
+        # actually needed; tests inject a FakeTtsBackend instead. Wrapped in a
+        # cache so IVR replays of the same welcome/menu text reuse the wav.
         from teleflow.tts import EdgeTtsBackend
 
-        self._tts = EdgeTtsBackend(ffmpeg_path=settings.ffmpeg_path)
+        self._tts = CachingTtsBackend(EdgeTtsBackend(ffmpeg_path=settings.ffmpeg_path))
         return self._tts
 
     def _on_report_connected(self, call_id: str) -> None:
@@ -473,7 +507,7 @@ class SipCoreService:
         self._emit(EVENT_REPORT_CONNECTED, call_id=call_id)
         self._emit(EVENT_REPORT_PLAYING, call_id=call_id)
         assert self._report_wav is not None
-        self._backend.play_file_to_call(call_id, str(self._report_wav))
+        self._backend.play_file_to_call(call_id, str(self._report_wav), hangup_on_eof=True)
 
     def _on_report_eof(self, call_id: str) -> None:
         if not self._report_active:
@@ -495,6 +529,77 @@ class SipCoreService:
         self._report_id = None
         self._report_call_id = None
         self._report_wav = None
+
+    # ------------------------------------------------------------------
+    # Inbound IVR flow (feature teleflow-call-ivr).
+    # After auto-answer (ivr_enabled): synthesize + queue the welcome message
+    # and each digit's menu text (empty texts skipped), play them one by one,
+    # then listen for the first DTMF key to fire EVENT_IVR_DIGIT and stop
+    # listening. {last_digit} is surfaced on CALL_ENDED for the on-hook hook.
+    # ------------------------------------------------------------------
+    def _maybe_start_ivr(self, call_id: str) -> None:
+        settings = self._store.load()
+        if not settings.ivr_enabled or self._tts is None:
+            return
+        voice = settings.tts_voice
+        # Synthesize first so a TTS failure leaves the call as a normal two-way
+        # bridge instead of a silently-mic-suppressed call.
+        try:
+            queue: list[str] = []
+            if settings.ivr_welcome.strip():
+                queue.append(str(self._tts.synthesize_to_wav(settings.ivr_welcome, voice)))
+            for digit in "1234567890":
+                text = settings.ivr_digit_text.get(digit, "").strip()
+                if text:
+                    queue.append(str(self._tts.synthesize_to_wav(text, voice)))
+        except TtsError as exc:
+            self._log_line(f"[IVR] TTS 失败, 跳过 IVR: {exc}")
+            return
+        # TTS succeeded: suppress the mic bridge and start the menu.
+        self._backend.mark_ivr(call_id)
+        self._ivr_active = True
+        self._ivr_call_id = call_id
+        self._ivr_queue = queue
+        self._ivr_listening = False
+        self._ivr_digit_fired = False
+        self._last_digit = ""
+        self._log_line(f"[IVR] 启动菜单: call={call_id} 条目数={len(queue)}")
+        self._ivr_play_next()
+
+    def _ivr_play_next(self) -> None:
+        if not self._ivr_active or self._ivr_call_id is None:
+            return
+        if not self._ivr_queue:
+            # Menu finished: start listening for the first DTMF key.
+            self._ivr_listening = True
+            self._log_line(f"[IVR] 菜单播报完成, 开始监听按键 (call {self._ivr_call_id})")
+            return
+        wav = self._ivr_queue.pop(0)
+        self._backend.play_file_to_call(self._ivr_call_id, wav, hangup_on_eof=False)
+
+    def _on_ivr_playback_done(self, call_id: str) -> None:
+        if not self._ivr_active or call_id != self._ivr_call_id:
+            return
+        self._ivr_play_next()
+
+    def _on_dtmf(self, call_id: str, digit: str) -> None:
+        if not self._ivr_active or call_id != self._ivr_call_id:
+            return
+        if self._ivr_digit_fired or not self._ivr_listening:
+            return
+        self._ivr_digit_fired = True
+        self._ivr_listening = False
+        self._last_digit = digit
+        self._log_line(f"[IVR] 收到按键 {digit} (call {call_id})")
+        self._emit(EVENT_IVR_DIGIT, call_id=call_id, digit=digit)
+
+    def _reset_ivr(self) -> None:
+        self._ivr_active = False
+        self._ivr_call_id = None
+        self._ivr_queue = []
+        self._ivr_listening = False
+        self._ivr_digit_fired = False
+        self._last_digit = ""
 
     def reroute(self) -> None:
         """Re-apply the current device selection to a live call (mid-call switch).
@@ -552,10 +657,18 @@ class SipCoreService:
             self._backend.answer(call_id)
             self._state = CallState.CONNECTED
             self._emit(EVENT_CALL_CONNECTED, call_id=call_id)
+            self._maybe_start_ivr(call_id)
         elif name in ("bye", "cancel"):
             self._state = CallState.ENDED
-            self._emit(EVENT_CALL_ENDED, call_id=str(data.get("call_id", "")))
+            self._emit(
+                EVENT_CALL_ENDED, call_id=str(data.get("call_id", "")), last_digit=self._last_digit
+            )
             self._state = CallState.IDLE
+            self._reset_ivr()
+        elif name == "dtmf":
+            self._on_dtmf(str(data["call_id"]), str(data["digit"]))
+        elif name == "playback_done":
+            self._on_ivr_playback_done(str(data["call_id"]))
         elif name == "network_down":
             self.recover()
         elif name == "report_connected":

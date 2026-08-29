@@ -75,9 +75,9 @@ class _SpySipBackend(FakeSipBackend):
         self.called.append("place_report_call")
         super().place_report_call(target, wav_path)
 
-    def play_file_to_call(self, call_id: str, wav_path: str) -> None:
+    def play_file_to_call(self, call_id: str, wav_path: str, *, hangup_on_eof: bool = False) -> None:
         self.called.append("play_file_to_call")
-        super().play_file_to_call(call_id, wav_path)
+        super().play_file_to_call(call_id, wav_path, hangup_on_eof=hangup_on_eof)
 
     def hangup(self, call_id: str) -> None:
         self.called.append("hangup")

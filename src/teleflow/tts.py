@@ -80,6 +80,14 @@ class TtsBackend(Protocol):
         """Transcode ``mp3_path`` to ``wav_path`` (8k mono pcm_s16le); return wav."""
         ...
 
+    def synthesize_to_wav(self, text: str, voice: str) -> Path:
+        """Render ``text`` with ``voice`` straight to a playable wav (8k mono).
+
+        The default implementation sequences ``synthesize`` + ``transcode``; a
+        caching wrapper overrides it to reuse a previously rendered wav.
+        """
+        ...
+
 
 class EdgeTtsBackend:
     """Real backend: edge-tts for speech, external ffmpeg for transcode."""
@@ -122,6 +130,12 @@ class EdgeTtsBackend:
             raise FfmpegError(f"ffmpeg transcode failed: {err}")
         return wav_path
 
+    def synthesize_to_wav(self, text: str, voice: str) -> Path:  # pragma: no cover - needs network
+        """Sequence ``synthesize`` + ``transcode`` into one wav (intermediate mp3)."""
+        mp3 = self.synthesize(text, voice)
+        wav_path = mp3.with_suffix(".wav")
+        return self.transcode(mp3, wav_path)
+
 
 class FakeTtsBackend:
     """Headless stand-in: records calls, returns a canned wav path.
@@ -143,3 +157,56 @@ class FakeTtsBackend:
     def transcode(self, mp3_path: Path, wav_path: Path) -> Path:
         self.transcoded.append((mp3_path, wav_path))
         return wav_path
+
+    def synthesize_to_wav(self, text: str, voice: str) -> Path:
+        # Record the synthesize call so caching tests can observe cache hits
+        # (a hit never reaches this method on the caching wrapper's inner).
+        self.synthesized.append((text, voice))
+        return self._fake_wav
+
+
+class CachingTtsBackend:
+    """Wraps a ``TtsBackend`` and caches rendered wavs by (cleaned text + voice).
+
+    IVR replays the same welcome/menu text on every inbound call, so re-synthesizing
+    each time wastes edge-tts/ffmpeg cycles. The cache key is a short hash of
+    ``clean_markdown(text)`` + ``voice``; a present wav is returned without touching
+    the inner backend, and only a text/voice change (different hash) re-renders.
+    """
+
+    def __init__(self, inner: TtsBackend, cache_dir: Path | None = None) -> None:
+        self._inner = inner
+        self._cache_dir = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE_DIR
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        # Recorded for tests: (text, voice) tuples that actually reached the inner
+        # backend (i.e. cache misses / changes).
+        self.rendered: list[tuple[str, str]] = []
+
+    @staticmethod
+    def _cache_key(text: str, voice: str) -> str:
+        import hashlib
+
+        h = hashlib.sha256()
+        h.update(clean_markdown(text).encode("utf-8"))
+        h.update(b"\x00")
+        h.update(voice.encode("utf-8"))
+        return h.hexdigest()[:16]
+
+    def synthesize_to_wav(self, text: str, voice: str) -> Path:
+        key = self._cache_key(text, voice)
+        wav_path = self._cache_dir / f"ivr_{key}.wav"
+        if wav_path.exists():
+            return wav_path
+        mp3 = self._inner.synthesize(clean_markdown(text), voice)
+        wav = self._inner.transcode(mp3, wav_path)
+        self.rendered.append((text, voice))
+        return wav
+
+    # Delegate the lower-level protocol methods so this wrapper satisfies
+    # ``TtsBackend`` and the report flow (which calls synthesize/transcode
+    # directly) keeps working unchanged.
+    def synthesize(self, text: str, voice: str) -> Path:
+        return self._inner.synthesize(text, voice)
+
+    def transcode(self, mp3_path: Path, wav_path: Path) -> Path:
+        return self._inner.transcode(mp3_path, wav_path)

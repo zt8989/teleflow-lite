@@ -18,7 +18,7 @@ import threading
 from typing import Callable, Protocol
 
 from teleflow.config import ConfigStore
-from teleflow.sip import EVENT_CALL_CONNECTED, EVENT_CALL_ENDED, SipCoreService
+from teleflow.sip import EVENT_CALL_CONNECTED, EVENT_CALL_ENDED, EVENT_IVR_DIGIT, SipCoreService
 
 
 class HookRunner(Protocol):
@@ -85,8 +85,18 @@ def attach_hooks(service: SipCoreService, runner: HookRunner, store: ConfigStore
     def _off_hook(call_id: str) -> None:
         runner.run(store.load().off_hook_cmd, {"call_id": call_id})
 
-    def _on_hook(call_id: str) -> None:
-        runner.run(store.load().on_hook_cmd, {"call_id": call_id})
+    def _on_hook(call_id: str, last_digit: str = "") -> None:
+        # {last_digit} is the first DTMF key of an IVR call (empty if none).
+        runner.run(store.load().on_hook_cmd, {"call_id": call_id, "last_digit": last_digit})
+
+    def _on_digit(call_id: str, digit: str) -> None:
+        # Per-digit IVR command; empty => no command configured for this key, so
+        # skip entirely (a key without a hook should not fire a blank command).
+        command = store.load().ivr_digit_hook.get(digit, "")
+        if not command or not command.strip():
+            return
+        runner.run(command, {"call_id": call_id, "digit": digit})
 
     service.on(EVENT_CALL_CONNECTED, _off_hook)
     service.on(EVENT_CALL_ENDED, _on_hook)
+    service.on(EVENT_IVR_DIGIT, _on_digit)
