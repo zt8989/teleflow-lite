@@ -15,7 +15,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
-from teleflow.config import ConfigStore
+from teleflow.config import ConfigStore, Settings
 from teleflow.tts import TtsBackend, TtsError, clean_markdown
 
 # Domain events emitted to subscribers.
@@ -154,6 +154,32 @@ def resolve_sip_port(
         if probe(candidate):
             return candidate, requested
     raise RuntimeError(f"没有可用的本地 UDP 端口 (扫描范围 {start}-{start + scan - 1})")
+
+
+def resolve_report_target(settings: Settings) -> str | None:
+    """Build the SIP URI to dial for a phone report.
+
+    Only ``report_extension`` (分机号) is required. When ``report_host`` (座机地址)
+    is set the call goes to that desk phone —
+    ``sip:{ext}@{report_host}:{report_port or 5060}`` — otherwise it defaults to
+    the configured gateway (走网关) using the SIP 账号 host/port —
+    ``sip:{ext}@{sip_host}:{sip_server_port}``.
+
+    Returns ``None`` when no dialable target can be constructed: the extension is
+    empty, or neither a 座机 address nor a gateway host is configured.
+    """
+    extension = settings.report_extension.strip()
+    if not extension:
+        return None
+    if settings.report_host.strip():
+        host = settings.report_host.strip()
+        port = settings.report_port or 5060
+        return f"sip:{extension}@{host}:{port}"
+    gateway_host = settings.sip_host.strip()
+    if not gateway_host:
+        return None
+    port = settings.sip_server_port or 5060
+    return f"sip:{extension}@{gateway_host}:{port}"
 
 
 class FakeSipBackend:
@@ -380,16 +406,20 @@ class SipCoreService:
         if not self._running:
             self._fail_report("sip_not_running")
             raise RuntimeError("SIP service is not running")
-        default_target = (
-            f"sip:{settings.report_extension}@{settings.report_host}"
-            f":{settings.report_port}"
-            if settings.report_host and settings.report_extension
-            else ""
-        )
+        default_target = resolve_report_target(settings)
         resolved_target = target or default_target
         if not resolved_target:
             self._fail_report("no_target")
-            raise RuntimeError("no report target configured")
+            if not settings.report_extension.strip():
+                detail = "未填写分机号（report_extension），无法拨打"
+            elif target:
+                detail = "指定的 target 为空"
+            else:
+                detail = (
+                    "未配置座机地址（report_host）且未配置网关（sip_host），"
+                    "无法确定拨打目标"
+                )
+            raise RuntimeError(f"no report target configured: {detail}")
         if audio_path and not Path(audio_path).exists():
             self._fail_report("file_missing")
             raise RuntimeError("audio file not found")

@@ -318,3 +318,35 @@ def test_finish_test_report_logs_synthesis_error(tmp_path) -> None:
     assert "测试汇报失败: connection reset" in window.dashboard._log_view.toPlainText()
     assert window._pending_report_error is None
     window.close()
+
+
+# --- phone-report routing (teleflow-phone-report-routing: ticket 02) ---
+
+
+def test_report_defaults_to_gateway_route_via_settings(tmp_path) -> None:
+    """Only the extension is required: leaving 座机地址 empty makes a report
+    dial the configured gateway (走网关), not a desk phone."""
+    from teleflow.sip import SipCoreService as _Svc
+    from teleflow.tts import FakeTtsBackend
+
+    app, window, _, manager, store = _make_window(tmp_path)
+    dialog = SettingsDialog(manager, window)
+    dialog.sip_host.setText("192.168.1.189")
+    dialog.sip_server_port.setValue(5062)
+    dialog.report_extension.setText("8000")
+    dialog.report_host.setText("")  # 座机地址 left empty -> default gateway route
+    dialog._save_and_close()
+
+    reloaded = ConfigStore(tmp_path / "config.json").load()
+    assert reloaded.sip_host == "192.168.1.189"
+    assert reloaded.sip_server_port == 5062
+    assert reloaded.report_extension == "8000"
+    assert reloaded.report_host == ""
+
+    svc = _Svc(FakeSipBackend(), store, tts=FakeTtsBackend())
+    svc.start()
+    svc.start_report("测试汇报")
+    assert svc._backend.report_calls == [
+        ("sip:8000@192.168.1.189:5062", str(svc._report_wav))
+    ]
+    window.close()

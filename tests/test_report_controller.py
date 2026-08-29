@@ -31,12 +31,16 @@ def _service(
     report_host="192.168.1.116",
     report_port=5060,
     report_extension="8000",
+    sip_host="",
+    sip_server_port=5060,
 ):
     store = ConfigStore(tmp_path / "config.json")
     settings = store.load()
     settings.report_host = report_host
     settings.report_port = report_port
     settings.report_extension = report_extension
+    settings.sip_host = sip_host
+    settings.sip_server_port = sip_server_port
     store.save(settings)
     backend = FakeSipBackend()
     svc = SipCoreService(backend, store, tts=tts)
@@ -105,9 +109,12 @@ def test_start_report_requires_running(tmp_path: Path) -> None:
     assert backend.report_calls == []
 
 
-def test_start_report_requires_target(tmp_path: Path) -> None:
+def test_start_report_requires_extension(tmp_path: Path) -> None:
     tts = FakeTtsBackend()
-    svc, backend, _ = _service(tmp_path, tts=tts, report_host="")  # no target
+    # No extension => no dialable target, even with a gateway configured.
+    svc, backend, _ = _service(
+        tmp_path, tts=tts, report_extension="", sip_host="192.168.1.189"
+    )
     svc.start()
     failed: list[str] = []
     svc.on(EVENT_REPORT_FAILED, lambda reason, report_id: failed.append(reason))
@@ -116,6 +123,67 @@ def test_start_report_requires_target(tmp_path: Path) -> None:
         svc.start_report("x")
 
     assert failed == ["no_target"]
+    assert backend.report_calls == []
+
+
+def test_start_report_defaults_to_gateway_route(tmp_path: Path) -> None:
+    tts = FakeTtsBackend()
+    # Only the extension + a configured gateway: routes through the gateway.
+    svc, backend, _ = _service(
+        tmp_path,
+        tts=tts,
+        report_host="",  # no 座机 address -> 走网关
+        report_extension="8000",
+        sip_host="192.168.1.189",
+        sip_server_port=5060,
+    )
+    svc.start()
+
+    svc.start_report("会议纪要")
+
+    assert backend.report_calls == [("sip:8000@192.168.1.189:5060", str(tts._fake_wav))]
+
+
+def test_start_report_desk_phone_route_defaults_port_5060(tmp_path: Path) -> None:
+    tts = FakeTtsBackend()
+    # 座机 address set, no port => defaults to 5060.
+    svc, backend, _ = _service(
+        tmp_path, tts=tts, report_host="192.168.1.116", report_port=0
+    )
+    svc.start()
+
+    svc.start_report("会议纪要")
+
+    assert backend.report_calls == [("sip:8000@192.168.1.116:5060", str(tts._fake_wav))]
+
+
+def test_start_report_desk_phone_route_explicit_port(tmp_path: Path) -> None:
+    tts = FakeTtsBackend()
+    svc, backend, _ = _service(
+        tmp_path, tts=tts, report_host="192.168.1.116", report_port=5080
+    )
+    svc.start()
+
+    svc.start_report("会议纪要")
+
+    assert backend.report_calls == [("sip:8000@192.168.1.116:5080", str(tts._fake_wav))]
+
+
+def test_start_report_no_route_without_extension_or_host(tmp_path: Path) -> None:
+    tts = FakeTtsBackend()
+    # Extension set, but neither a 座机 address nor a gateway host => no_target.
+    svc, backend, _ = _service(
+        tmp_path, tts=tts, report_host="", report_extension="8000", sip_host=""
+    )
+    svc.start()
+    failed: list[str] = []
+    svc.on(EVENT_REPORT_FAILED, lambda reason, report_id: failed.append(reason))
+
+    with pytest.raises(RuntimeError):
+        svc.start_report("x")
+
+    assert failed == ["no_target"]
+    assert backend.report_calls == []
 
 
 def test_start_report_missing_audio_file_fails(tmp_path: Path) -> None:
