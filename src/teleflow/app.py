@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import shutil
 import sys
+import threading
+import time
 import warnings
 from pathlib import Path
 from typing import Callable
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QIcon, QPixmap, QTextCharFormat
 from PyQt6.QtWidgets import (
     QApplication,
@@ -618,6 +620,12 @@ class SettingsDialog(QDialog):
 # Main window
 # ---------------------------------------------------------------------------
 class MainWindow(QMainWindow):
+    # Worker->GUI handoff for the async test-report path: emitted from the
+    # synthesis thread, delivered as a queued call on the GUI thread (PyQt6's
+    # QTimer.singleShot has no receiver overload, signals are the safe route).
+    _synth_done = pyqtSignal()
+    _synth_timed_out = pyqtSignal()
+
     def __init__(
         self,
         manager: AudioDeviceManager,
@@ -633,6 +641,13 @@ class MainWindow(QMainWindow):
         self._tray: QSystemTrayIcon | None = None
         self._tray_sip: QAction | None = None
         self._settings_dialog: SettingsDialog | None = None
+        # Worker->GUI handoff for the async test-report path (_test_report).
+        self._pending_report_text = ""
+        self._pending_report_mp3 = ""
+        self._pending_report_wav = ""
+        self._pending_report_error: str | None = None
+        self._synth_done.connect(self._finish_test_report)
+        self._synth_timed_out.connect(self._log_synth_timeout)
         self.setWindowTitle("TeleFlow — 座机声音流转助手")
         self.setWindowIcon(_load_icon())
         self.resize(680, 520)
@@ -720,12 +735,69 @@ class MainWindow(QMainWindow):
 
     def _test_report(self) -> None:
         """Trigger a phone report with built-in sample text (from the tray menu
-        or the dashboard button)."""
+        or the dashboard button).
+
+        TTS synthesis + ffmpeg transcoding run in a background thread so the
+        UI stays responsive. When the wav is ready we hop back to the GUI
+        thread via QTimer.singleShot(msec, self, "slot") — the string-slot
+        overload posts a queued call to ``self``'s thread, which is the only
+        safe way to touch Qt widgets / pjsua2 from the worker.
+        """
+        text = "这是一条 TeleFlow 测试汇报。座机接通后，你会听到这条语音播报。"
+        settings = self._store.load()
+        voice, ffmpeg = settings.tts_voice, settings.ffmpeg_path
+        self.append_log_line(f"[TTS] 合成中: voice={voice}")
+        self._pending_report_text = text
+
+        def _synthesize() -> None:
+            try:
+                from teleflow.tts import EdgeTtsBackend
+
+                tts = EdgeTtsBackend(ffmpeg_path=ffmpeg)
+                mp3 = tts.synthesize(text, voice)
+                wav = tts.transcode(mp3, mp3.with_suffix(".wav"))
+                self._pending_report_mp3 = str(mp3)
+                self._pending_report_wav = str(wav)
+                self._pending_report_error = None
+            except Exception as exc:  # noqa: BLE001 - surface failures in the log
+                self._pending_report_error = str(exc)
+            self._synth_done.emit()
+
+        threading.Thread(target=_synthesize, daemon=True).start()
+        threading.Thread(
+            target=self._watchdog_test_report,
+            args=(120,),
+            daemon=True,
+        ).start()
+
+    def _watchdog_test_report(self, timeout_sec: float) -> None:
+        """Log a warning if synthesis hangs (e.g. edge-tts network stall)."""
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            if self._pending_report_wav or self._pending_report_error:
+                return
+            time.sleep(1)
+        self._synth_timed_out.emit()
+
+    def _log_synth_timeout(self) -> None:
+        self.append_log_line(
+            "[TTS] 合成超时（超过 120 秒），请检查网络后重试"
+        )
+
+    def _finish_test_report(self) -> None:
+        """GUI-thread continuation of the background synthesis."""
+        if self._pending_report_error:
+            self.append_log_line(f"[REPORT] 测试汇报失败: {self._pending_report_error}")
+            self._pending_report_error = None
+            return
+        mp3, wav = self._pending_report_mp3, self._pending_report_wav
+        self.append_log_line(f"[TTS] 合成完成: {mp3}")
+        self.append_log_line(f"[FFMPEG] 转码完成: {wav}")
+        self._pending_report_mp3 = ""
+        self._pending_report_wav = ""
         try:
-            self._service.start_report(
-                "这是一条 TeleFlow 测试汇报。座机接通后，你会听到这条语音播报。"
-            )
-        except Exception as exc:  # noqa: BLE001 - surface failures in the log view
+            self._service.start_report(self._pending_report_text, audio_path=wav)
+        except Exception as exc:  # noqa: BLE001 - surface in the log view
             self.append_log_line(f"[REPORT] 测试汇报失败: {exc}")
 
     def _notify_port_conflict(self, requested: int, selected: int) -> None:

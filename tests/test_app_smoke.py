@@ -282,3 +282,39 @@ def test_auto_start_respects_disabled_flag(tmp_path) -> None:
 
     assert started is False
     assert not service.running
+
+# --- async test-report handoff (GUI slot after background synthesis) ---
+
+
+def test_finish_test_report_starts_report_with_wav(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("teleflow.sip._udp_port_available", lambda port: True)
+    app, window, service, _, store = _make_window(tmp_path)
+    settings = store.load()
+    settings.report_host = "192.168.1.116"
+    settings.report_extension = "8000"
+    store.save(settings)
+    service.start()
+    wav = tmp_path / "report.wav"
+    wav.write_bytes(b"RIFF")
+
+    window._pending_report_text = "会议纪要"
+    window._pending_report_mp3 = str(tmp_path / "report.mp3")
+    window._pending_report_wav = str(wav)
+    window._pending_report_error = None
+    window._finish_test_report()
+
+    assert service._backend.report_calls == [
+        ("sip:8000@192.168.1.116:5060", str(wav))
+    ]
+    assert "[FFMPEG] 转码完成" in window.dashboard._log_view.toPlainText()
+    window.close()
+
+
+def test_finish_test_report_logs_synthesis_error(tmp_path) -> None:
+    app, window, _, _, _ = _make_window(tmp_path)
+    window._pending_report_error = "connection reset"
+    window._finish_test_report()
+
+    assert "测试汇报失败: connection reset" in window.dashboard._log_view.toPlainText()
+    assert window._pending_report_error is None
+    window.close()
