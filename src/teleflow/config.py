@@ -23,8 +23,12 @@ class Settings:
     falls back to these defaults on load.
     """
 
-    # Local SIP transport: pjsua2 binds this UDP port as a SIP *client*.
-    sip_port: int = 5060
+    # Local SIP transport port, as a string so it can be empty. Empty means
+    # auto-detect: pjsua2 binds the first free UDP port starting at 5060 (if the
+    # registrar/freeswitch already listens on 5060 the client moves on). A
+    # non-empty value is a preferred port, honoured only when free; otherwise
+    # the user is warned and a free port is picked automatically.
+    sip_port: str = ""
     # SIP client account — TeleFlow registers to this registrar/proxy as this user.
     sip_server: str = ""  # registrar/proxy URI, e.g. "sip:provider.example.com:5060"
     sip_user: str = ""  # AOR / auth username
@@ -87,6 +91,19 @@ class ConfigStore:
         if not isinstance(raw, dict):
             return Settings()
         known = {k: v for k, v in raw.items() if k in Settings.field_names()}
+        # ``sip_port`` became optional ("" = auto-detect, ticket 01 of
+        # sip-port-auto-detect). Normalize any stored value: the old fixed
+        # default 5060 (int) is upgraded to "" so legacy configs don't pin the
+        # port that collides with a co-located registrar; other values are kept
+        # as strings for the auto-detect code to validate.
+        if "sip_port" in known:
+            stored = known["sip_port"]
+            if stored in (None, "", 0):
+                known["sip_port"] = ""
+            elif stored == 5060:
+                known["sip_port"] = ""
+            else:
+                known["sip_port"] = str(stored).strip()
         # Field migration from the pre-sip-softphone schema (and the intermediate
         # ata-registration branch). The old design was a SIP *server* the gateway
         # registered to; the new design is a SIP *client* that registers to an

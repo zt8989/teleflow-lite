@@ -16,7 +16,7 @@ def test_load_returns_defaults_when_file_missing(tmp_path: Path) -> None:
     store = ConfigStore(tmp_path / "config.json")
     settings = store.load()
     assert settings == Settings()
-    assert settings.sip_port == 5060
+    assert settings.sip_port == ""
     assert settings.sip_server == ""
     assert settings.sip_user == ""
     assert settings.sip_password == ""
@@ -26,14 +26,14 @@ def test_store_accepts_str_path(tmp_path: Path) -> None:
     # ConfigStore must coerce a str path to Path so load()/save() work whether
     # the caller passes a Path or a string (regression: str path broke .exists()).
     store = ConfigStore(str(tmp_path / "nested" / "config.json"))
-    store.save(Settings(sip_port=5062))
-    assert store.load().sip_port == 5062
+    store.save(Settings(sip_port="5062"))
+    assert store.load().sip_port == "5062"
 
 
 def test_round_trip_preserves_all_fields(tmp_path: Path) -> None:
     store = ConfigStore(tmp_path / "config.json")
     original = Settings(
-        sip_port=5070,
+        sip_port="5070",
         playback_device_id="speaker-1",
         capture_device_id="mic-2",
         autostart=True,
@@ -50,7 +50,7 @@ def test_round_trip_preserves_all_fields(tmp_path: Path) -> None:
 def test_sip_client_fields_default_on_fresh_file(tmp_path: Path) -> None:
     store = ConfigStore(tmp_path / "config.json")
     settings = store.load()
-    assert settings.sip_port == 5060
+    assert settings.sip_port == ""  # "" = auto-detect
     assert settings.sip_server == ""
     assert settings.sip_user == ""
     assert settings.sip_password == ""
@@ -65,7 +65,7 @@ def test_old_file_without_new_fields_uses_defaults(tmp_path: Path) -> None:
         '{"sip_port": 5090, "playback_device_id": "x"}', encoding="utf-8"
     )
     loaded = store.load()
-    assert loaded.sip_port == 5090  # old sip_port carries over as local transport
+    assert loaded.sip_port == "5090"  # explicit old port carries over (str)
     assert loaded.playback_device_id == "x"
     assert loaded.sip_user == ""  # sip_number no longer auto-defaults
 
@@ -90,7 +90,7 @@ def test_migration_maps_gateway_fields_to_client_credentials(tmp_path: Path) -> 
     loaded = store.load()
     assert loaded.sip_user == "2001"
     assert loaded.sip_password == "old-secret"
-    assert loaded.sip_port == 5060  # unchanged
+    assert loaded.sip_port == ""  # legacy fixed default 5060 upgrades to auto
     assert not hasattr(loaded, "gateway_port")  # retired, not carried over
     assert not hasattr(loaded, "accounts")
 
@@ -99,7 +99,7 @@ def test_partial_file_merges_with_defaults(tmp_path: Path) -> None:
     store = ConfigStore(tmp_path / "config.json")
     store.path.write_text('{"sip_port": 5080}', encoding="utf-8")
     loaded = store.load()
-    assert loaded.sip_port == 5080  # old sip_port migrates to local transport
+    assert loaded.sip_port == "5080"  # explicit port migrates to local transport
     assert loaded.autostart is False  # default retained
     assert loaded.log_level == "INFO"
 
@@ -108,15 +108,23 @@ def test_unknown_keys_are_ignored(tmp_path: Path) -> None:
     store = ConfigStore(tmp_path / "config.json")
     store.path.write_text('{"sip_port": 5090, "mystery": true}', encoding="utf-8")
     loaded = store.load()
-    assert loaded.sip_port == 5090  # old sip_port migrates to local transport
+    assert loaded.sip_port == "5090"  # explicit port migrates to local transport
     assert not hasattr(loaded, "mystery")
+
+
+def test_legacy_default_5060_upgrades_to_auto(tmp_path: Path) -> None:
+    """The old fixed default (int 5060) must not pin the port that collides
+    with a co-located registrar; it upgrades to "" (auto-detect)."""
+    store = ConfigStore(tmp_path / "config.json")
+    store.path.write_text('{"sip_port": 5060}', encoding="utf-8")
+    assert store.load().sip_port == ""
 
 
 def test_persists_across_two_store_instances(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
-    ConfigStore(path).save(Settings(sip_port=6060))
+    ConfigStore(path).save(Settings(sip_port="6060"))
     reloaded = ConfigStore(path).load()
-    assert reloaded.sip_port == 6060
+    assert reloaded.sip_port == "6060"
 
 
 def test_phone_report_fields_default_on_fresh_file(tmp_path: Path) -> None:

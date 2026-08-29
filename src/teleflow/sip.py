@@ -9,6 +9,7 @@ into domain events the UI subscribes to; it performs no socket I/O itself.
 
 from __future__ import annotations
 
+import socket
 import uuid
 from enum import Enum
 from pathlib import Path
@@ -23,6 +24,7 @@ EVENT_SIP_STOPPED = "sip_stopped"
 EVENT_SIP_REGISTERED = "sip_registered"
 EVENT_SIP_UNREGISTERED = "sip_unregistered"
 EVENT_SIP_REGISTER_FAILED = "sip_register_failed"
+EVENT_SIP_PORT_CONFLICT = "sip_port_conflict"
 EVENT_CALL_INCOMING = "call_incoming"
 EVENT_CALL_CONNECTED = "call_connected"
 EVENT_CALL_ENDED = "call_ended"
@@ -87,6 +89,71 @@ class SipBackend(Protocol):
     def recover(self) -> None:
         """Best-effort recovery after a network drop / transport disconnect."""
         ...
+
+
+SIP_AUTO_PORT_START = 5060
+SIP_PORT_SCAN_LIMIT = 100
+
+
+def _udp_port_available(port: int) -> bool:
+    """True when nothing is bound to ``port`` for UDP on this machine.
+
+    Attempts a wildcard bind. Without extra options a plain wildcard bind can
+    coexist with a concrete bind that set SO_REUSEADDR — e.g. a co-located
+    registrar (FreeSWITCH) holds ``<lan-ip>:5060`` while pjsua2 would still
+    bind ``0.0.0.0:5060``, and the REGISTER responses then loop back into the
+    registrar. On Windows we set SO_EXCLUSIVEADDRUSE so any existing bind on
+    that port (specific or wildcard, reuse or not) makes the probe fail.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if exclusive is not None:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+            except OSError:
+                pass
+        sock.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def resolve_sip_port(
+    preferred: str | int | None = None,
+    *,
+    probe: Callable[[int], bool] | None = None,
+    start: int = SIP_AUTO_PORT_START,
+    scan: int = SIP_PORT_SCAN_LIMIT,
+) -> tuple[int, int | None]:
+    """Decide the local UDP transport port for the SIP client.
+
+    ``preferred`` empty/invalid means auto-detect: probe from ``start`` upward
+    and take the first free port. A valid ``preferred`` is only honoured while
+    free; when occupied the caller is told (second return value) and a free
+    port is chosen automatically so the service still starts.
+
+    ``probe`` defaults to the module's real availability check and is looked
+    up at call time so tests can monkeypatch it.
+
+    Returns ``(chosen_port, preferred_port_or_None)`` — when preferred is not
+    None and differs from chosen, the preferred port was occupied.
+    """
+    if probe is None:
+        probe = _udp_port_available
+    requested: int | None = None
+    if preferred is not None and str(preferred).strip().isdigit():
+        candidate = int(str(preferred).strip())
+        if 1 <= candidate <= 65535:
+            requested = candidate
+    if requested is not None and probe(requested):
+        return requested, requested
+    for candidate in range(start, start + scan):
+        if probe(candidate):
+            return candidate, requested
+    raise RuntimeError(f"没有可用的本地 UDP 端口 (扫描范围 {start}-{start + scan - 1})")
 
 
 class FakeSipBackend:
@@ -263,7 +330,16 @@ class SipCoreService:
 
     def start(self) -> None:
         settings = self._store.load()
-        self._backend.start(settings.sip_port, self._dispatch)
+        # Auto-detect a free UDP transport port unless the user configured a
+        # specific one; a configured-but-occupied port falls back to the next
+        # free port, announcing the conflict so the UI can warn the user.
+        port, requested = resolve_sip_port(settings.sip_port)
+        if requested is not None and port != requested:
+            self._log_line(f"[SIP] 指定端口 {requested} 已被占用，已自动改用端口 {port}")
+            self._emit(EVENT_SIP_PORT_CONFLICT, requested=requested, selected=port)
+        elif requested is None:
+            self._log_line(f"[SIP] 自动选择本地端口 {port}")
+        self._backend.start(port, self._dispatch)
         self._running = True
         self._emit(EVENT_SIP_STARTED)
 

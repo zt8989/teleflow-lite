@@ -16,12 +16,22 @@ from teleflow.sip import (
     EVENT_CALL_ENDED,
     EVENT_CALL_INCOMING,
     EVENT_MEDIA_ERROR,
+    EVENT_SIP_PORT_CONFLICT,
     EVENT_SIP_REGISTERED,
     EVENT_SIP_REGISTER_FAILED,
     EVENT_SIP_STARTED,
     FakeSipBackend,
     SipCoreService,
+    _udp_port_available,
 )
+
+
+@pytest.fixture(autouse=True)
+def _free_udp_ports(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the port auto-detection deterministic: pretend every UDP port is
+    free so ``start()`` always picks the default unless a test overrides the
+    probe. Without this the real socket probe would depend on the host."""
+    monkeypatch.setattr("teleflow.sip._udp_port_available", lambda port: True)
 
 
 def _service(tmp_path):
@@ -80,10 +90,10 @@ def test_media_error_is_forwarded(tmp_path) -> None:
     assert errors == ["RTP timeout"]
 
 
-def test_service_starts_on_configured_port(tmp_path) -> None:
+def test_service_starts_on_configured_port(tmp_path, monkeypatch) -> None:
     store = ConfigStore(tmp_path / "config.json")
     settings = store.load()
-    settings.sip_port = 5070
+    settings.sip_port = "5070"
     store.save(settings)
 
     backend = FakeSipBackend()
@@ -91,6 +101,88 @@ def test_service_starts_on_configured_port(tmp_path) -> None:
     svc.start()
 
     assert backend.port == 5070
+
+
+def test_auto_detect_skips_occupied_5060(tmp_path, monkeypatch) -> None:
+    """Empty config: the resolver probes from 5060 and drifts to the first free
+    port (here: 5061), exactly the co-located-registrar scenario."""
+    probed: list[int] = []
+    monkeypatch.setattr(
+        "teleflow.sip._udp_port_available",
+        lambda port: probed.append(port) or port >= 5061,
+    )
+    store = ConfigStore(tmp_path / "config.json")
+    store.save(store.load())  # empty config file on disk
+
+    backend = FakeSipBackend()
+    svc = SipCoreService(backend, store)
+    svc.start()
+
+    assert backend.port == 5061
+    assert probed[:2] == [5060, 5061]
+
+
+def test_configured_occupied_port_emits_conflict_and_falls_back(
+    tmp_path, monkeypatch
+) -> None:
+    """A configured port that is taken must warn the user and still start on
+    the next free port."""
+    monkeypatch.setattr("teleflow.sip._udp_port_available", lambda port: port == 5061)
+    store = ConfigStore(tmp_path / "config.json")
+    settings = store.load()
+    settings.sip_port = "5060"
+    store.save(settings)
+
+    backend = FakeSipBackend()
+    svc = SipCoreService(backend, store)
+    conflicts: list[tuple[int, int]] = []
+    svc.on(
+        EVENT_SIP_PORT_CONFLICT,
+        lambda requested, selected: conflicts.append((requested, selected)),
+    )
+
+    svc.start()
+
+    assert backend.port == 5061
+    assert conflicts == [(5060, 5061)]
+    assert svc.running
+
+
+def test_configured_free_port_does_not_emit_conflict(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("teleflow.sip._udp_port_available", lambda port: True)
+    store = ConfigStore(tmp_path / "config.json")
+    settings = store.load()
+    settings.sip_port = "5070"
+    store.save(settings)
+
+    backend = FakeSipBackend()
+    svc = SipCoreService(backend, store)
+    conflicts: list[tuple[int, int]] = []
+    svc.on(
+        EVENT_SIP_PORT_CONFLICT,
+        lambda requested, selected: conflicts.append((requested, selected)),
+    )
+
+    svc.start()
+
+    assert backend.port == 5070
+    assert conflicts == []
+
+
+def test_udp_port_available_detects_occupied_and_released_port() -> None:
+    """The real probe must see a held port as occupied and a released one as
+    free (regression: a plain wildcard bind used to coexist with a concrete
+    SO_REUSEADDR bind on Windows, missing the co-located registrar)."""
+    import socket as socket_mod
+
+    holder = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_DGRAM)
+    holder.bind(("0.0.0.0", 0))
+    port = holder.getsockname()[1]
+    try:
+        assert _udp_port_available(port) is False
+    finally:
+        holder.close()
+    assert _udp_port_available(port) is True
 
 
 def test_reroute_if_connected_only_fires_while_a_call_is_active(tmp_path) -> None:

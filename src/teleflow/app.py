@@ -70,6 +70,7 @@ from teleflow.sip import (
     EVENT_SIP_STARTED,
     EVENT_SIP_STOPPED,
     EVENT_SIP_UNREGISTERED,
+    EVENT_SIP_PORT_CONFLICT,
     FakeSipBackend,
     ReportState,
     SipBackend,
@@ -153,7 +154,7 @@ class DashboardWidget(QWidget):
         stat_row = QHBoxLayout()
         stat_row.setSpacing(8)
         self._sip_stat = self._build_stat_group("SIP 服务", "未启动")
-        self._reg_stat = self._build_stat_group("SIP 注册", "未注册")
+        self._reg_stat = self._build_stat_group("网关注册", "未注册")
         self._mode_stat = self._build_stat_group("当前模式", "生产模式")
         self._call_stat = self._build_stat_group("通话状态", "空闲")
         stat_row.addWidget(self._sip_stat)
@@ -332,7 +333,7 @@ class DashboardWidget(QWidget):
         self._update_sip_stat()
 
     def set_sip_registration(self, text: str) -> None:
-        """Update the SIP 注册 status card (e.g. 未注册 / 已注册 / 注册失败)."""
+        """Update the 网关注册 status card (e.g. 未注册 / 已注册 / 注册失败)."""
         self._set_stat_value(self._reg_stat, text)
 
     def set_call_state(self, state: CallState) -> None:
@@ -402,17 +403,6 @@ class SettingsDialog(QDialog):
         split.addWidget(self._menu)
         split.addWidget(self._pages, 1)
         layout.addLayout(split)
-
-        # --- Page: SIP 服务 ---
-        sip_page = QWidget()
-        sl = QVBoxLayout(sip_page)
-        sl.setContentsMargins(12, 12, 12, 12)
-        sl.setSpacing(8)
-        sl.addWidget(QLabel("SIP 本地端口（客户端传输，默认 5060）:"))
-        self.port = QSpinBox()
-        self.port.setRange(1, 65535)
-        sl.addWidget(self.port)
-        sl.addStretch()
 
         # --- Page: SIP 账号 (客户端注册到外部服务器) ---
         acct_page = QWidget()
@@ -502,7 +492,6 @@ class SettingsDialog(QDialog):
         ll.addStretch()
 
         for title, page in [
-            ("SIP 服务", sip_page),
             ("SIP 账号", acct_page),
             ("钩子命令", hook_page),
             ("电话汇报 (RPC)", report_page),
@@ -678,6 +667,17 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001 - surface failures in the log view
             self.append_log_line(f"[REPORT] 测试汇报失败: {exc}")
 
+    def _notify_port_conflict(self, requested: int, selected: int) -> None:
+        """Warn the user that the preferred SIP port was occupied and the client
+        auto-moved to a free one (the log line is written by the service)."""
+        if self._tray is not None:
+            self._tray.showMessage(
+                "TeleFlow — 网关注册",
+                f"指定端口 {requested} 已被占用，已自动改用端口 {selected}",
+                QSystemTrayIcon.MessageIcon.Warning,
+                5000,
+            )
+
     def _wire_service(self) -> None:
         svc = self._service
         svc.on(EVENT_SIP_STARTED, lambda: self._sync_sip_button())
@@ -695,6 +695,10 @@ class MainWindow(QMainWindow):
             lambda code, reason: self.dashboard.set_sip_registration(
                 f"注册失败 ({code})" if code else "注册失败"
             ),
+        )
+        svc.on(
+            EVENT_SIP_PORT_CONFLICT,
+            lambda requested, selected: self._notify_port_conflict(requested, selected),
         )
         svc.on(
             EVENT_CALL_INCOMING,

@@ -363,18 +363,13 @@ const LOG_PANE = `<div class="card"><h3>实时日志（SIP / 媒体 / 设备）<
    Multi-page (macOS System Settings style) matching the real dialog. */
 const SETTINGS_PANE = `<div class="dlgLayout">
   <div class="dlgMenu">
-    <button id="m-sip" class="active" onclick="showPanel('sip')">SIP 服务</button>
-    <button id="m-acct" onclick="showPanel('acct')">SIP 账号</button>
+    <button id="m-acct" class="active" onclick="showPanel('acct')">SIP 账号</button>
     <button id="m-hook" onclick="showPanel('hook')">钩子命令</button>
     <button id="m-rpc" onclick="showPanel('rpc')">电话汇报 (RPC)</button>
     <button id="m-log" onclick="showPanel('log')">日志与启动</button>
   </div>
   <div style="flex:1;min-width:0">
-    <div class="dlgPanel" id="p-sip">
-      <label class="fld"><span>SIP 本地端口（客户端传输，默认 5060）</span><input type="number" id="sipPort" value="${state.port}"></label>
-      <p class="hint">TeleFlow 作为本地 SIP 客户端，用此端口与 SIP 服务器通信。</p>
-    </div>
-    <div class="dlgPanel hidden" id="p-acct">
+    <div class="dlgPanel" id="p-acct">
       <label class="fld"><span>SIP 服务器（注册地址，例如 sip:provider.example.com:5060，留空则不注册）</span><input type="text" id="sipServer" value="${state.server}" placeholder="sip:provider.example.com:5060"></label>
       <div class="row">
         <label class="fld"><span>SIP 账号（认证用户名 / AOR，例如 2001）</span><input type="text" id="sipUser" value="${state.user}" placeholder="例如 2001"></label>
@@ -422,7 +417,7 @@ function Dashboard(){
   <p class="hint">设置与退出在右下角系统托盘菜单中 · 点击 ☎ 图标打开</p>
   <div class="statgrid">
     <div class="stat"><div class="k">SIP 服务</div><div class="v">${statusPill()}</div></div>
-    <div class="stat"><div class="k">SIP 注册</div><div class="v ${regClass()}">${state.registration}</div></div>
+    <div class="stat"><div class="k">网关注册</div><div class="v ${regClass()}">${state.registration}</div></div>
     <div class="stat"><div class="k">当前模式</div><div class="v">${state.mode}</div></div>
     <div class="stat"><div class="k">通话状态</div><div class="v">${state.call}</div></div>
     <div class="stat"><div class="k">电话汇报</div><div class="v">${state.report.state}</div></div>
@@ -481,7 +476,6 @@ function saveSettings(){
   if(g("sipServer")) state.server=g("sipServer").value.trim();
   if(g("sipUser")) state.user=g("sipUser").value.trim();
   if(g("sipPassword")) state.password=g("sipPassword").value;
-  if(g("sipPort")) state.port=+g("sipPort").value||5060;
   if(g("offHookCmd")) state.offHookCmd=g("offHookCmd").value;
   if(g("onHookCmd")) state.onHookCmd=g("onHookCmd").value;
   if(g("reportTarget")) state.reportTarget=g("reportTarget").value;
