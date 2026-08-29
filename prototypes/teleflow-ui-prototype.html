@@ -123,6 +123,21 @@
   .trayMenu button.danger:hover{background:var(--bad);color:#fff}
   .trayMenu .sep{height:1px;background:#d6d6d6;margin:4px 4px}
 
+  /* dashboard top menu button — same items as the tray menu */
+  .dashmenu{position:relative;margin:-2px 0 10px}
+  #dashMenuBtn{background:#171a21;color:#fff;border:1px solid #2a2f3a;border-radius:8px;
+    padding:6px 14px;font-size:13px;cursor:pointer}
+  #dashMenuBtn:hover{border-color:var(--accent)}
+  #dashMenuList{position:absolute;top:calc(100% + 4px);left:0;width:210px;z-index:40;
+    background:linear-gradient(#fdfdfd,#f0f0f0);border:1px solid #9a9a9a;border-radius:3px;
+    padding:4px;box-shadow:0 2px 12px rgba(0,0,0,.25);display:flex;flex-direction:column;gap:1px}
+  #dashMenuList button{display:flex;align-items:center;gap:9px;width:100%;background:none;border:none;
+    color:#1c1c1c;text-align:left;padding:6px 10px;border-radius:2px;cursor:pointer;font-size:13px}
+  #dashMenuList button:hover{background:var(--accent);color:#fff}
+  #dashMenuList button.danger{color:var(--bad)}
+  #dashMenuList button.danger:hover{background:var(--bad);color:#fff}
+  #dashMenuList .sep{height:1px;background:#d6d6d6;margin:4px 4px}
+
   /* QDialog (settings) */
   .modal{position:fixed;inset:0;background:rgba(0,0,0,.28);display:flex;align-items:center;
     justify-content:center;z-index:80}
@@ -414,7 +429,17 @@ const SETTINGS_PANE = `<div class="dlgLayout">
    ========================================================================= */
 function Dashboard(){
   return `
-  <p class="hint">设置与退出在右下角系统托盘菜单中 · 点击 ☎ 图标打开</p>
+  <div class="dashmenu" id="dashmenuwrap">
+    <button id="dashMenuBtn" onclick="toggleDashMenu(event)">菜单 ▾</button>
+    <div class="hidden" id="dashMenuList">
+      <button id="dashSipItem" onclick="dashAct('togglesip')">▶ 启动 SIP 服务</button>
+      <button onclick="dashAct('show')">🪟 显示窗口</button>
+      <button onclick="dashAct('report')">📞 测试汇报</button>
+      <button onclick="dashAct('settings')">⚙ 设置</button>
+      <div class="sep"></div>
+      <button class="danger" onclick="dashAct('quit')">⏻ 退出</button>
+    </div>
+  </div>
   <div class="statgrid">
     <div class="stat"><div class="k">SIP 服务</div><div class="v">${statusPill()}</div></div>
     <div class="stat"><div class="k">网关注册</div><div class="v ${regClass()}">${state.registration}</div></div>
@@ -440,7 +465,25 @@ function render(){
   if(sbPort) sbPort.textContent = "SIP 本地端口 "+state.port;
   const tsi=document.getElementById("traySipItem");
   if(tsi) tsi.textContent = state.sipRunning ? "⏸ 停止 SIP 服务" : "▶ 启动 SIP 服务";
+  const dsi=document.getElementById("dashSipItem");
+  if(dsi) dsi.textContent = state.sipRunning ? "⏸ 停止 SIP 服务" : "▶ 启动 SIP 服务";
 }
+
+/* dashboard top menu — same items as the tray menu, same actions */
+function closeDashMenu(){document.getElementById("dashMenuList").classList.add("hidden");}
+function toggleDashMenu(e){
+  e.stopPropagation();
+  document.getElementById("dashMenuList").classList.toggle("hidden");
+}
+function dashAct(a){
+  closeDashMenu();
+  if(a==="settings"){ openSettings(); }
+  else{ simMenu(a); }
+}
+document.addEventListener("click",(e)=>{
+  const m=document.getElementById("dashmenuwrap");
+  if(!m || !m.contains(e.target)) closeDashMenu();
+});
 
 /* tray menu (QMenu) */
 function closeTray(){document.getElementById("trayMenu").classList.add("hidden");}

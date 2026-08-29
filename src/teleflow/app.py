@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSystemTrayIcon,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -145,10 +146,16 @@ class DashboardWidget(QWidget):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
 
-        # Hint
-        hint = QLabel("设置与退出在右下角系统托盘菜单中 · 点击托盘图标打开")
-        hint.setStyleSheet("color: gray; font-size: 11px;")
-        layout.addWidget(hint)
+        # Top row: menu button whose items mirror the system-tray menu
+        # (populated by MainWindow via set_service_menu with shared QActions).
+        top_row = QHBoxLayout()
+        self._menu_btn = QToolButton()
+        self._menu_btn.setText("菜单")
+        self._menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._menu_btn.setArrowType(Qt.ArrowType.DownArrow)
+        top_row.addWidget(self._menu_btn)
+        top_row.addStretch()
+        layout.addLayout(top_row)
 
         # Stat grid (4 cards in a horizontal row)
         stat_row = QHBoxLayout()
@@ -335,6 +342,15 @@ class DashboardWidget(QWidget):
     def set_sip_registration(self, text: str) -> None:
         """Update the 网关注册 status card (e.g. 未注册 / 已注册 / 注册失败)."""
         self._set_stat_value(self._reg_stat, text)
+
+    def set_service_menu(self, actions: list[QAction]) -> None:
+        """Attach the service menu to the top button. ``actions`` are the same
+        QAction instances shown in the system-tray menu, so both menus stay in
+        sync (labels, enabled state, triggers)."""
+        menu = QMenu(self._menu_btn)
+        for action in actions:
+            menu.addAction(action)
+        self._menu_btn.setMenu(menu)
 
     def set_call_state(self, state: CallState) -> None:
         self._call_state = state
@@ -577,11 +593,13 @@ class MainWindow(QMainWindow):
         self,
         manager: AudioDeviceManager,
         service: SipCoreService,
+        store: ConfigStore,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._manager = manager
         self._service = service
+        self._store = store
         self._force_quit = False
         self._tray: QSystemTrayIcon | None = None
         self._tray_sip: QAction | None = None
@@ -594,11 +612,35 @@ class MainWindow(QMainWindow):
         self.dashboard = DashboardWidget(manager)
         self.setCentralWidget(self.dashboard)
 
+        self._build_service_actions()
+        self.dashboard.set_service_menu(
+            [
+                self._act_toggle_sip,
+                self._act_show,
+                self._act_settings,
+                self._act_report,
+                self._act_quit,
+            ]
+        )
         self._setup_tray()
         self._wire_service()
 
     def append_log_line(self, line: str) -> None:
         self.dashboard.append_log_line(line)
+
+    def _build_service_actions(self) -> None:
+        """One set of QActions shared by the dashboard menu and the system-tray
+        menu, so both always show the same items in the same state."""
+        self._act_toggle_sip = QAction("启动 SIP 服务", self)
+        self._act_toggle_sip.triggered.connect(self._toggle_sip)
+        self._act_show = QAction("显示窗口", self)
+        self._act_show.triggered.connect(self.show_window)
+        self._act_settings = QAction("设置", self)
+        self._act_settings.triggered.connect(self._open_settings)
+        self._act_report = QAction("测试汇报", self)
+        self._act_report.triggered.connect(self._test_report)
+        self._act_quit = QAction("退出", self)
+        self._act_quit.triggered.connect(self.quit_app)
 
     def _setup_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -607,23 +649,13 @@ class MainWindow(QMainWindow):
         self._tray = QSystemTrayIcon(self)
         self._tray.setIcon(_load_tray_icon())
         menu = QMenu()
-        sip_action = menu.addAction("启动 SIP 服务")
-        assert sip_action is not None
-        sip_action.triggered.connect(self._toggle_sip)
-        show_action = menu.addAction("显示窗口")
-        assert show_action is not None
-        show_action.triggered.connect(self.show_window)
-        settings_action = menu.addAction("设置")
-        assert settings_action is not None
-        settings_action.triggered.connect(self._open_settings)
-        report_action = menu.addAction("测试汇报")
-        assert report_action is not None
-        report_action.triggered.connect(self._test_report)
+        menu.addAction(self._act_toggle_sip)
+        menu.addAction(self._act_show)
+        menu.addAction(self._act_settings)
+        menu.addAction(self._act_report)
         menu.addSeparator()
-        quit_action = menu.addAction("退出")
-        assert quit_action is not None
-        quit_action.triggered.connect(self.quit_app)
-        self._tray_sip = sip_action
+        menu.addAction(self._act_quit)
+        self._tray_sip = self._act_toggle_sip
         self._tray.setContextMenu(menu)
         self._tray.activated.connect(
             lambda reason: self.show_window()
@@ -739,8 +771,21 @@ class MainWindow(QMainWindow):
         if self._service.running:
             self._service.stop()
         else:
-            self._service.start()
+            try:
+                self._service.start()
+            except Exception as exc:  # noqa: BLE001 - surface startup failures
+                self.append_log_line(f"[SIP] 启动失败: {exc}")
+                self._sync_sip_button()
+                return
+        # Remember the service state so the next launch restores it: started =>
+        # auto-connect on launch, stopped => stay stopped ("记录上次状态").
+        self._save_auto_connect()
         self._sync_sip_button()
+
+    def _save_auto_connect(self) -> None:
+        settings = self._store.load()
+        settings.sip_auto_connect = self._service.running
+        self._store.save(settings)
 
     def _sync_sip_button(self) -> None:
         running = self._service.running
@@ -782,6 +827,38 @@ def _default_sip_backend() -> SipBackend:
         return FakeSipBackend()
 
 
+def maybe_auto_start_sip(
+    service: SipCoreService,
+    store: ConfigStore,
+    log: Callable[[str], None],
+) -> bool:
+    """Auto-connect the gateway on launch, restoring the last service state.
+
+    Starts the SIP service when the persisted ``sip_auto_connect`` flag is set
+    and the gateway config is complete (server + user). On an incomplete
+    config or a startup exception the service stays stopped and the flag is
+    persisted as False so the next launch doesn't retry the same failure.
+
+    Returns whether the service was (asked to be) started.
+    """
+    settings = store.load()
+    if not settings.sip_auto_connect:
+        return False
+    if not (settings.sip_server and settings.sip_user):
+        settings.sip_auto_connect = False
+        store.save(settings)
+        log("[SIP] 网关配置不完整，未自动连接；请先完成 SIP 账号设置")
+        return False
+    try:
+        service.start()
+    except Exception as exc:  # noqa: BLE001 - startup failures must not crash the app
+        settings.sip_auto_connect = False
+        store.save(settings)
+        log(f"[SIP] 自动连接网关失败: {exc}")
+        return False
+    return True
+
+
 def build_app(
     config_path: Path | None = None,
     audio_backend: AudioBackend | None = None,
@@ -796,7 +873,7 @@ def build_app(
     manager = AudioDeviceManager(audio_backend, store)
     tts = EdgeTtsBackend(ffmpeg_path=settings.ffmpeg_path)
     service = SipCoreService(sip_backend, store, tts=tts)
-    window = MainWindow(manager, service)
+    window = MainWindow(manager, service, store)
 
     logger = EventLogger(level=LogLevel[settings.log_level], sink=window.append_log_line)
     attach(logger, service, manager)
@@ -837,6 +914,10 @@ def build_app(
         window.hide()
     else:
         window.show()
+
+    # Restore the last service state: auto-connect the gateway on launch when
+    # the config is complete; a failed or incomplete auto-start stays stopped.
+    maybe_auto_start_sip(service, store, window.append_log_line)
 
     return app
 

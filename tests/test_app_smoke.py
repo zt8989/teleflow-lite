@@ -11,7 +11,7 @@ import pytest
 try:
     from PyQt6.QtWidgets import QApplication, QLabel  # noqa: F401
 
-    from teleflow.app import MainWindow, SettingsDialog
+    from teleflow.app import MainWindow, SettingsDialog, maybe_auto_start_sip
     from teleflow.audio import AudioDeviceManager, FakeAudioBackend
     from teleflow.config import ConfigStore
     from teleflow.logging import EventLogger, LogLevel, attach
@@ -46,12 +46,12 @@ def _make_window(tmp_path):
     store = ConfigStore(tmp_path / "config.json")
     manager = AudioDeviceManager(FakeAudioBackend(), store)
     service = SipCoreService(FakeSipBackend(), store)
-    window = MainWindow(manager, service)
-    return app, window, service, manager
+    window = MainWindow(manager, service, store)
+    return app, window, service, manager, store
 
 
 def test_window_populates_device_comboboxes(tmp_path) -> None:
-    app, window, _, _ = _make_window(tmp_path)
+    app, window, _, _, _ = _make_window(tmp_path)
     dash = window.dashboard
     playback_names = [
         dash._playback_cb.itemText(i)
@@ -63,14 +63,14 @@ def test_window_populates_device_comboboxes(tmp_path) -> None:
 
 
 def test_debug_preset_button_selects_headset(tmp_path) -> None:
-    app, window, _, manager = _make_window(tmp_path)
+    app, window, _, manager, _ = _make_window(tmp_path)
     window.dashboard._debug_btn.click()
     assert manager.current_selection() == ("hw:0,0", "hw:0,0")
     window.close()
 
 
 def test_status_panel_reflects_sip_events(tmp_path) -> None:
-    app, window, service, _ = _make_window(tmp_path)
+    app, window, service, _, _ = _make_window(tmp_path)
     sip = service._backend  # the scripted fake gateway
     dash = window.dashboard
 
@@ -84,14 +84,14 @@ def test_status_panel_reflects_sip_events(tmp_path) -> None:
 
 
 def test_log_view_tab_exists_and_appends(tmp_path) -> None:
-    app, window, _, _ = _make_window(tmp_path)
+    app, window, _, _, _ = _make_window(tmp_path)
     window.append_log_line("[INFO] hello")
     assert "[INFO] hello" in window.dashboard._log_view.toPlainText()
     window.close()
 
 
 def test_sip_events_appear_in_log_view(tmp_path) -> None:
-    app, window, service, manager = _make_window(tmp_path)
+    app, window, service, manager, _ = _make_window(tmp_path)
     logger = EventLogger(level=LogLevel.INFO, sink=window.append_log_line)
     attach(logger, service, manager)
 
@@ -102,7 +102,7 @@ def test_sip_events_appear_in_log_view(tmp_path) -> None:
 
 
 def test_close_to_tray_hides_window(tmp_path) -> None:
-    app, window, _, _ = _make_window(tmp_path)
+    app, window, _, _, _ = _make_window(tmp_path)
     window._tray = object()  # pretend a real tray is present
     event = _CloseEvent()
     window.closeEvent(event)
@@ -112,7 +112,7 @@ def test_close_to_tray_hides_window(tmp_path) -> None:
 
 
 def test_close_without_tray_quits(tmp_path) -> None:
-    app, window, _, _ = _make_window(tmp_path)
+    app, window, _, _, _ = _make_window(tmp_path)
     window._tray = None
     event = _CloseEvent()
     window.closeEvent(event)
@@ -128,7 +128,7 @@ def test_start_minimized_hides_window(tmp_path) -> None:
     store.save(settings)
     manager = AudioDeviceManager(FakeAudioBackend(), store)
     service = SipCoreService(FakeSipBackend(), store)
-    window = MainWindow(manager, service)
+    window = MainWindow(manager, service, store)
     if store.load().start_minimized:
         window.hide()
     assert window.isHidden() is True
@@ -136,7 +136,7 @@ def test_start_minimized_hides_window(tmp_path) -> None:
 
 
 def test_sip_registration_updates_dashboard_card(tmp_path) -> None:
-    app, window, service, _ = _make_window(tmp_path)
+    app, window, service, _, _ = _make_window(tmp_path)
     dash = window.dashboard
     sip = service._backend
     service.start()
@@ -153,7 +153,7 @@ def test_sip_registration_updates_dashboard_card(tmp_path) -> None:
 
 
 def test_settings_dialog_round_trips_sip_account(tmp_path) -> None:
-    app, window, service, manager = _make_window(tmp_path)
+    app, window, service, manager, _ = _make_window(tmp_path)
     dialog = SettingsDialog(manager, window)
     dialog.sip_server.setText("sip:provider.example.com:5060")
     dialog.sip_user.setText("2001")
@@ -165,3 +165,118 @@ def test_settings_dialog_round_trips_sip_account(tmp_path) -> None:
     assert reloaded.sip_user == "2001"
     assert reloaded.sip_password == "secret"
     window.close()
+
+
+# --- dashboard top menu shares the tray's actions (gateway-auto-connect) ---
+
+
+def test_dashboard_menu_uses_same_actions_as_tray(tmp_path) -> None:
+    app, window, _, _, _ = _make_window(tmp_path)
+    dash = window.dashboard
+    menu = dash._menu_btn.menu()
+    assert menu is not None
+    actions = menu.actions()
+    assert [a.text() for a in actions] == [
+        "启动 SIP 服务",
+        "显示窗口",
+        "设置",
+        "测试汇报",
+        "退出",
+    ]
+    # Same QAction instances as the tray menu -> labels/state stay in sync.
+    assert actions[0] is window._act_toggle_sip
+    assert actions[4] is window._act_quit
+    window.close()
+
+
+def test_toggle_sip_persists_auto_connect_flag(tmp_path) -> None:
+    app, window, service, _, store = _make_window(tmp_path)
+    store.load().sip_auto_connect = False
+    store.save(store.load())
+
+    window._toggle_sip()  # start
+    assert service.running
+    assert store.load().sip_auto_connect is True
+
+    window._toggle_sip()  # stop
+    assert not service.running
+    assert store.load().sip_auto_connect is False
+    window.close()
+
+
+# --- launch-time auto-connect (maybe_auto_start_sip) ---
+
+
+def test_auto_start_connects_when_config_complete(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr("teleflow.sip._udp_port_available", lambda port: True)
+    store = ConfigStore(tmp_path / "config.json")
+    settings = store.load()
+    settings.sip_server = "sip:192.168.1.189:5060"
+    settings.sip_user = "1002"
+    settings.sip_password = "1234"
+    store.save(settings)
+
+    service = SipCoreService(FakeSipBackend(), store)
+    log = []
+    started = maybe_auto_start_sip(service, store, log.append)
+
+    assert started is True
+    assert service.running
+    assert store.load().sip_auto_connect is True
+
+
+def test_auto_start_stays_stopped_on_incomplete_config(tmp_path) -> None:
+    store = ConfigStore(tmp_path / "config.json")
+    settings = store.load()
+    settings.sip_server = "sip:192.168.1.189:5060"  # no sip_user
+    store.save(settings)
+
+    service = SipCoreService(FakeSipBackend(), store)
+    log = []
+    started = maybe_auto_start_sip(service, store, log.append)
+
+    assert started is False
+    assert not service.running
+    assert store.load().sip_auto_connect is False
+    assert any("配置不完整" in line for line in log)
+
+
+def test_auto_start_falls_back_to_stopped_on_startup_error(
+    tmp_path, monkeypatch
+) -> None:
+    store = ConfigStore(tmp_path / "config.json")
+    settings = store.load()
+    settings.sip_server = "sip:192.168.1.189:5060"
+    settings.sip_user = "1002"
+    store.save(settings)
+
+    service = SipCoreService(FakeSipBackend(), store)
+
+    def _boom() -> None:
+        raise RuntimeError("no free port")
+
+    monkeypatch.setattr(service, "start", _boom)
+    log = []
+    started = maybe_auto_start_sip(service, store, log.append)
+
+    assert started is False
+    assert not service.running
+    assert store.load().sip_auto_connect is False
+    assert any("自动连接网关失败" in line for line in log)
+
+
+def test_auto_start_respects_disabled_flag(tmp_path) -> None:
+    store = ConfigStore(tmp_path / "config.json")
+    settings = store.load()
+    settings.sip_server = "sip:192.168.1.189:5060"
+    settings.sip_user = "1002"
+    settings.sip_auto_connect = False
+    store.save(settings)
+
+    service = SipCoreService(FakeSipBackend(), store)
+    started = maybe_auto_start_sip(service, store, lambda line: None)
+
+    assert started is False
+    assert not service.running

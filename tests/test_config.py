@@ -54,6 +54,15 @@ def test_sip_client_fields_default_on_fresh_file(tmp_path: Path) -> None:
     assert settings.sip_server == ""
     assert settings.sip_user == ""
     assert settings.sip_password == ""
+    assert settings.sip_auto_connect is True  # auto-connect gateway on launch
+
+
+def test_sip_auto_connect_round_trips(tmp_path: Path) -> None:
+    store = ConfigStore(tmp_path / "config.json")
+    store.save(Settings(sip_auto_connect=False))
+    assert store.load().sip_auto_connect is False
+    store.save(Settings(sip_auto_connect=True))
+    assert store.load().sip_auto_connect is True
 
 
 def test_old_file_without_new_fields_uses_defaults(tmp_path: Path) -> None:

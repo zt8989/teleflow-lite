@@ -37,6 +37,11 @@ class Settings:
     capture_device_id: str = ""
     autostart: bool = False
     start_minimized: bool = False
+    # Whether the app auto-connects to the gateway on launch (starts the SIP
+    # service). Persisted on every manual start/stop so the next launch
+    # restores the last service state; auto-launch falls back to stopped when
+    # the config is incomplete or startup fails.
+    sip_auto_connect: bool = True
     log_level: str = "INFO"
     # Hook commands (ticket 01/02): local shell commands run at call-lifecycle
     # moments, with {call_id} substituted. Empty means no hook.
