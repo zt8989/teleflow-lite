@@ -15,7 +15,7 @@ import pytest
 try:
     import pjsua2  # noqa: F401 - the native extension must be importable
     from teleflow.config import ConfigStore
-    from teleflow.pjsua2_backend import Pjsua2Backend
+    from teleflow.pjsua2_backend import Pjsua2Backend, _new_call_op
 
     _HAVE_PJSUA2 = True
 except ImportError:  # pragma: no cover - environment dependent
@@ -33,3 +33,45 @@ def test_real_backend_starts_stops_and_tolerates_no_device(tmp_path) -> None:
     assert backend.port == 5090
     backend.stop()
     assert backend.running is False
+
+
+def test_place_call_and_place_report_call_do_not_raise(tmp_path) -> None:
+    """Regression: pjsua2's Call.makeCall(dst_uri, prm) requires an explicit
+    CallOpParam; the outbound paths used to call makeCall(target) and blew up
+    with 'missing 1 required positional argument: prm' the moment a real call
+    was placed (report flow and manual outbound calls)."""
+    store = ConfigStore(tmp_path / "c.json")
+    backend = Pjsua2Backend(store)
+    backend.start(5090, lambda name, data: None)
+    wav = tmp_path / "report.wav"
+    wav.write_bytes(b"RIFF")
+    try:
+        backend.place_call("sip:1001@127.0.0.1:5099")
+        backend.place_report_call("sip:8000@127.0.0.1:5099", str(wav))
+    finally:
+        backend.stop()
+
+
+def test_new_call_op_requests_audio_only(tmp_path) -> None:
+    """Regression: pjsua2's default call setting adds a T.140 ``m=text`` SDP
+    line, which the NewRockTech ATA rejects with 415 (phone never rings).
+    Calls must use an op that requests audio only — and the setting must not
+    be "empty", or makeCall falls back to the default and re-adds the line.
+    Also regression: outbound calls keep a reference in backend._calls so the
+    wrapper is not GC'd mid-call ("Call 0 hanging up" right after makeCall)."""
+    import pjsua2 as pj
+
+    op = _new_call_op(pj)
+    assert op.opt.isEmpty() is False
+    assert op.opt.audioCount == 1
+    assert op.opt.textCount == 0
+    assert op.opt.videoCount == 0
+
+    store = ConfigStore(tmp_path / "c.json")
+    backend = Pjsua2Backend(store)
+    backend.start(5091, lambda name, data: None)
+    try:
+        backend.place_report_call("sip:8000@127.0.0.1:5099", "C:/nope.wav")
+        assert len(backend._calls) == 1  # wrapper kept alive, not GC'd
+    finally:
+        backend.stop()

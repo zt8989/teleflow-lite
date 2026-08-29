@@ -201,6 +201,25 @@ def _make_report_eof_callback(pj: Any, backend: "Pjsua2Backend", call_id: str) -
     return _ReportEofCallback()
 
 
+def _new_call_op(pj: Any) -> Any:
+    """Build a CallOpParam with the media settings every outbound/inbound call
+    needs.
+
+    pjsua2's CallSetting.isEmpty() is true when audio/video/text counts are
+    all zero, and makeCall() then falls back to the pjsua default setting —
+    which enables a T.140 text media (``m=text`` in the SDP). Cheap gateways
+    (e.g. the NewRockTech ATA) reject that offer with 415 Unsupported Media
+    Type and the phone never rings. Explicitly requesting 1 audio stream and
+    0 text streams keeps the setting non-empty and the text line out of the
+    SDP.
+    """
+    op = pj.CallOpParam()
+    op.opt.audioCount = 1
+    op.opt.textCount = 0
+    op.opt.videoCount = 0
+    return op
+
+
 class Pjsua2Backend:
     """Native SIP backend. Construction fails fast if pjsua2 is absent."""
 
@@ -311,7 +330,7 @@ class Pjsua2Backend:
         self._apply_route()
         call = self._calls.get(call_id)
         if call is not None:
-            op = self._pj.CallOpParam()
+            op = _new_call_op(self._pj)
             op.statusCode = 200
             call.answer(op)
 
@@ -324,19 +343,36 @@ class Pjsua2Backend:
         self._apply_route()
         assert self._call_cls is not None
         call = self._call_cls(self._account)
-        call.makeCall(target)
+        op = _new_call_op(self._pj)
+        call.makeCall(target, op)
+        # Keep a reference: pjsua2 hangs up a call whose Python wrapper is
+        # garbage-collected ("Call 0 hanging up" right after makeCall).
+        self._calls[str(call.getId())] = call
 
     def place_report_call(self, target: str, wav_path: str) -> None:  # pragma: no cover
         # Like place_call, but the Call instance is tagged as a report call so
         # onCallMediaState signals "report_connected" (instead of bridging) and
-        # the service plays the file into it on answer.
-        self._apply_route()
+        # the service plays the file into it on answer. A report call is
+        # one-way playback into the call; it must NOT touch the user's sound
+        # devices, so unlike a normal call we skip _apply_route() here (it
+        # would open the capture device and show "microphone in use").
         assert self._call_cls is not None
         call = self._call_cls(self._account)
         call._is_report = True
         call._report_file = wav_path
         call._report_connected_fired = False
-        call.makeCall(target)
+        op = _new_call_op(self._pj)
+        call.makeCall(target, op)
+        # Keep a reference (see place_call: GC of the wrapper hangs up the call).
+        self._calls[str(call.getId())] = call
+        # pjsua2 opens the sound devices while initialising the call's media;
+        # a report call only plays a file into the call and must not claim the
+        # microphone. Drop the capture device (playback is irrelevant here
+        # too; the next normal call's _apply_route restores the real device).
+        try:
+            self._ep.audDevManager().setCaptureDev(self._pj.PJSUA_SND_NULL_DEV)
+        except Exception:  # noqa: BLE001 - best-effort; the call still works
+            pass
 
     def play_file_to_call(self, call_id: str, wav_path: str) -> None:  # pragma: no cover
         # One-way playback: file -> call audio only. No capture device, no
