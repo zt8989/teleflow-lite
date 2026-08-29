@@ -446,6 +446,10 @@ class SettingsDialog(QDialog):
         self.sip_password = QLineEdit()
         self.sip_password.setEchoMode(QLineEdit.EchoMode.Password)
         al.addWidget(self.sip_password)
+        al.addWidget(
+            QLabel("提示：此为电话汇报的默认路由（走网关）。汇报页只填分机号即可，"
+                   "仅当配置了“座机地址”时才改走该地址。")
+        )
         al.addStretch()
 
         # --- Page: 钩子命令 ---
@@ -496,13 +500,13 @@ class SettingsDialog(QDialog):
         rp.addWidget(self.rpc_port)
         rp.addWidget(QLabel("RPC Token (Bearer，隐藏显示；留空自动生成):"))
         rp.addLayout(rpc_token_row)
-        rp.addWidget(QLabel("座机地址（域名或 IP，用于对外打电话）:"))
+        rp.addWidget(QLabel("座机地址（选填；留空则默认走网关）:"))
         rp.addWidget(self.report_host)
         report_port_row = QHBoxLayout()
         report_port_row.setSpacing(6)
-        report_port_row.addWidget(QLabel("座机端口:"))
+        report_port_row.addWidget(QLabel("座机端口（默认 5060）:"))
         report_port_row.addWidget(self.report_port)
-        report_port_row.addWidget(QLabel("座机分机号:"))
+        report_port_row.addWidget(QLabel("分机号（必填，对外拨打的号码）:"))
         report_port_row.addWidget(self.report_extension)
         report_port_row.addStretch()
         rp.addLayout(report_port_row)
