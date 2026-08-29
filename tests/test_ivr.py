@@ -318,3 +318,65 @@ def test_ivr_defers_playback_until_media_active(tmp_path: Path) -> None:
     service._dispatch("call_media_active", {"call_id": "C1"})
     assert len(backend.report_played) == 2
 
+
+class _HoldPlaybackBackend(FakeSipBackend):
+    """Fake whose one-way playback stays open until the test ends it.
+
+    The stock fake fires ``playback_done`` synchronously, so the menu always
+    drains before a key can arrive. The real pjsua2 backend keeps delivering
+    ``onDtmfDigit`` while a file plays, so a key *can* arrive mid-announcement;
+    this fake models that by never auto-ending a play.
+    """
+
+    def play_file_to_call(self, call_id: str, wav_path: str, *, hangup_on_eof: bool = False) -> bool:
+        self.report_played.append((call_id, wav_path))
+        return True
+
+
+def test_ivr_digit_during_playback_fires_immediately(tmp_path: Path) -> None:
+    # Regression: a DTMF key pressed while a prompt is still announcing must be
+    # honoured at once (barge-in) instead of being dropped until the whole menu
+    # finishes playing.
+    settings = Settings(ivr_enabled=True, ivr_welcome="欢迎", ivr_digit_text={"1": "菜单一"})
+    store = ConfigStore(tmp_path / "c.json")
+    store.save(settings)
+    backend = _HoldPlaybackBackend()
+    service = SipCoreService(backend, store, tts=FakeTtsBackend())
+    service.start()
+
+    received: list[tuple[str, str]] = []
+    service.on(EVENT_IVR_DIGIT, lambda call_id, digit: received.append((call_id, digit)))
+
+    backend.receive_invite("C1")  # welcome starts announcing and stays open
+    assert len(backend.report_played) == 1
+    assert service._ivr_listening is False  # still mid-announcement
+
+    backend.receive_dtmf("C1", "1")  # pressed while the welcome is still playing
+
+    assert received == [("C1", "1")]
+    assert service._ivr_queue == []  # remaining menu items canceled
+    assert backend.stopped_playback == ["C1"]  # current prompt stopped
+    assert len(backend.report_played) == 1  # menu tail never played afterwards
+
+    backend.receive_dtmf("C1", "2")  # still first-key-only
+    backend.receive_bye("C1")
+    assert received == [("C1", "1")]
+
+
+def test_ivr_digit_during_playback_no_auto_eof_chain(tmp_path: Path) -> None:
+    # After a barge-in key, a late playback_done from the canceled prompt must
+    # not advance the (now empty) menu chain or start any further playback.
+    settings = Settings(ivr_enabled=True, ivr_digit_text={"1": "菜单一"})
+    store = ConfigStore(tmp_path / "c.json")
+    store.save(settings)
+    backend = _HoldPlaybackBackend()
+    service = SipCoreService(backend, store, tts=FakeTtsBackend())
+    service.start()
+
+    backend.receive_invite("C1")  # "1" prompt announcing
+    backend.receive_dtmf("C1", "1")  # barge-in: queue canceled, playback stopped
+    assert len(backend.report_played) == 1
+
+    backend.receive_playback_done("C1")  # stray EOF from the stopped player
+    assert len(backend.report_played) == 1
+

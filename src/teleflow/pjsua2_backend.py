@@ -490,6 +490,32 @@ class Pjsua2Backend:
         self._report_players[call_id] = player
         return True
 
+    def stop_playback(self, call_id: str) -> None:  # pragma: no cover
+        """Stop an in-flight one-way playback into ``call_id`` (IVR barge-in:
+        a key pressed while a prompt is still announcing cancels it).
+
+        Releases the transmit to the call audio and destroys the player so the
+        tail of the menu can't keep talking over the caller's choice. Mirrors
+        the order ``onEof2`` already uses (stop the transmit before destroying
+        the player), so no EOF event is fired afterwards. No-op when no player
+        is active for the call.
+        """
+        player = self._report_players.pop(call_id, None)
+        if player is None:
+            return
+        sink = getattr(player, "_sink", None)
+        if sink is not None:
+            try:
+                player.stopTransmit(sink)
+            except Exception:  # noqa: BLE001 - best-effort
+                pass
+        destroy = getattr(player, "destroyPlayer", None)
+        if destroy is not None:
+            try:
+                destroy()
+            except Exception:  # noqa: BLE001 - best-effort
+                pass
+
     def reroute(self) -> None:  # pragma: no cover
         """Re-apply the current device selection to a live call (mid-call switch)."""
         self._apply_route()

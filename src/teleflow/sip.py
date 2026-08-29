@@ -99,6 +99,12 @@ class SipBackend(Protocol):
         """
         ...
 
+    def stop_playback(self, call_id: str) -> None:
+        """Stop an in-flight one-way playback into ``call_id`` (IVR barge-in:
+        a key pressed while a prompt is still announcing cancels it). Safe to
+        call when nothing is playing for that call."""
+        ...
+
     def reroute(self) -> None:
         """Re-apply the current device selection to a live call (mid-call switch)."""
         ...
@@ -225,6 +231,7 @@ class FakeSipBackend:
         self.rerouted: list[str] = []
         self.report_calls: list[tuple[str, str]] = []
         self.report_played: list[tuple[str, str]] = []
+        self.stopped_playback: list[str] = []
         self.device_change_callbacks: list[Callable[[], None]] = []
 
     def start(self, port: int, handler: Callable[[str, dict], None]) -> None:
@@ -282,6 +289,9 @@ class FakeSipBackend:
             self._fire("playback_done", call_id=call_id)
         return True
 
+    def stop_playback(self, call_id: str) -> None:
+        self.stopped_playback.append(call_id)
+
     def receive_report_connected(self, call_id: str) -> None:
         """Simulate the desk phone answering the report call (test hook)."""
         self._fire("report_connected", call_id=call_id)
@@ -289,6 +299,12 @@ class FakeSipBackend:
     def receive_report_playback_done(self, call_id: str) -> None:
         """Simulate playback EOF for the report call (test hook)."""
         self._fire("report_eof", call_id=call_id)
+
+    def receive_playback_done(self, call_id: str) -> None:
+        """Simulate an IVR menu item's playback EOF (test hook). The stock fake
+        fires this synchronously inside play_file_to_call; a holding fake uses
+        this to end an item explicitly."""
+        self._fire("playback_done", call_id=call_id)
 
     def receive_dtmf(self, call_id: str, digit: str) -> None:
         """Simulate an inbound DTMF key press (test hook)."""
@@ -571,8 +587,11 @@ class SipCoreService:
     # Inbound IVR flow (feature teleflow-call-ivr).
     # After auto-answer (ivr_enabled): synthesize + queue the welcome message
     # and each digit's menu text (empty texts skipped), play them one by one,
-    # then listen for the first DTMF key to fire EVENT_IVR_DIGIT and stop
-    # listening. {last_digit} is surfaced on CALL_ENDED for the on-hook hook.
+    # then act on the first DTMF key. Keys are honoured at any time (barge-in):
+    # a key pressed while a prompt is still announcing cancels the remaining
+    # queue and the current playback, fires EVENT_IVR_DIGIT, and stops
+    # listening for further keys. {last_digit} is surfaced on CALL_ENDED for
+    # the on-hook hook.
     # ------------------------------------------------------------------
     def _build_ivr_digit_queue(self, settings: Settings) -> list[str]:
         """Synthesize the per-digit menu prompts in 1~9~0 order (empty text
@@ -620,9 +639,10 @@ class SipCoreService:
         if not self._ivr_active or self._ivr_call_id is None:
             return
         if not self._ivr_queue:
-            # Menu finished: start listening for the first DTMF key.
+            # Menu queue drained. Keys are honoured at any time (see _on_dtmf),
+            # so this flag is informational here.
             self._ivr_listening = True
-            self._log_line(f"[IVR] 菜单播报完成, 开始监听按键 (call {self._ivr_call_id})")
+            self._log_line(f"[IVR] 菜单播报完成 (call {self._ivr_call_id})")
             return
         # Pop the front item. The fake backend starts playback and fires
         # playback_done synchronously, so on success the chain advances to the
@@ -643,13 +663,15 @@ class SipCoreService:
         self._ivr_play_next()
 
     def _on_call_media_active(self, call_id: str) -> None:
-        # The real backend signals this once an inbound call's audio media is up.
-        # IVR playback may have been attempted (and failed) at answer time; retry
-        # the front of the queue now. Only triggers once — once anything has
-        # started playing, the playback_done chain owns the rest.
+        # The real backend signals this once an inbound call's audio media is
+        # up. IVR playback may have been attempted (and failed) at answer time;
+        # retry the front of the queue now. Only triggers once — once anything
+        # has started playing the playback_done chain owns the rest, and once a
+        # key has fired (barge-in canceled the queue) the menu must not be
+        # resurrected by a late media-active event.
         if not self._ivr_active or call_id != self._ivr_call_id:
             return
-        if self._ivr_started:
+        if self._ivr_started or self._ivr_digit_fired:
             return
         self._ivr_play_next()
 
@@ -716,11 +738,17 @@ class SipCoreService:
     def _on_dtmf(self, call_id: str, digit: str) -> None:
         if not self._ivr_active or call_id != self._ivr_call_id:
             return
-        if self._ivr_digit_fired or not self._ivr_listening:
+        if self._ivr_digit_fired:
             return
         self._ivr_digit_fired = True
         self._ivr_listening = False
         self._last_digit = digit
+        if self._ivr_queue:
+            # Barge-in: a key pressed while the menu is still announcing wins
+            # over the remaining prompts. Cancel the queue and stop the current
+            # playback so the caller's choice isn't drowned out by the menu tail.
+            self._ivr_queue = []
+            self._backend.stop_playback(call_id)
         self._log_line(f"[IVR] 收到按键 {digit} (call {call_id})")
         # Every digit fires its per-digit hook; the call stays bridged two-way
         # (the mic is never suppressed during IVR), so the AI side can talk back
