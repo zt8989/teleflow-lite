@@ -116,6 +116,16 @@ class SipBackend(Protocol):
         """Re-apply the current device selection to a live call (mid-call switch)."""
         ...
 
+    def mark_ivr(self, call_id: str) -> None:
+        """Tag an inbound call as IVR: suppress the mic bridge during the menu
+        announcement (one-way, like a report call) so there is no echo."""
+        ...
+
+    def unmark_ivr(self, call_id: str) -> None:
+        """Untag an IVR call and restore its two-way bridge (called when the
+        configured bridge/exit digit is pressed)."""
+        ...
+
     def set_device_change_callback(self, cb: Callable[[], None]) -> None:
         """Register a callback fired when audio devices are hot-plugged."""
         ...
@@ -239,6 +249,8 @@ class FakeSipBackend:
         self.report_calls: list[tuple[str, str]] = []
         self.report_played: list[tuple[str, str]] = []
         self.stopped_playback: list[str] = []
+        self.ivr_marked: list[str] = []
+        self.ivr_unmarked: list[str] = []
         self.device_change_callbacks: list[Callable[[], None]] = []
 
     def start(self, port: int, handler: Callable[[str, dict], None]) -> None:
@@ -298,6 +310,15 @@ class FakeSipBackend:
 
     def stop_playback(self, call_id: str) -> None:
         self.stopped_playback.append(call_id)
+
+    def mark_ivr(self, call_id: str) -> None:
+        # Scripted fake has no live bridge to suppress; record the call so the
+        # service's one-way-announcement logic is exercised and tests can assert.
+        self.ivr_marked.append(call_id)
+
+    def unmark_ivr(self, call_id: str) -> None:
+        # No real bridge to restore in the scripted fake; record it.
+        self.ivr_unmarked.append(call_id)
 
     def receive_report_connected(self, call_id: str) -> None:
         """Simulate the desk phone answering the report call (test hook)."""
@@ -679,6 +700,10 @@ class SipCoreService:
         settings = self._store.load()
         if not settings.ivr_enabled or self._tts is None:
             return
+        # Mark the call one-way for the announcement: the backend suppresses the
+        # mic bridge (like a report call) so the menu can't echo. The bridge is
+        # restored only when the configured bridge/exit digit is later pressed.
+        self._backend.mark_ivr(call_id)
         self._ivr_begin(call_id, self._ivr_prompts(settings), settings.tts_voice)
 
     def _ivr_begin(self, call_id: str, prompts: list[str], voice: str) -> None:
@@ -858,10 +883,43 @@ class SipCoreService:
             self._ivr_playing = False
             self._backend.stop_playback(call_id)
         self._log_line(f"[IVR] 收到按键 {digit} (call {call_id})")
-        # Every digit fires its per-digit hook; the call stays bridged two-way
-        # (the mic is never suppressed during IVR), so the AI side can talk back
-        # or barge in at any time. IVR menu mode ends only when the call hangs up.
+        # If this is the configured bridge/exit digit, leave the IVR menu and
+        # restore the call's two-way bridge so the AI side can hear the user
+        # (e.g. start Vibe Coding). Bridge BEFORE emitting the digit event so
+        # the per-digit hook (e.g. Ctrl+D connect) runs on a two-way call. Only
+        # when a non-empty exit digit is configured; otherwise the call stays
+        # one-way for its whole duration.
+        exit_digit = self._store.load().ivr_exit_digit.strip()
+        if exit_digit and digit == exit_digit:
+            self._exit_ivr_to_call(call_id)
+        # Every digit fires its per-digit hook. The call stays one-way (mic
+        # suppressed) unless this was the bridge/exit digit above, in which case
+        # it is now two-way. IVR menu mode otherwise ends only on hang-up.
         self._emit(EVENT_IVR_DIGIT, call_id=call_id, digit=digit)
+
+    def _exit_ivr_to_call(self, call_id: str) -> None:
+        """Leave IVR menu mode and restore the call's two-way bridge.
+
+        Called when the configured bridge/exit digit is pressed: the caller
+        wanted a real conversation (e.g. start Vibe Coding), so the previously
+        one-way announcement call is re-bridged to the user's sound devices so
+        the AI side can hear the user. The call stays CONNECTED; we only reset
+        the IVR menu bookkeeping and hand the bridge back to the backend.
+        ``_last_digit``, ``_state`` and ``_active_call_id`` are intentionally
+        left intact so the on-hook hook (with {last_digit}) still fires
+        correctly on hang-up.
+        """
+        self._ivr_active = False
+        self._ivr_call_id = None
+        self._ivr_queue = []
+        self._ivr_slots = []
+        self._ivr_next = 0
+        self._ivr_total = 0
+        self._ivr_playing = False
+        self._ivr_listening = False
+        self._ivr_digit_fired = False
+        self._ivr_started = False
+        self._backend.unmark_ivr(call_id)
 
     def _reset_ivr(self) -> None:
         self._ivr_active = False

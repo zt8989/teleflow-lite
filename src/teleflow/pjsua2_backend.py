@@ -189,30 +189,27 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
                             "report_connected", {"call_id": str(info.id)}
                         )
                     return
-            # Inbound calls (incl. IVR) are always bridged two-way. Tell the
-            # service the media is active so it can (re)start IVR playback; a
-            # plain call ignores that event, so firing it here is harmless.
-            if backend._handler is not None:
-                backend._handler("call_media_active", {"call_id": str(info.id)})
-            # Bridge the call's audio to the selected devices through the
-            # conference bridge: downstream call -> playback device, upstream
-            # capture device -> call. No recorder / transform.
-                call_audio = self.getAudioMedia(media.index)
-                dev_mgr = backend._ep.audDevManager()
-                # Downstream: decoded call audio -> selected playback device.
-                call_audio.startTransmit(dev_mgr.getPlaybackDevMedia())
-                # Upstream: selected capture device -> call audio (to telephone).
-                # Only when a capture device is actually selected — an empty
-                # capture id is one-way (downstream only), matching MicroSIP, so
-                # we must NOT open a capture endpoint or the OS microphone prompt
-                # fires and we'd transmit silence back. Re-apply the capture
-                # device here so a preceding report call's null-sink selection
-                # does not leak into this normal call.
-                cap = backend._store.load().capture_device_id
-                bridge = backend._bridge
-                if capture_device_selected(cap) and bridge is not None:
-                    bridge.apply_capture(cap)
-                    dev_mgr.getCaptureDevMedia().startTransmit(call_audio)
+                # An IVR call is announced one-way (file -> call) by the service;
+                # the mic is suppressed (no bridge) so the menu can't echo. Tell
+                # the service the media is active so it can (re)start playback;
+                # a plain call ignores that event, so firing it is harmless.
+                if getattr(self, "_is_ivr", False):
+                    if backend._handler is not None:
+                        backend._handler(
+                            "call_media_active", {"call_id": str(info.id)}
+                        )
+                    return
+                # Normal inbound call (or an IVR call whose bridge was restored
+                # by unmark_ivr): bridge two-way. Tell the service the media is
+                # active so it can (re)start IVR playback; a plain call ignores
+                # that event, so firing it is harmless.
+                if backend._handler is not None:
+                    backend._handler(
+                        "call_media_active", {"call_id": str(info.id)}
+                    )
+                _bridge_two_way(backend, self, media.index)
+                # A pjsua2 call has a single audio stream; bridge it once.
+                return
 
         def onDtmfDigit(self, prm: Any) -> None:  # noqa: ARG002 - pjsua2 callback signature
             # Forward an inbound DTMF keypress to the service so the IVR can act
@@ -349,6 +346,25 @@ def _make_report_player(pj: Any, backend: "Pjsua2Backend", call_id: str, *, hang
 def _release_report_player(backend: "Pjsua2Backend", call_id: str) -> None:  # pragma: no cover
     """Drop our reference to a report player once its call is gone."""
     backend._report_players.pop(call_id, None)
+
+
+def _bridge_two_way(backend: "Pjsua2Backend", call: Any, media_index: int) -> None:  # pragma: no cover
+    """Connect a call's active audio media to the user's sound devices through
+    pjsua2's conference bridge: downstream call -> playback device, upstream
+    capture device -> call. No recorder / transform is inserted."""
+    call_audio = call.getAudioMedia(media_index)
+    dev_mgr = backend._ep.audDevManager()
+    # Downstream: decoded call audio -> selected playback device.
+    call_audio.startTransmit(dev_mgr.getPlaybackDevMedia())
+    # Upstream: selected capture device -> call audio (to telephone). Only when a
+    # capture device is actually selected — an empty capture id is one-way
+    # (downstream only), matching MicroSIP, so we must NOT open a capture
+    # endpoint or the OS microphone prompt fires and we'd transmit silence back.
+    cap = backend._store.load().capture_device_id
+    bridge = backend._bridge
+    if capture_device_selected(cap) and bridge is not None:
+        bridge.apply_capture(cap)
+        dev_mgr.getCaptureDevMedia().startTransmit(call_audio)
 
 
 def _new_call_op(pj: Any) -> Any:
@@ -627,6 +643,41 @@ class Pjsua2Backend:
                 destroy()
             except Exception:  # noqa: BLE001 - best-effort
                 pass
+
+    def mark_ivr(self, call_id: str) -> None:  # pragma: no cover
+        # Tag an inbound call as IVR: suppress the mic bridge during the menu
+        # announcement (one-way, like a report call) so there is no echo. Pin the
+        # capture device to the null sink so this call never opens the real
+        # microphone or bridges it to the call, even if a later route change or
+        # reroute would otherwise open the configured capture device.
+        call = self._calls.get(call_id)
+        if call is None:
+            return
+        call._is_ivr = True
+        try:
+            self._ep.audDevManager().setCaptureDev(self._pj.PJSUA_SND_NULL_DEV)
+        except Exception:  # noqa: BLE001 - best-effort; call still works one-way
+            pass
+
+    def unmark_ivr(self, call_id: str) -> None:  # pragma: no cover
+        # Restore the call's two-way bridge: the configured bridge/exit digit was
+        # pressed. Re-apply the user's real device route and connect the call to
+        # the sound devices through the conference bridge.
+        call = self._calls.get(call_id)
+        if call is None:
+            return
+        call._is_ivr = False
+        # Restore the real device route (the configured capture device, not the
+        # null sink mark_ivr pinned) before bridging.
+        self._apply_route()
+        info = call.getInfo()
+        for media in info.media:
+            if (
+                media.type == self._pj.PJMEDIA_TYPE_AUDIO
+                and media.status == self._pj.PJSUA_CALL_MEDIA_ACTIVE
+            ):
+                _bridge_two_way(self, call, media.index)
+                break
 
     def reroute(self) -> None:  # pragma: no cover
         """Re-apply the current device selection to a live call (mid-call switch)."""

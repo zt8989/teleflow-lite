@@ -102,8 +102,9 @@ def test_ivr_only_first_digit_triggers(tmp_path: Path) -> None:
     digit_calls = [(c, ctx) for (c, ctx) in recorder.calls if c]
     assert ("k1 {digit}", {"call_id": "C1", "digit": "1"}) in digit_calls
     assert ("k2 {digit}", {"call_id": "C1", "digit": "2"}) not in digit_calls
-    # The IVR call is always bridged two-way, so there is no "exit" gate: the
-    # on-hook command fires on every hang-up, carrying the last pressed digit.
+    # The on-hook command fires on every hang-up regardless of which digit was
+    # pressed (the bridge/exit key only decides whether the call is two-way, not
+    # whether the on-hook hook runs), carrying the last pressed digit.
     on_hook_ctx = [ctx for (_c, ctx) in recorder.calls if "last_digit" in ctx]
     assert on_hook_ctx == [{"call_id": "C1", "last_digit": "1"}]
 
@@ -123,9 +124,9 @@ def test_ivr_per_digit_hook_empty_skips(tmp_path: Path) -> None:
 
 
 def test_on_hook_fires_on_every_hangup_with_last_digit(tmp_path: Path) -> None:
-    # Regression: with the IVR call always bridged two-way there is no "exit"
-    # gate, so the on-hook command must fire on every hang-up, carrying the last
-    # IVR digit pressed (or "" if none was pressed).
+    # Regression: the on-hook command must fire on every hang-up, carrying the
+    # last IVR digit pressed (or "" if none was pressed) — the bridge/exit key
+    # only affects whether the call is two-way, not whether on-hook runs.
     settings = Settings(ivr_enabled=True, off_hook_cmd="", on_hook_cmd="STOP_HOOK")
     service, backend, tts = _build(tmp_path, settings)
     recorder = _RecordingHookRunner()
@@ -246,6 +247,88 @@ def test_replay_ivr_menu_rejects_inactive_call(tmp_path: Path) -> None:
         assert False, "expected NoActiveCallError after BYE"
     except NoActiveCallError:
         pass
+
+
+def test_ivr_invite_marks_call_one_way(tmp_path: Path) -> None:
+    # Regression: while the menu is announced the inbound call must be tagged
+    # one-way (mic suppressed) so the announcement can't echo. The fake backend
+    # records the mark.
+    settings = Settings(ivr_enabled=True, ivr_welcome="欢迎")
+    service, backend, tts = _build(tmp_path, settings)
+    backend.receive_invite("C1")  # starts IVR
+    assert backend.ivr_marked == ["C1"]
+
+
+def test_pressing_exit_digit_unmarks_and_bridges_two_way(tmp_path: Path) -> None:
+    # Pressing the configured bridge/exit digit (default "0") exits the IVR menu
+    # and restores the two-way bridge: the call stays CONNECTED, the per-digit
+    # hook still fires, and the backend is told to unmark the one-way IVR call.
+    settings = Settings(
+        ivr_enabled=True,
+        ivr_welcome="欢迎",
+        ivr_exit_digit="0",
+        ivr_digit_hook={"0": "CONNECT {digit}"},
+    )
+    service, backend, tts = _build(tmp_path, settings)
+    recorder = _RecordingHookRunner()
+    attach_hooks(service, recorder, ConfigStore(tmp_path / "c.json"))
+
+    received: list[tuple[str, str]] = []
+    service.on(EVENT_IVR_DIGIT, lambda call_id, digit: received.append((call_id, digit)))
+
+    backend.receive_invite("C1")  # one-way announcement
+    assert backend.ivr_marked == ["C1"]
+    backend.receive_dtmf("C1", "0")  # bridge/exit key
+
+    # Call is re-bridged two-way (unmarked), but still connected.
+    assert backend.ivr_unmarked == ["C1"]
+    assert service._ivr_active is False
+    assert service.active_call_id == "C1"
+    # Per-digit hook still fired for key "0".
+    assert received == [("C1", "0")]
+    assert ("CONNECT {digit}", {"call_id": "C1", "digit": "0"}) in recorder.calls
+
+
+def test_pressing_non_exit_digit_stays_one_way(tmp_path: Path) -> None:
+    # Pressing a digit that is NOT the bridge/exit key fires its hook but keeps
+    # the call one-way (mic suppressed); the bridge is never restored.
+    settings = Settings(
+        ivr_enabled=True,
+        ivr_welcome="欢迎",
+        ivr_exit_digit="0",
+        ivr_digit_hook={"1": "WEATHER {digit}"},
+    )
+    service, backend, tts = _build(tmp_path, settings)
+    received: list[tuple[str, str]] = []
+    service.on(EVENT_IVR_DIGIT, lambda call_id, digit: received.append((call_id, digit)))
+
+    backend.receive_invite("C1")
+    backend.receive_dtmf("C1", "1")  # non-exit key
+
+    assert backend.ivr_unmarked == []  # never bridged
+    assert service._ivr_active is True  # IVR menu mode still alive (can replay)
+    assert received == [("C1", "1")]
+
+
+def test_empty_exit_digit_never_bridges(tmp_path: Path) -> None:
+    # With ivr_exit_digit cleared, no key bridges: the call stays one-way for
+    # its whole duration even if "0" (the would-be default) is pressed.
+    settings = Settings(
+        ivr_enabled=True,
+        ivr_welcome="欢迎",
+        ivr_exit_digit="",
+        ivr_digit_hook={"0": "CONNECT {digit}"},
+    )
+    service, backend, tts = _build(tmp_path, settings)
+    received: list[tuple[str, str]] = []
+    service.on(EVENT_IVR_DIGIT, lambda call_id, digit: received.append((call_id, digit)))
+
+    backend.receive_invite("C1")
+    backend.receive_dtmf("C1", "0")
+
+    assert backend.ivr_unmarked == []  # never bridged
+    assert service._ivr_active is True
+    assert received == [("C1", "0")]
 
 
 def test_play_to_call_surfaces_failed_start(tmp_path: Path) -> None:

@@ -506,25 +506,36 @@ class SettingsDialog(QDialog):
         ivl.addWidget(self.ivr_welcome)
         ivl.addWidget(
             QLabel("每个数字键（1-9-0）的播报词与命令：播报词留空则该键不播报，"
-                   "命令留空则该键被按下时不执行。通话始终双向桥接，AI 侧可随时插话或打断。")
+                   "命令留空则该键被按下时不执行。播报期间通话为单向（防回音，与汇报一致）；"
+                   "勾选某键为“桥接键”后，按下该键将退出菜单并切换为双向桥接（AI 侧可插话/打断），默认 0 键。")
         )
         digit_grid = QGridLayout()
         digit_grid.setSpacing(4)
         digit_grid.addWidget(QLabel("键"), 0, 0)
         digit_grid.addWidget(QLabel("播报词"), 0, 1)
         digit_grid.addWidget(QLabel("命令"), 0, 2)
+        digit_grid.addWidget(QLabel("桥接↔双向"), 0, 3)
         self.ivr_digit_text_edits: dict[str, QLineEdit] = {}
         self.ivr_digit_hook_edits: dict[str, QLineEdit] = {}
+        self.ivr_exit_checkboxes: dict[str, QCheckBox] = {}
         for row, digit in enumerate("1234567890", start=1):
             digit_grid.addWidget(QLabel(digit), row, 0)
             text_edit = QLineEdit()
             text_edit.setPlaceholderText("播报词（留空跳过）")
             hook_edit = QLineEdit()
             hook_edit.setPlaceholderText("命令（留空不执行）")
+            exit_cb = QCheckBox()
+            exit_cb.setToolTip("按下该键后退出菜单并切换为双向桥接")
+            # Single-select: checking one bridge key unchecks the others.
+            exit_cb.toggled.connect(
+                lambda checked, d=digit: self._on_exit_digit_toggled(d, checked)
+            )
             digit_grid.addWidget(text_edit, row, 1)
             digit_grid.addWidget(hook_edit, row, 2)
+            digit_grid.addWidget(exit_cb, row, 3)
             self.ivr_digit_text_edits[digit] = text_edit
             self.ivr_digit_hook_edits[digit] = hook_edit
+            self.ivr_exit_checkboxes[digit] = exit_cb
         ivl.addLayout(digit_grid)
         ivl.addStretch()
 
@@ -671,6 +682,8 @@ class SettingsDialog(QDialog):
             edit.setText(settings.ivr_digit_text.get(digit, ""))
         for digit, edit in self.ivr_digit_hook_edits.items():
             edit.setText(settings.ivr_digit_hook.get(digit, ""))
+        for digit, cb in self.ivr_exit_checkboxes.items():
+            cb.setChecked(digit == settings.ivr_exit_digit)
         self.rpc_enabled.setChecked(settings.rpc_enabled)
         self.rpc_port.setValue(settings.rpc_port)
         self.rpc_token.setText(settings.rpc_token)
@@ -705,6 +718,13 @@ class SettingsDialog(QDialog):
         settings.ivr_digit_hook = {
             d: v for d, e in self.ivr_digit_hook_edits.items() if (v := e.text().strip())
         }
+        # Single bridge/exit digit (at most one row checked); "" = no key bridges.
+        exit_digit = ""
+        for digit, cb in self.ivr_exit_checkboxes.items():
+            if cb.isChecked():
+                exit_digit = digit
+                break
+        settings.ivr_exit_digit = exit_digit
         settings.rpc_enabled = self.rpc_enabled.isChecked()
         settings.rpc_port = self.rpc_port.value()
         settings.rpc_token = self.rpc_token.text().strip()
@@ -722,6 +742,19 @@ class SettingsDialog(QDialog):
         settings.start_minimized = self.start_minimized.isChecked()
         self._store.save(settings)
         self.accept()
+
+    def _on_exit_digit_toggled(self, digit: str, checked: bool) -> None:
+        """Single-select the bridge/exit digit: checking one row clears the rest.
+
+        A checked row means "pressing this key exits the IVR menu and bridges the
+        call two-way"; at most one key can be the bridge key (stored in
+        ``ivr_exit_digit``). Unchecking the only checked row leaves no bridge key.
+        """
+        if not checked:
+            return
+        for other, cb in self.ivr_exit_checkboxes.items():
+            if other != digit:
+                cb.setChecked(False)
 
     def _on_tts_voice_changed(self, idx: int) -> None:
         """Show the custom voice-ID field only while the '自定义…' entry is selected."""

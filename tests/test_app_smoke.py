@@ -174,11 +174,15 @@ def test_settings_dialog_ivr_digit_edits_round_trip(tmp_path) -> None:
     dialog = SettingsDialog(manager, window)
     dialog.ivr_digit_text_edits["1"].setText("菜单一")
     dialog.ivr_digit_hook_edits["1"].setText("hook1 {digit}")
+    # Select "2" as the bridge/exit key (single-select); this also unchecks the
+    # default "0" that _load_settings ticked.
+    dialog.ivr_exit_checkboxes["2"].setChecked(True)
     dialog._save_and_close()
 
     reloaded = ConfigStore(tmp_path / "config.json").load()
     assert reloaded.ivr_digit_text == {"1": "菜单一"}
     assert reloaded.ivr_digit_hook == {"1": "hook1 {digit}"}
+    assert reloaded.ivr_exit_digit == "2"
     window.close()
 
 

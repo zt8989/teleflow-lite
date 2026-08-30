@@ -96,6 +96,12 @@ class Settings:
     ivr_welcome: str = ""
     ivr_digit_text: dict[str, str] = field(default_factory=dict)
     ivr_digit_hook: dict[str, str] = field(default_factory=dict)
+    # Inbound IVR: the digit that, when pressed, exits the menu and bridges the
+    # call two-way so the AI side can hear the user (e.g. start Vibe Coding).
+    # During the menu announcement the call is one-way (no mic) to avoid echo,
+    # like a phone-report call; only this key opens the uplink. Empty => no key
+    # bridges, so the call stays one-way for its whole duration. Default "0".
+    ivr_exit_digit: str = "0"
     # Phone-report RPC (feature teleflow-phone-report). TeleFlow can be told by an
     # external hook to dial the desk phone and play a report; these persist that
     # control channel + synthesis settings.

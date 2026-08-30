@@ -191,9 +191,9 @@ def test_on_hook_fires_on_call_ended_when_last_digit_zero(tmp_path: Path) -> Non
 
 
 def test_on_hook_fires_on_every_hangup(tmp_path: Path) -> None:
-    # The IVR call is always bridged two-way, so the on-hook command fires on
-    # every hang-up (no exit-digit gate). The last digit pressed is carried in
-    # the context.
+    # The on-hook command fires on every hang-up (the bridge/exit key only
+    # decides whether the call is two-way, not whether on-hook runs). The last
+    # digit pressed is carried in the context.
     store = ConfigStore(tmp_path / "c.json")
     settings = store.load()
     settings.ivr_enabled = True
