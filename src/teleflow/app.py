@@ -80,8 +80,24 @@ from teleflow.sip import (
     SipBackend,
     SipCoreService,
 )
+from teleflow.i18n import register_on_change, set_language, tr
 from teleflow.rpc import RpcServer
 from teleflow.tts import CachingTtsBackend, EdgeTtsBackend
+
+# Maps the built-in TTS voice display names (config.BUILTIN_TTS_VOICES) to i18n
+# keys so the voice dropdown labels follow the UI language.
+_TTS_VOICE_KEYS: dict[str, str] = {
+    "晓晓（女）": "tts.voice.xiaoxiao",
+    "云希（男）": "tts.voice.yunxi",
+    "云扬（男·新闻）": "tts.voice.yunyang",
+    "晓伊（女·川渝）": "tts.voice.xiaoyi",
+    "云健（男）": "tts.voice.yunjian",
+    "晓辰（女）": "tts.voice.xiaochen",
+    "云霞（女）": "tts.voice.yunxia",
+    "云野（男）": "tts.voice.yunye",
+    "Aria（en-US 女）": "tts.voice.aria",
+    "Guy（en-US 男）": "tts.voice.guy",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +159,9 @@ class DashboardWidget(QWidget):
         self._manager = manager
         self._sip_running = False
         self._call_state: CallState = CallState.IDLE
-        self._mode = "生产模式"
+        self._report_state: ReportState = ReportState.IDLE
+        self._reg_status: tuple[str, int | None] = ("unregistered", None)
+        self._mode_key = "dash.mode.production"
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -153,7 +171,7 @@ class DashboardWidget(QWidget):
         # (populated by MainWindow via set_service_menu with shared QActions).
         top_row = QHBoxLayout()
         self._menu_btn = QToolButton()
-        self._menu_btn.setText("菜单")
+        self._menu_btn.setText(tr("dash.menu"))
         self._menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._menu_btn.setArrowType(Qt.ArrowType.DownArrow)
         top_row.addWidget(self._menu_btn)
@@ -163,10 +181,10 @@ class DashboardWidget(QWidget):
         # Stat grid (4 cards in a horizontal row)
         stat_row = QHBoxLayout()
         stat_row.setSpacing(8)
-        self._sip_stat = self._build_stat_group("SIP 服务", "未启动")
-        self._reg_stat = self._build_stat_group("网关注册", "未注册")
-        self._mode_stat = self._build_stat_group("当前模式", "生产模式")
-        self._call_stat = self._build_stat_group("通话状态", "空闲")
+        self._sip_stat = self._build_stat_group("dash.sip_service", "dash.unstarted")
+        self._reg_stat = self._build_stat_group("dash.gateway_reg", "dash.unregistered")
+        self._mode_stat = self._build_stat_group("dash.current_mode", "dash.mode.production")
+        self._call_stat = self._build_stat_group("dash.call_state", "dash.idle")
         stat_row.addWidget(self._sip_stat)
         stat_row.addWidget(self._reg_stat)
         stat_row.addWidget(self._mode_stat)
@@ -174,7 +192,8 @@ class DashboardWidget(QWidget):
         layout.addLayout(stat_row)
 
         # Audio device routing group
-        audio_group = QGroupBox("音频设备（独立选择）")
+        audio_group = QGroupBox(tr("dash.audio_devices"))
+        self._audio_group = audio_group
         ag = QVBoxLayout(audio_group)
         ag.setSpacing(8)
 
@@ -184,11 +203,13 @@ class DashboardWidget(QWidget):
         self._capture_cb = QComboBox()
         pb_col = QVBoxLayout()
         pb_col.setSpacing(4)
-        pb_col.addWidget(QLabel("扬声器 / 播放（下行）"))
+        self._playback_label = QLabel(tr("dash.playback"))
+        pb_col.addWidget(self._playback_label)
         pb_col.addWidget(self._playback_cb)
         cap_col = QVBoxLayout()
         cap_col.setSpacing(4)
-        cap_col.addWidget(QLabel("麦克风 / 采集（上行）"))
+        self._capture_label = QLabel(tr("dash.capture"))
+        cap_col.addWidget(self._capture_label)
         cap_col.addWidget(self._capture_cb)
         dev_row.addLayout(pb_col)
         dev_row.addLayout(cap_col)
@@ -196,12 +217,13 @@ class DashboardWidget(QWidget):
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
-        self._refresh_btn = QPushButton("刷新设备")
-        self._debug_btn = QPushButton("调试模式（耳机）")
-        self._prod_btn = QPushButton("生产模式（虚拟声卡）")
+        self._refresh_btn = QPushButton(tr("dash.refresh"))
+        self._debug_btn = QPushButton(tr("dash.mode.debug.btn"))
+        self._prod_btn = QPushButton(tr("dash.mode.production.btn"))
         self._prod_btn.setEnabled(False)  # production is the default
         btn_row.addWidget(self._refresh_btn)
-        btn_row.addWidget(QLabel("模式预设："))
+        self._preset_label = QLabel(tr("dash.mode.preset"))
+        btn_row.addWidget(self._preset_label)
         btn_row.addWidget(self._debug_btn)
         btn_row.addWidget(self._prod_btn)
         btn_row.addStretch()
@@ -215,18 +237,20 @@ class DashboardWidget(QWidget):
         self._capture_cb.currentIndexChanged.connect(self._on_device_change)
 
         # Phone-report group (feature teleflow-phone-report)
-        report_group = QGroupBox("电话汇报 (RPC)")
+        report_group = QGroupBox(tr("dash.phone_report"))
+        self._report_group = report_group
         rg = QVBoxLayout(report_group)
-        self._report_stat = self._build_stat_group("汇报状态", "空闲")
+        self._report_stat = self._build_stat_group("dash.report_state", "dash.idle")
         rg.addWidget(self._report_stat)
-        self._test_report_btn = QPushButton("测试汇报")
+        self._test_report_btn = QPushButton(tr("dash.test_report"))
         self._test_report_btn.clicked.connect(self._fire_test_report)
         rg.addWidget(self._test_report_btn)
         layout.addWidget(report_group)
         self._test_report_cb: Callable[..., None] | None = None
 
         # Log group
-        log_group = QGroupBox("实时日志（SIP / 媒体 / 设备）")
+        log_group = QGroupBox(tr("dash.log_group"))
+        self._log_group = log_group
         lg = QVBoxLayout(log_group)
         self._log_view = QPlainTextEdit()
         self._log_view.setReadOnly(True)
@@ -240,11 +264,11 @@ class DashboardWidget(QWidget):
     # -- stat group helpers --
 
     @staticmethod
-    def _build_stat_group(key: str, value: str) -> QGroupBox:
-        g = QGroupBox(key)
+    def _build_stat_group(title_key: str, value_key: str) -> QGroupBox:
+        g = QGroupBox(tr(title_key))
         vl = QVBoxLayout(g)
         vl.setContentsMargins(8, 8, 8, 8)
-        lbl = QLabel(value)
+        lbl = QLabel(tr(value_key))
         lbl.setObjectName("stat_value")
         font = lbl.font()
         font.setBold(True)
@@ -272,7 +296,7 @@ class DashboardWidget(QWidget):
         # only) operation — matching MicroSIP, where the microphone is only
         # opened when an input device is explicitly selected. Its userData is
         # the empty string, which set_selection normalises to "one-way".
-        self._capture_cb.addItem("不采集（单向）", "")
+        self._capture_cb.addItem(tr("dash.no_capture"), "")
         for device in self._manager.capture_devices():
             self._capture_cb.addItem(device.name, device.id)
         self._select(self._playback_cb, playback_id)
@@ -299,8 +323,8 @@ class DashboardWidget(QWidget):
         is_debug = preset == "debug"
         self._debug_btn.setEnabled(not is_debug)
         self._prod_btn.setEnabled(is_debug)
-        self._mode = "调试模式" if is_debug else "生产模式"
-        self._set_stat_value(self._mode_stat, self._mode)
+        self._mode_key = "dash.mode.debug" if is_debug else "dash.mode.production"
+        self._set_stat_value(self._mode_stat, tr(self._mode_key))
 
     def _on_device_change(self) -> None:
         playback_id = self._playback_cb.currentData()
@@ -353,8 +377,14 @@ class DashboardWidget(QWidget):
         self._sip_running = running
         self._update_sip_stat()
 
-    def set_sip_registration(self, text: str) -> None:
-        """Update the 网关注册 status card (e.g. 未注册 / 已注册 / 注册失败)."""
+    def set_sip_registration(self, status_key: str, code: int | None = None) -> None:
+        """Update the 网关注册 status card (e.g. registered / unregistered / failed)."""
+        self._reg_status = (status_key, code)
+        text = (
+            tr("reg.failed_with_code", code=code)
+            if status_key == "failed" and code
+            else tr(f"reg.{status_key}")
+        )
         self._set_stat_value(self._reg_stat, text)
 
     def set_service_menu(self, actions: list[QAction]) -> None:
@@ -369,21 +399,24 @@ class DashboardWidget(QWidget):
     def set_call_state(self, state: CallState) -> None:
         self._call_state = state
         text = {
-            CallState.CONNECTED: "通话中",
-            CallState.INCOMING: "呼入",
-            CallState.ENDED: "挂断",
-            CallState.IDLE: "空闲 · 监听中" if self._sip_running else "空闲",
-        }.get(state, "空闲")
+            CallState.CONNECTED: tr("dash.call.connected"),
+            CallState.INCOMING: tr("dash.call.incoming"),
+            CallState.ENDED: tr("dash.call.ended"),
+            CallState.IDLE: tr("dash.idle_listening")
+            if self._sip_running
+            else tr("dash.idle"),
+        }.get(state, tr("dash.idle"))
         self._set_stat_value(self._call_stat, text)
 
     def set_report_state(self, state: ReportState) -> None:
+        self._report_state = state
         text = {
-            ReportState.IDLE: "空闲",
-            ReportState.DIALING: "拨号中…",
-            ReportState.PLAYING: "播放中…",
-            ReportState.COMPLETED: "已完成",
-            ReportState.FAILED: "失败",
-        }.get(state, "空闲")
+            ReportState.IDLE: tr("dash.idle"),
+            ReportState.DIALING: tr("dash.report.dialing"),
+            ReportState.PLAYING: tr("dash.report.playing"),
+            ReportState.COMPLETED: tr("dash.report.completed"),
+            ReportState.FAILED: tr("dash.report.failed"),
+        }.get(state, tr("dash.idle"))
         self._set_stat_value(self._report_stat, text)
 
     def set_test_report_callback(self, cb: Callable[..., None]) -> None:
@@ -393,12 +426,40 @@ class DashboardWidget(QWidget):
         if self._test_report_cb is not None:
             self._test_report_cb()
 
-    def set_mode(self, mode: str) -> None:
-        self._mode = mode
-        self._set_stat_value(self._mode_stat, mode)
+    def set_mode(self, mode_key: str) -> None:
+        self._mode_key = mode_key
+        self._set_stat_value(self._mode_stat, tr(mode_key))
 
     def _update_sip_stat(self) -> None:
-        self._set_stat_value(self._sip_stat, "运行中" if self._sip_running else "未启动")
+        self._set_stat_value(
+            self._sip_stat, tr("dash.running") if self._sip_running else tr("dash.unstarted")
+        )
+
+    def retranslate(self) -> None:
+        """Re-bind every user-visible string after a language switch."""
+        self._menu_btn.setText(tr("dash.menu"))
+        self._sip_stat.setTitle(tr("dash.sip_service"))
+        self._reg_stat.setTitle(tr("dash.gateway_reg"))
+        self._mode_stat.setTitle(tr("dash.current_mode"))
+        self._call_stat.setTitle(tr("dash.call_state"))
+        self._audio_group.setTitle(tr("dash.audio_devices"))
+        self._playback_label.setText(tr("dash.playback"))
+        self._capture_label.setText(tr("dash.capture"))
+        self._refresh_btn.setText(tr("dash.refresh"))
+        self._preset_label.setText(tr("dash.mode.preset"))
+        self._debug_btn.setText(tr("dash.mode.debug.btn"))
+        self._prod_btn.setText(tr("dash.mode.production.btn"))
+        self._report_group.setTitle(tr("dash.phone_report"))
+        self._report_stat.setTitle(tr("dash.report_state"))
+        self._test_report_btn.setText(tr("dash.test_report"))
+        self._log_group.setTitle(tr("dash.log_group"))
+        self._populate_devices()
+        # Re-render dynamic state text in the new language.
+        self._update_sip_stat()
+        self.set_sip_registration(*self._reg_status)
+        self.set_call_state(self._call_state)
+        self.set_report_state(self._report_state)
+        self.set_mode(self._mode_key)
 
 
 # ---------------------------------------------------------------------------
@@ -415,10 +476,13 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self._manager = manager
         self._store = manager.store
-        self.setWindowTitle("设置")
+        self.setWindowTitle(tr("settings.title"))
         self.setModal(True)
         self.setMinimumWidth(560)
         self.setMinimumHeight(460)
+        # (widget, i18n-key) pairs re-bound on a language switch.
+        self._retranslatable: list[tuple[QLabel | QCheckBox | QPushButton, str]] = []
+        self._page_titles: list[str] = []
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
@@ -440,41 +504,38 @@ class SettingsDialog(QDialog):
         al.setContentsMargins(12, 12, 12, 12)
         al.setSpacing(8)
         # 网关连接:域名或 IP / 端口 / 分机号(分机号也作认证账号)。
-        al.addWidget(QLabel("网关地址（域名或 IP，留空则不注册）:"))
+        al.addWidget(self._lbl("settings.gateway_addr"))
         self.sip_host = QLineEdit()
-        self.sip_host.setPlaceholderText("例如 192.168.1.189 或 sip.example.com")
+        self.sip_host.setPlaceholderText(tr("settings.gateway_addr.ph"))
         al.addWidget(self.sip_host)
         host_port_row = QHBoxLayout()
         host_port_row.setSpacing(6)
-        host_port_row.addWidget(QLabel("网关端口:"))
+        host_port_row.addWidget(self._lbl("settings.gateway_port"))
         self.sip_server_port = QSpinBox()
         self.sip_server_port.setRange(1, 65535)
         self.sip_server_port.setValue(5060)
         host_port_row.addWidget(self.sip_server_port)
         host_port_row.addStretch()
         al.addLayout(host_port_row)
-        al.addWidget(QLabel("分机号（SIP 账号 / AOR，例如 1002）:"))
+        al.addWidget(self._lbl("settings.extension"))
         self.sip_user = QLineEdit()
         al.addWidget(self.sip_user)
-        al.addWidget(QLabel("SIP 密码:"))
+        al.addWidget(self._lbl("settings.sip_password"))
         self.sip_password = QLineEdit()
         self.sip_password.setEchoMode(QLineEdit.EchoMode.Password)
         al.addWidget(self.sip_password)
-        al.addWidget(
-            QLabel("提示：此为电话汇报的默认路由（走网关）。汇报页只填分机号即可，"
-                   "仅当配置了“座机地址”时才改走该地址。")
-        )
+        al.addWidget(self._lbl("settings.report_hint"))
         # SIP 本地监听端口（选填）: 留空则自动检测空闲端口（避免与本机其他
         # SIP 服务如 FreeSWITCH 抢占同一端口）。
         port_row = QHBoxLayout()
         port_row.setSpacing(6)
-        port_row.addWidget(QLabel("SIP 端口（选填，留空=自动检测）:"))
+        port_row.addWidget(self._lbl("settings.sip_port"))
         self.sip_port = QLineEdit()
-        self.sip_port.setPlaceholderText("例如 5062")
+        self.sip_port.setPlaceholderText(tr("settings.sip_port.ph"))
         port_row.addWidget(self.sip_port)
         port_row.addStretch()
         al.addLayout(port_row)
-        self.sip_auto_connect = QCheckBox("启动时自动连接网关")
+        self.sip_auto_connect = self._chk("settings.auto_connect")
         al.addWidget(self.sip_auto_connect)
         al.addStretch()
 
@@ -483,13 +544,13 @@ class SettingsDialog(QDialog):
         hl = QVBoxLayout(hook_page)
         hl.setContentsMargins(12, 12, 12, 12)
         hl.setSpacing(8)
-        hl.addWidget(QLabel("摘机命令（自动接通时执行，可用 {call_id} 表示来电 ID）:"))
+        hl.addWidget(self._lbl("settings.off_hook"))
         self.off_hook_cmd = QLineEdit()
-        self.off_hook_cmd.setPlaceholderText("例如 /usr/local/bin/on-answer.sh {call_id}")
+        self.off_hook_cmd.setPlaceholderText(tr("settings.off_hook.ph"))
         hl.addWidget(self.off_hook_cmd)
-        hl.addWidget(QLabel("挂机命令（通话结束时执行，可用 {call_id} 表示来电 ID；IVR 下额外可用 {last_digit} 表示首个按键）:"))
+        hl.addWidget(self._lbl("settings.on_hook"))
         self.on_hook_cmd = QLineEdit()
-        self.on_hook_cmd.setPlaceholderText("例如 /usr/local/bin/on-hangup.sh {call_id} {last_digit}")
+        self.on_hook_cmd.setPlaceholderText(tr("settings.on_hook.ph"))
         hl.addWidget(self.on_hook_cmd)
         hl.addStretch()
 
@@ -498,34 +559,30 @@ class SettingsDialog(QDialog):
         ivl = QVBoxLayout(ivr_page)
         ivl.setContentsMargins(12, 12, 12, 12)
         ivl.setSpacing(6)
-        self.ivr_enabled = QCheckBox("启用呼入 IVR（接通后播报菜单并监听按键）")
+        self.ivr_enabled = self._chk("settings.ivr.enabled")
         ivl.addWidget(self.ivr_enabled)
-        ivl.addWidget(QLabel("欢迎语（接通后先播，留空则不播）:"))
+        ivl.addWidget(self._lbl("settings.ivr.welcome"))
         self.ivr_welcome = QLineEdit()
-        self.ivr_welcome.setPlaceholderText("例如 您好，请按数字键选择")
+        self.ivr_welcome.setPlaceholderText(tr("settings.ivr.welcome.ph"))
         ivl.addWidget(self.ivr_welcome)
-        ivl.addWidget(
-            QLabel("每个数字键（1-9-0）的播报词与命令：播报词留空则该键不播报，"
-                   "命令留空则该键被按下时不执行。播报期间通话为单向（防回音，与汇报一致）；"
-                   "勾选某键为“桥接键”后，按下该键将退出菜单并切换为双向桥接（AI 侧可插话/打断），默认 0 键。")
-        )
+        ivl.addWidget(self._lbl("settings.ivr.desc"))
         digit_grid = QGridLayout()
         digit_grid.setSpacing(4)
-        digit_grid.addWidget(QLabel("键"), 0, 0)
-        digit_grid.addWidget(QLabel("播报词"), 0, 1)
-        digit_grid.addWidget(QLabel("命令"), 0, 2)
-        digit_grid.addWidget(QLabel("桥接↔双向"), 0, 3)
+        digit_grid.addWidget(self._lbl("settings.ivr.key"), 0, 0)
+        digit_grid.addWidget(self._lbl("settings.ivr.prompt"), 0, 1)
+        digit_grid.addWidget(self._lbl("settings.ivr.command"), 0, 2)
+        digit_grid.addWidget(self._lbl("settings.ivr.bridge"), 0, 3)
         self.ivr_digit_text_edits: dict[str, QLineEdit] = {}
         self.ivr_digit_hook_edits: dict[str, QLineEdit] = {}
         self.ivr_exit_checkboxes: dict[str, QCheckBox] = {}
         for row, digit in enumerate("1234567890", start=1):
             digit_grid.addWidget(QLabel(digit), row, 0)
             text_edit = QLineEdit()
-            text_edit.setPlaceholderText("播报词（留空跳过）")
+            text_edit.setPlaceholderText(tr("settings.ivr.text.ph"))
             hook_edit = QLineEdit()
-            hook_edit.setPlaceholderText("命令（留空不执行）")
+            hook_edit.setPlaceholderText(tr("settings.ivr.cmd.ph"))
             exit_cb = QCheckBox()
-            exit_cb.setToolTip("按下该键后退出菜单并切换为双向桥接")
+            exit_cb.setToolTip(tr("settings.ivr.exit.tip"))
             # Single-select: checking one bridge key unchecks the others.
             exit_cb.toggled.connect(
                 lambda checked, d=digit: self._on_exit_digit_toggled(d, checked)
@@ -544,73 +601,73 @@ class SettingsDialog(QDialog):
         rp = QVBoxLayout(report_page)
         rp.setContentsMargins(12, 12, 12, 12)
         rp.setSpacing(6)
-        self.rpc_enabled = QCheckBox("启用电话汇报 RPC（本地控制通道）")
+        self.rpc_enabled = self._chk("settings.rpc.enabled")
         self.rpc_port = QSpinBox()
         self.rpc_port.setRange(1, 65535)
         self.rpc_token = QLineEdit()
         self.rpc_token.setReadOnly(True)
-        self.rpc_token_reset_btn = QPushButton("重置 Token")
+        self.rpc_token_reset_btn = QPushButton(tr("settings.reset_token"))
+        self._retranslatable.append((self.rpc_token_reset_btn, "settings.reset_token"))
         self.rpc_token_reset_btn.clicked.connect(self._reset_token)
         rpc_token_row = QHBoxLayout()
         rpc_token_row.setSpacing(6)
         rpc_token_row.addWidget(self.rpc_token)
         rpc_token_row.addWidget(self.rpc_token_reset_btn)
         self.report_host = QLineEdit()
-        self.report_host.setPlaceholderText("例如 192.168.1.116")
+        self.report_host.setPlaceholderText(tr("settings.desk_addr.ph"))
         self.report_port = QSpinBox()
         self.report_port.setRange(1, 65535)
         self.report_port.setValue(5060)
         self.report_extension = QLineEdit()
-        self.report_extension.setPlaceholderText("例如 8000")
+        self.report_extension.setPlaceholderText(tr("settings.ext.ph"))
         self.report_caller_id = QLineEdit()
-        self.report_caller_id.setPlaceholderText("主叫显示名（默认 TeleFlow）")
+        self.report_caller_id.setPlaceholderText(tr("settings.caller_id.ph"))
         # TTS voice: a dropdown of built-in edge-tts roles + a "自定义…" entry
         # that reveals a free-text field for any other voice ID.
         self._tts_voice_ids = [vid for _name, vid in BUILTIN_TTS_VOICES]
         self.tts_voice = QComboBox()
-        self.tts_voice.addItems([f"{name} — {vid}" for name, vid in BUILTIN_TTS_VOICES])
-        self.tts_voice.addItem("自定义…")
         self.tts_voice.currentIndexChanged.connect(self._on_tts_voice_changed)
         self.tts_voice_custom = QLineEdit()
-        self.tts_voice_custom.setPlaceholderText("自定义 edge-tts 音色 ID，如 zh-CN-YunyangNeural")
+        self.tts_voice_custom.setPlaceholderText(tr("settings.tts_voice_custom.ph"))
         self.tts_voice_custom.hide()
         self.ffmpeg_path = QLineEdit()
         rp.addWidget(self.rpc_enabled)
-        rp.addWidget(QLabel("RPC 监听端口:"))
+        rp.addWidget(self._lbl("settings.rpc_port"))
         rp.addWidget(self.rpc_port)
-        rp.addWidget(QLabel("RPC Token (Bearer，隐藏显示；留空自动生成):"))
+        rp.addWidget(self._lbl("settings.rpc_token"))
         rp.addLayout(rpc_token_row)
         # 分机号: the only required field, shown first with display priority.
-        ext_label = QLabel("分机号（必填，对外拨打的号码）:")
+        ext_label = QLabel(tr("settings.extension.required"))
+        self._retranslatable.append((ext_label, "settings.extension.required"))
         ext_label.setStyleSheet("font-weight: bold; color: #b00020;")
         rp.addWidget(ext_label)
         rp.addWidget(self.report_extension)
         # 座机（选填）: secondary to 分机号; 留空则默认走网关.
-        rp.addWidget(QLabel("座机地址（选填；留空则默认走网关）:"))
+        rp.addWidget(self._lbl("settings.desk_addr"))
         rp.addWidget(self.report_host)
         report_port_row = QHBoxLayout()
         report_port_row.setSpacing(6)
-        report_port_row.addWidget(QLabel("座机端口（默认 5060）:"))
+        report_port_row.addWidget(self._lbl("settings.desk_port"))
         report_port_row.addWidget(self.report_port)
         report_port_row.addStretch()
         rp.addLayout(report_port_row)
-        rp.addWidget(QLabel("主叫显示名:"))
+        rp.addWidget(self._lbl("settings.caller_id"))
         rp.addWidget(self.report_caller_id)
-        rp.addWidget(QLabel("TTS 音色:"))
+        rp.addWidget(self._lbl("settings.tts_voice"))
         rp.addWidget(self.tts_voice)
         rp.addWidget(self.tts_voice_custom)
-        rp.addWidget(QLabel("ffmpeg 路径 (可选):"))
+        rp.addWidget(self._lbl("settings.ffmpeg"))
         rp.addWidget(self.ffmpeg_path)
         # 汇报播报结束后是否自动挂机。
-        self.report_hangup_on_eof = QCheckBox("汇报播放结束后自动挂机")
+        self.report_hangup_on_eof = self._chk("settings.report_hangup")
         rp.addWidget(self.report_hangup_on_eof)
         # TTS 合成参数: 缓存 TTL 与失败重试次数，均可通过设置调整。
-        rp.addWidget(QLabel("TTS 缓存 TTL（秒，0=每次重新合成）:"))
+        rp.addWidget(self._lbl("settings.tts_ttl"))
         self.tts_cache_ttl_seconds = QSpinBox()
         self.tts_cache_ttl_seconds.setRange(0, 31_536_000)
         self.tts_cache_ttl_seconds.setValue(604800)
         rp.addWidget(self.tts_cache_ttl_seconds)
-        rp.addWidget(QLabel("TTS 合成失败重试次数:"))
+        rp.addWidget(self._lbl("settings.tts_retry"))
         self.tts_retry_attempts = QSpinBox()
         self.tts_retry_attempts.setRange(1, 10)
         self.tts_retry_attempts.setValue(3)
@@ -625,39 +682,43 @@ class SettingsDialog(QDialog):
         fl = QFormLayout()
         self.log_level = QComboBox()
         self.log_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
-        fl.addRow("日志级别:", self.log_level)
-        self.autostart = QCheckBox("开机自启")
+        fl.addRow(self._lbl("settings.log_level"), self.log_level)
+        self.autostart = self._chk("settings.autostart")
         fl.addRow(self.autostart)
-        self.start_minimized = QCheckBox("最小化启动")
+        self.start_minimized = self._chk("settings.start_minimized")
         fl.addRow(self.start_minimized)
+        # Language: follows the OS when "auto"; persisted in Settings.language.
+        self._language_combo = QComboBox()
+        self._language_combo.addItem(tr("language.auto"), "auto")
+        self._language_combo.addItem(tr("language.english"), "en")
+        self._language_combo.addItem(tr("language.chinese"), "zh_CN")
+        fl.addRow(self._lbl("settings.language"), self._language_combo)
         ll.addLayout(fl)
         ll.addStretch()
 
-        for title, page in [
-            ("SIP 账号", acct_page),
-            ("钩子命令", hook_page),
-            ("呼入 IVR", ivr_page),
-            ("电话汇报 (RPC)", report_page),
-            ("日志与启动", log_page),
+        for title_key, page in [
+            ("settings.sip_account", acct_page),
+            ("settings.hooks", hook_page),
+            ("settings.ivr", ivr_page),
+            ("settings.report", report_page),
+            ("settings.log_start", log_page),
         ]:
-            self._menu.addItem(title)
+            self._menu.addItem(tr(title_key))
             self._pages.addWidget(page)
+            self._page_titles.append(title_key)
         self._menu.currentRowChanged.connect(self._pages.setCurrentIndex)
         self._menu.setCurrentRow(0)
 
-        # ffmpeg placeholder reflects auto-discovery: if a binary is on PATH, show
-        # its path so the user knows it will be used without explicit config.
-        ffmpeg_bin = shutil.which("ffmpeg")
-        if ffmpeg_bin:
-            self.ffmpeg_path.setPlaceholderText(f"自动发现: {ffmpeg_bin}")
-        else:
-            self.ffmpeg_path.setPlaceholderText("留空 = 自动查找 PATH")
+        self._populate_tts_voice_combo()
+        self._refresh_ffmpeg_placeholder()
 
         # Buttons (full width, below the split panes)
         btn_row = QHBoxLayout()
-        self.save_btn = QPushButton("保存设置")
+        self.save_btn = QPushButton(tr("settings.save"))
+        self._retranslatable.append((self.save_btn, "settings.save"))
         self.save_btn.clicked.connect(self._save_and_close)
-        self.cancel_btn = QPushButton("关闭")
+        self.cancel_btn = QPushButton(tr("settings.close"))
+        self._retranslatable.append((self.cancel_btn, "settings.close"))
         self.cancel_btn.clicked.connect(self.reject)
         btn_row.addStretch()
         btn_row.addWidget(self.save_btn)
@@ -699,6 +760,11 @@ class SettingsDialog(QDialog):
         self.log_level.setCurrentText(settings.log_level)
         self.autostart.setChecked(settings.autostart)
         self.start_minimized.setChecked(settings.start_minimized)
+        lang = settings.language
+        idx = self._language_combo.findData(lang)
+        if idx < 0:
+            idx = self._language_combo.findData("auto")
+        self._language_combo.setCurrentIndex(idx)
 
     def _save_and_close(self) -> None:
         settings = self._store.load()
@@ -740,7 +806,10 @@ class SettingsDialog(QDialog):
         settings.log_level = self.log_level.currentText()
         settings.autostart = self.autostart.isChecked()
         settings.start_minimized = self.start_minimized.isChecked()
+        settings.language = self._language_combo.currentData() or "auto"
         self._store.save(settings)
+        self.retranslate()
+        set_language(settings.language)
         self.accept()
 
     def _on_exit_digit_toggled(self, digit: str, checked: bool) -> None:
@@ -782,6 +851,66 @@ class SettingsDialog(QDialog):
         import secrets
 
         self.rpc_token.setText(secrets.token_hex(16))
+
+    def _lbl(self, key: str) -> QLabel:
+        lbl = QLabel(tr(key))
+        self._retranslatable.append((lbl, key))
+        return lbl
+
+    def _chk(self, key: str) -> QCheckBox:
+        chk = QCheckBox(tr(key))
+        self._retranslatable.append((chk, key))
+        return chk
+
+    def _populate_tts_voice_combo(self, preserve: bool = False) -> None:
+        """Build the TTS voice dropdown from built-in edge-tts roles (+ 自定义…).
+
+        Voice *display names* are translated via the i18n catalog; the stored
+        ``tts_voice`` field is always the raw edge-tts voice ID. When ``preserve``
+        is set the current selection is restored after rebuilding (used on a
+        language switch so the user's choice doesn't reset to the first entry).
+        """
+        current = self._current_tts_voice() if preserve else None
+        self.tts_voice.blockSignals(True)
+        self.tts_voice.clear()
+        for name, vid in BUILTIN_TTS_VOICES:
+            key = _TTS_VOICE_KEYS.get(name, "tts.voice.xiaoxiao")
+            self.tts_voice.addItem(f"{tr(key)} — {vid}", vid)
+        self.tts_voice.addItem(tr("settings.custom"))
+        if current is not None:
+            self._select_tts_voice(current)
+        self.tts_voice.blockSignals(False)
+        self._on_tts_voice_changed(self.tts_voice.currentIndex())
+
+    def _refresh_ffmpeg_placeholder(self) -> None:
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if ffmpeg_bin:
+            self.ffmpeg_path.setPlaceholderText(tr("settings.ffmpeg.auto", path=ffmpeg_bin))
+        else:
+            self.ffmpeg_path.setPlaceholderText(tr("settings.ffmpeg.find"))
+
+    def retranslate(self) -> None:
+        """Re-bind every user-visible string after a language switch."""
+        self.setWindowTitle(tr("settings.title"))
+        for widget, key in self._retranslatable:
+            widget.setText(tr(key))
+        for i, title_key in enumerate(self._page_titles):
+            item = self._menu.item(i)
+            if item is not None:
+                item.setText(tr(title_key))
+        self.sip_host.setPlaceholderText(tr("settings.gateway_addr.ph"))
+        self.off_hook_cmd.setPlaceholderText(tr("settings.off_hook.ph"))
+        self.on_hook_cmd.setPlaceholderText(tr("settings.on_hook.ph"))
+        self.ivr_welcome.setPlaceholderText(tr("settings.ivr.welcome.ph"))
+        self.sip_port.setPlaceholderText(tr("settings.sip_port.ph"))
+        self.report_extension.setPlaceholderText(tr("settings.ext.ph"))
+        self.report_caller_id.setPlaceholderText(tr("settings.caller_id.ph"))
+        self.tts_voice_custom.setPlaceholderText(tr("settings.tts_voice_custom.ph"))
+        self._populate_tts_voice_combo(preserve=True)
+        self._refresh_ffmpeg_placeholder()
+        self._language_combo.setItemText(0, tr("language.auto"))
+        self._language_combo.setItemText(1, tr("language.english"))
+        self._language_combo.setItemText(2, tr("language.chinese"))
 
 
 
@@ -832,6 +961,9 @@ class MainWindow(QMainWindow):
         self._manager = manager
         self._service = service
         self._store = store
+        # Apply the persisted (or auto) language before building any widget so
+        # every tr() during construction resolves against the right locale.
+        set_language(store.load().language)
         self._force_quit = False
         self._tray: QSystemTrayIcon | None = None
         self._tray_sip: QAction | None = None
@@ -846,7 +978,7 @@ class MainWindow(QMainWindow):
         self._synth_timed_out.connect(self._log_synth_timeout)
         self._gui_task.connect(self._run_gui_task)
         self._rpc_task.connect(self._run_rpc_task)
-        self.setWindowTitle("TeleFlow — 座机声音流转助手")
+        self.setWindowTitle(tr("app.title"))
         self.setWindowIcon(_load_icon())
         self.resize(680, 520)
 
@@ -866,6 +998,7 @@ class MainWindow(QMainWindow):
         )
         self._setup_tray()
         self._wire_service()
+        register_on_change(self._retranslate_all)
 
     def gui(self, fn: Callable[[], None]) -> None:
         """Queued-handoff ``fn`` onto the GUI thread.
@@ -925,16 +1058,40 @@ class MainWindow(QMainWindow):
     def _build_service_actions(self) -> None:
         """One set of QActions shared by the dashboard menu and the system-tray
         menu, so both always show the same items in the same state."""
-        self._act_toggle_sip = QAction("启动 SIP 服务", self)
+        self._act_toggle_sip = QAction(self)
         self._act_toggle_sip.triggered.connect(self._toggle_sip)
-        self._act_show = QAction("显示窗口", self)
+        self._act_show = QAction(self)
         self._act_show.triggered.connect(self.show_window)
-        self._act_settings = QAction("设置", self)
+        self._act_settings = QAction(self)
         self._act_settings.triggered.connect(self._open_settings)
-        self._act_report = QAction("测试汇报", self)
+        self._act_report = QAction(self)
         self._act_report.triggered.connect(self._test_report)
-        self._act_quit = QAction("退出", self)
+        self._act_quit = QAction(self)
         self._act_quit.triggered.connect(self.quit_app)
+        self._update_action_texts()
+
+    def _update_action_texts(self) -> None:
+        """Re-bind the shared menu/tray action labels (toggle label tracks state)."""
+        running = self._service.running
+        self._act_toggle_sip.setText(
+            tr("action.toggle_sip.stop" if running else "action.toggle_sip.start")
+        )
+        self._act_show.setText(tr("action.show"))
+        self._act_settings.setText(tr("action.settings"))
+        self._act_report.setText(tr("action.test_report"))
+        self._act_quit.setText(tr("action.quit"))
+
+    def _retranslate_all(self, resolved: str) -> None:
+        """Language-change callback (registered with ``register_on_change``).
+
+        ``resolved`` is the new locale; we ignore it and just re-bind every
+        user-visible string (window, shared actions, dashboard, open dialog).
+        """
+        self.setWindowTitle(tr("app.title"))
+        self._update_action_texts()
+        self.dashboard.retranslate()
+        if self._settings_dialog is not None:
+            self._settings_dialog.retranslate()
 
     def _setup_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -993,10 +1150,10 @@ class MainWindow(QMainWindow):
         overload posts a queued call to ``self``'s thread, which is the only
         safe way to touch Qt widgets / pjsua2 from the worker.
         """
-        text = "这是一条 TeleFlow 测试汇报。座机接通后，你会听到这条语音播报。"
+        text = tr("report.test_sample")
         settings = self._store.load()
         voice, ffmpeg = settings.tts_voice, settings.ffmpeg_path
-        self.append_log_line(f"[TTS] 合成中: voice={voice}")
+        self.append_log_line(f"[TTS] synthesizing: voice={voice}")
         self._pending_report_text = text
 
         def _synthesize() -> None:
@@ -1039,32 +1196,32 @@ class MainWindow(QMainWindow):
 
     def _log_synth_timeout(self) -> None:
         self.append_log_line(
-            "[TTS] 合成超时（超过 120 秒），请检查网络后重试"
+            "[TTS] synthesis timed out (>120s); check network and retry"
         )
 
     def _finish_test_report(self) -> None:
         """GUI-thread continuation of the background synthesis."""
         if self._pending_report_error:
-            self.append_log_line(f"[REPORT] 测试汇报失败: {self._pending_report_error}")
+            self.append_log_line(f"[REPORT] test report failed: {self._pending_report_error}")
             self._pending_report_error = None
             return
         mp3, wav = self._pending_report_mp3, self._pending_report_wav
-        self.append_log_line(f"[TTS] 合成完成: {mp3}")
-        self.append_log_line(f"[FFMPEG] 转码完成: {wav}")
+        self.append_log_line(f"[TTS] synthesized: {mp3}")
+        self.append_log_line(f"[FFMPEG] transcoded: {wav}")
         self._pending_report_mp3 = ""
         self._pending_report_wav = ""
         try:
             self._service.start_report(self._pending_report_text, audio_path=wav)
         except Exception as exc:  # noqa: BLE001 - surface in the log view
-            self.append_log_line(f"[REPORT] 测试汇报失败: {exc}")
+            self.append_log_line(f"[REPORT] test report failed: {exc}")
 
     def _notify_port_conflict(self, requested: int, selected: int) -> None:
         """Warn the user that the preferred SIP port was occupied and the client
         auto-moved to a free one (the log line is written by the service)."""
         if self._tray is not None:
             self._tray.showMessage(
-                "TeleFlow — 网关注册",
-                f"指定端口 {requested} 已被占用，已自动改用端口 {selected}",
+                tr("tray.register.title"),
+                tr("tray.port_conflict", requested=requested, selected=selected),
                 QSystemTrayIcon.MessageIcon.Warning,
                 5000,
             )
@@ -1078,18 +1235,16 @@ class MainWindow(QMainWindow):
         svc.on(EVENT_SIP_STOPPED, lambda: self.gui(self._sync_sip_button))
         svc.on(
             EVENT_SIP_REGISTERED,
-            lambda contact: self.gui(lambda: self.dashboard.set_sip_registration("已注册")),
+            lambda contact: self.gui(lambda: self.dashboard.set_sip_registration("registered")),
         )
         svc.on(
             EVENT_SIP_UNREGISTERED,
-            lambda: self.gui(lambda: self.dashboard.set_sip_registration("未注册")),
+            lambda: self.gui(lambda: self.dashboard.set_sip_registration("unregistered")),
         )
         svc.on(
             EVENT_SIP_REGISTER_FAILED,
             lambda code, reason: self.gui(
-                lambda: self.dashboard.set_sip_registration(
-                    f"注册失败 ({code})" if code else "注册失败"
-                )
+                lambda: self.dashboard.set_sip_registration("failed", code if code else None)
             ),
         )
         svc.on(
@@ -1140,7 +1295,7 @@ class MainWindow(QMainWindow):
             try:
                 self._service.start()
             except Exception as exc:  # noqa: BLE001 - surface startup failures
-                self.append_log_line(f"[SIP] 启动失败: {exc}")
+                self.append_log_line(f"[SIP] start failed: {exc}")
                 self._sync_sip_button()
                 return
         # Remember the service state so the next launch restores it: started =>
@@ -1155,13 +1310,10 @@ class MainWindow(QMainWindow):
 
     def _sync_sip_button(self) -> None:
         running = self._service.running
-        label = "停止 SIP 服务" if running else "启动 SIP 服务"
         self.dashboard.set_sip_running(running)
         if not running:
-            self.dashboard.set_sip_registration("未注册")
-        tray_sip = self._tray_sip
-        if tray_sip is not None:
-            tray_sip.setText(label)
+            self.dashboard.set_sip_registration("unregistered")
+        self._update_action_texts()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         if self._tray is not None and not self._force_quit:
@@ -1213,14 +1365,14 @@ def maybe_auto_start_sip(
     if not (settings.sip_host and settings.sip_user):
         settings.sip_auto_connect = False
         store.save(settings)
-        log("[SIP] 网关配置不完整，未自动连接；请先完成 SIP 账号设置")
+        log("[SIP] gateway config incomplete; not auto-connecting. Complete SIP account settings first.")
         return False
     try:
         service.start()
     except Exception as exc:  # noqa: BLE001 - startup failures must not crash the app
         settings.sip_auto_connect = False
         store.save(settings)
-        log(f"[SIP] 自动连接网关失败: {exc}")
+        log(f"[SIP] auto-connect gateway failed: {exc}")
         return False
     return True
 

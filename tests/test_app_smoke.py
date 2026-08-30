@@ -27,6 +27,23 @@ except Exception:  # pragma: no cover - environment dependent
 pytestmark = pytest.mark.skipif(not _HAVE_GUI, reason="PyQt6 not available")
 
 
+# Pin the GUI locale to zh_CN so the dashboard/tray Chinese assertions in this
+# module hold on any host (the i18n catalog is the source of truth, and the
+# non-Chinese default would otherwise break those hardcoded-string checks).
+# Module-local (not in conftest) so test_i18n.py keeps its own en/auto control.
+@pytest.fixture(autouse=True)
+def _zh_cn_locale(monkeypatch):
+    monkeypatch.setenv("LANG", "zh_CN.UTF-8")
+    monkeypatch.delenv("LANGUAGE", raising=False)
+    monkeypatch.delenv("LC_ALL", raising=False)
+    from teleflow.i18n import reset, set_language
+
+    reset()
+    set_language("auto")
+    yield
+    reset()
+
+
 class _CloseEvent:
     """Minimal stand-in for a Qt closeEvent carrying ignore()/accept()."""
 
@@ -207,6 +224,29 @@ def test_settings_dialog_exposes_all_remaining_fields(tmp_path) -> None:
     window.close()
 
 
+def test_settings_language_selector_persists_and_switches_live(tmp_path) -> None:
+    """Choosing a language in Settings persists to config and switches the UI
+    live (the tray/menu actions re-bind in the new language)."""
+    from teleflow.i18n import get_language
+
+    app, window, _, manager, _ = _make_window(tmp_path)
+    # Fixture starts us in zh_CN; the toggle action reads Chinese.
+    assert window._act_toggle_sip.text() == "启动 SIP 服务"
+
+    dialog = SettingsDialog(manager, window)
+    idx = dialog._language_combo.findData("en")
+    assert idx >= 0
+    dialog._language_combo.setCurrentIndex(idx)
+    dialog._save_and_close()
+
+    reloaded = ConfigStore(tmp_path / "config.json").load()
+    assert reloaded.language == "en"
+    # Live switch: the shared action now reads English.
+    assert window._act_toggle_sip.text() == "Start SIP Service"
+    assert get_language() == "en"
+    window.close()
+
+
 # --- dashboard top menu shares the tray's actions (gateway-auto-connect) ---
 
 
@@ -280,7 +320,7 @@ def test_auto_start_stays_stopped_on_incomplete_config(tmp_path) -> None:
     assert started is False
     assert not service.running
     assert store.load().sip_auto_connect is False
-    assert any("配置不完整" in line for line in log)
+    assert any("gateway config incomplete" in line for line in log)
 
 
 def test_auto_start_falls_back_to_stopped_on_startup_error(
@@ -304,7 +344,7 @@ def test_auto_start_falls_back_to_stopped_on_startup_error(
     assert started is False
     assert not service.running
     assert store.load().sip_auto_connect is False
-    assert any("自动连接网关失败" in line for line in log)
+    assert any("auto-connect gateway failed" in line for line in log)
 
 
 def test_auto_start_respects_disabled_flag(tmp_path) -> None:
@@ -344,7 +384,7 @@ def test_finish_test_report_starts_report_with_wav(tmp_path, monkeypatch) -> Non
     assert service._backend.report_calls == [
         ("sip:8000@192.168.1.116:5060", str(wav))
     ]
-    assert "[FFMPEG] 转码完成" in window.dashboard._log_view.toPlainText()
+    assert "[FFMPEG] transcoded:" in window.dashboard._log_view.toPlainText()
     window.close()
 
 
@@ -353,7 +393,7 @@ def test_finish_test_report_logs_synthesis_error(tmp_path) -> None:
     window._pending_report_error = "connection reset"
     window._finish_test_report()
 
-    assert "测试汇报失败: connection reset" in window.dashboard._log_view.toPlainText()
+    assert "[REPORT] test report failed: connection reset" in window.dashboard._log_view.toPlainText()
     assert window._pending_report_error is None
     window.close()
 
