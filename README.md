@@ -1,218 +1,302 @@
-# TeleFlow — 座机声音流转助手
+# TeleFlow — Desk-Phone Audio Router
 
-TeleFlow 是一个本地 **SIP 用户代理（UA）** 桌面程序（PyQt6）。它监听来自电话网关（ATA）呼入当前 SIP 账号的来电，**自动应答** 并把通话音频无损桥接到用户自选的声卡：下行写入播放设备、上行从采集设备取流。播放与采集设备可独立选择（例如生产模式用虚拟声卡，调试模式用耳机）。
+> 中文文档见 [README.zh-CN.md](README.zh-CN.md).
 
-- 真实传输层：`pjsua2` 原生库（见 `docs/build-pjsua2.md`）。
-- 测试/无界面环境：`FakeSipBackend` 脚本化网关，无需网络或原生库即可跑通全部逻辑。
+TeleFlow is a **local-only SIP user-agent (UA)** desktop app (PyQt6). It listens for
+inbound calls to the current SIP account coming from a telephone gateway (ATA),
+**auto-answers** them, and bridges the call audio losslessly to a user-selected
+sound card: downlink is written to the playback device, uplink is taken from the
+capture device. The playback and capture devices can be chosen independently (for
+example, a virtual sound card in production mode, headphones in debug mode).
+
+- Real transport: the `pjsua2` native library (see `docs/build-pjsua2.md`).
+- Tests / headless environments: a scripted `FakeSipBackend` gateway runs the entire
+  logic with no network or native library required.
 
 ---
 
-## 快速开始
+## Quick start
 
 ```bash
-# 依赖（Python >= 3.10）
-pip install -e .            # 安装 PyQt6 等运行时依赖
-# pjsua2 原生库需单独构建，见 docs/build-pjsua2.md
-python -m teleflow.app     # 启动 GUI
+# Dependencies (Python >= 3.10)
+pip install -e .            # install PyQt6 and other runtime dependencies
+# The pjsua2 native library must be built separately; see docs/build-pjsua2.md
+python -m teleflow.app     # launch the GUI
 ```
 
-启动后窗口最小化到系统托盘：右下角托盘菜单可 **启动/停止 SIP 服务、显示窗口、设置、退出**。`docs/packaging.md` 说明 macOS DMG 打包。
+After launch the window minimizes to the system tray: the tray menu in the
+bottom-right lets you **start/stop the SIP service, show the window, open Settings,
+and quit**. `docs/packaging.md` covers macOS DMG packaging.
 
 ---
 
-## 目录结构
+## Directory layout
 
-| 路径 | 职责 |
-|------|------|
-| `src/teleflow/sip.py` | SIP 核心服务 `SipCoreService` 与 `SipBackend` 协议（真实/假后端可互换） |
-| `src/teleflow/pjsua2_backend.py` | 基于 pjsua2 的真实传输层 |
-| `src/teleflow/hooks.py` | **通话生命周期外部命令 hook**（见下） |
-| `src/teleflow/config.py` | 设置持久化（`Settings` + `ConfigStore`） |
-| `src/teleflow/app.py` | PyQt6 应用外壳、仪表盘、托盘、设置弹窗 |
-| `src/teleflow/audio.py` / `media.py` | 音频设备枚举与会议桥路由 |
-| `prototypes/teleflow-ui-prototype.html` | UI 原型（含 hook 配置界面） |
+| Path | Responsibility |
+|------|----------------|
+| `src/teleflow/sip.py` | SIP core service `SipCoreService` and the `SipBackend` protocol (real/fake backends interchangeable) |
+| `src/teleflow/pjsua2_backend.py` | pjsua2-based real transport |
+| `src/teleflow/hooks.py` | **Call-lifecycle external command hooks** (see below) |
+| `src/teleflow/config.py` | Settings persistence (`Settings` + `ConfigStore`) |
+| `src/teleflow/app.py` | PyQt6 app shell, dashboard, tray, settings dialog |
+| `src/teleflow/audio.py` / `media.py` | Audio device enumeration and conference-bridge routing |
+| `prototypes/teleflow-ui-prototype.html` | Interactive UI prototype (incl. hook config UI) |
 
 ---
 
-## 音频路由：双向调试 vs 单向中继（生产模式）
+## Audio routing: two-way debug vs one-way relay (production mode)
 
-TeleFlow 只做**纯音频路由器**：把已建立的 RTP 会话桥到所选设备——下行（电话 → 播放设备）、上行（采集设备 → 电话）。播放与采集设备**可独立选择**，派生出两种典型用法：
+TeleFlow is only a **pure audio router**: it bridges an already-established RTP
+session onto the chosen devices — downlink (phone → playback device), uplink
+(capture device → phone). The playback and capture devices are **chosen
+independently**, which yields two typical usages:
 
-| 模式 | 播放设备 | 采集设备 | 行为 | 系统麦克风提示 |
-|------|----------|----------|------|----------------|
-| 调试模式（耳机） | 物理耳机 | 物理麦克风 | 双向：用座机正常通话 | 会（用了真麦克风） |
-| 生产模式（虚拟声卡） | VB-Cable / BlackHole | **不采集（空）** | **单向**：仅把座机语音写出到虚拟声卡 | **不会**（没开任何采集端点） |
+| Mode | Playback device | Capture device | Behavior | System mic prompt |
+|------|-----------------|----------------|---------|-------------------|
+| Debug mode (headphones) | Physical headphones | Physical mic | Two-way: talk on the landline normally | Yes (a real mic is used) |
+| Production mode (virtual sound card) | VB-Cable / BlackHole | **No capture (empty)** | **One-way**: only the landline voice is written to the virtual card | **No** (no capture endpoint opened) |
 
-**生产模式 = MicroSIP 风格**：是否打开麦克风完全由"是否选了输入设备"决定。采集设备留空即单向，TeleFlow 不打开任何音频输入端点（内部置 `PJSUA_SND_NULL_DEV`），系统不弹麦克风隐私提示。呼入 IVR 不再另设单向模式：只要选了采集设备，IVR 播报期间通话同样双向桥接，AI 侧可随时插话（见下节）。
+**Production mode = MicroSIP-style**: whether the microphone is opened is decided
+entirely by "whether an input device is selected". Leaving the capture device empty
+means one-way; TeleFlow opens no audio input endpoint (internally it sets
+`PJSUA_SND_NULL_DEV`), so the system shows no microphone-privacy prompt. Inbound IVR
+no longer has a separate one-way mode: as long as a capture device is selected, the IVR
+announcement still bridges the call two-way during playback, and the AI side can
+interrupt at any time (see next section).
 
-### 典型部署：座机语音经 VB-Cable 喂给三方 APP
+### Typical deployment: feed the landline voice to a third-party app via VB-Cable
 
-把座机通话语音实时送到另一个程序（语音助手 / 转写 / 录音）当麦克风输入：
+Send the landline call audio to another program (voice assistant / transcription /
+recording) as a microphone input, in real time:
 
 ```
-固定座机
-   │ 模拟电话线
+Landline phone
+   │ analog phone line
    ▼
-ATA（模拟电话适配器，转 SIP）
+ATA (analog telephone adapter, converts to SIP)
    │ SIP
    ▼
-FreeSWITCH（IP-PBX，路由 / 注册）
+FreeSWITCH (IP-PBX, routing / registration)
    │ SIP INVITE
    ▼
-TeleFlow（本程序，自动应答）
-   │ 下行音频（仅播放，不采集）
+TeleFlow (this app, auto-answers)
+   │ downlink audio (playback only, no capture)
    ▼
-VB-Cable（虚拟声卡 · 播放端）
-   │ 系统把其"录音端"呈现为麦克风
+VB-Cable (virtual sound card · playback side)
+   │ the OS exposes its "record side" as a microphone
    ▼
-三方 APP（把 VB-Cable 录音端选作"麦克风"输入）
+Third-party app (selects VB-Cable's record side as its "microphone" input)
 ```
 
-- TeleFlow 在此链路里只是 VB-Cable 的**写入方**：选「生产模式（虚拟声卡）」后，播放 = VB-Cable、采集 = 空。
-- VB-Cable **播放端**被 TeleFlow 写入（输出，不触发麦克风提示）；其**录音端**由三方 APP 打开当麦克风——那一侧的提示属于三方 APP，理应保留。
-- 红线不变：TeleFlow 仍不录音、不做 DSP，仅透传座机语音到虚拟声卡。
+- In this chain TeleFlow is only the **writer** into VB-Cable: after selecting "Production
+  mode (virtual sound card)", playback = VB-Cable, capture = empty.
+- VB-Cable's **playback side** is written by TeleFlow (output, no mic prompt); its
+  **record side** is opened by the third-party app as a microphone — that prompt belongs
+  to the third-party app and should stay.
+- The red line is unchanged: TeleFlow still records nothing, applies no DSP, and only
+  passes the landline voice through to the virtual sound card.
 
 ---
 
-## 呼入 IVR：欢迎语 + 每数字键播报 / Hook
+## Inbound IVR: welcome message + per-digit-key announcement / hook
 
-呼入自动应答后，TeleFlow 可进入一段简单 IVR：先播放**欢迎语**，再按 `1-9-0` 顺序逐项播放每个数字键**各自**的配置文字（菜单）。DTMF 监听在应答后即开启——来电者随时可按首个按键，**播报中也生效（抢断式）**，触发**该键**对应的 hook 命令。每个键独立配置 `text`（播报词）与 `hook`（命令），文字为空的键跳过不播、无 hook 的键按下时不执行命令。`ivr_enabled` 为总开关（默认开），关闭即回到纯音频路由器。
+After auto-answering an inbound call, TeleFlow can enter a simple IVR: it first plays a
+**welcome message**, then plays each digit key's own configured text (the menu) in order
+`1-9-0`. DTMF listening is enabled right after answering — the caller can press the first
+key at any time, and a key pressed **during playback also takes effect (barge-in)**,
+triggering that key's hook command. Each key is configured independently with `text`
+(announcement) and `hook` (command); a key with empty text is skipped in the menu, and a
+key with no hook runs no command when pressed. `ivr_enabled` is the master switch (on by
+default); turning it off returns TeleFlow to a pure audio router.
 
 ```
-座机来电（INVITE）
+Landline inbound (INVITE)
    │
    ▼
-TeleFlow 自动应答（CALL_CONNECTED）
+TeleFlow auto-answers (CALL_CONNECTED)
    │  ivr_enabled = True
    ▼
-播放 欢迎语（TTS → 8k mono wav，可缓存）；通话始终双向桥接，AI 侧可随时插话或打断
+Play welcome message (TTS → 8k mono wav, cacheable); the call is always bridged two-way,
+so the AI side can interrupt or talk over at any time
    │
    ▼
-按 1-9-0 顺序播放各键 text（空文字键跳过不播）；播报中按键即“抢断”：停止当前播报、取消剩余菜单项
+Play each key's text in order 1-9-0 (keys with empty text are skipped); a key pressed
+during playback is a "barge-in": stop the current announcement, cancel the remaining menu items
    │
    ▼
-来电者按 <键>（随时可按）
-   ├── 该键 hook 非空 → 执行该键命令（{call_id} / {digit}）   ← 每键独立
-   └── 停止监听后续按键；last_digit = 该键
+Caller presses <key> (any time)
+   ├── key has a non-empty hook → run that key's command ({call_id} / {digit})   ← per key
+   └── stop listening for further keys; last_digit = that key
    │
    ▼
-挂机（CALL_ENDED）
+Hang-up (CALL_ENDED)
    │
    ▼
-执行 on_hook_cmd（{last_digit} 被替换，未按键则为空串）
+Run on_hook_cmd ({last_digit} is substituted; empty string if no key was pressed)
 ```
 
-- **每键独立**：`ivr_digit_text` / `ivr_digit_hook` 均以 `"1".."9"`、`"0"` 为键；某键无文字则菜单中不播，某键无 hook 则按下时不执行命令。
-- **随时按键（抢断式）**：DTMF 监听在应答后即开启，不必等播报结束。欢迎语/菜单播报中按下按键会立即触发该键 hook，同时停掉当前播报并取消剩余菜单项，避免播报尾巴盖过按键动作；后续按键仍被忽略（首个按键生效）。
-- **语音缓存**：欢迎语与各键 `text` 首次 TTS 后按 `hash(clean_markdown(text)+voice)` 缓存 wav，同文本再次呼入直接复用。
-- **通话始终双向**：IVR 播报期间不压话筒，AI 侧（经采集设备）可随时插话或打断来电者，就像 10010 那样的「语音播报 + 实时聆听」。菜单仅由 DTMF 按键驱动，通话挂机时结束；不存在「退出 IVR 切回双向」的单独开关——只要选了采集设备，呼入通话即双向桥接。
-- 红线不变：IVR 播报仅做 TTS 播放与 DTMF 读取，不录音、不做 DSP；通话虽双向桥接，但 TeleFlow 不录音、不写通话 WAV、不做任何变换。
+- **Per-key independence**: `ivr_digit_text` / `ivr_digit_hook` are keyed by `"1".."9"`,
+  `"0"`; a key with no text is not announced in the menu, a key with no hook runs no
+  command when pressed.
+- **Press any time (barge-in)**: DTMF listening is enabled right after answering, not
+  after playback ends. A key pressed during the welcome/menue announcement immediately
+  fires that key's hook, while stopping the current announcement and cancelling the
+  remaining menu items, so the announcement tail does not cover the key action; further
+  keys are still ignored (the first key wins).
+- **Voice cache**: after the first TTS of the welcome message and each key's `text`, the
+  wav is cached by `hash(clean_markdown(text)+voice)`; a repeat inbound with the same text
+  reuses it directly.
+- **Always two-way call**: during IVR playback the mic is not suppressed, so the AI side
+  (via the capture device) can talk over or interrupt the caller at any time, like a
+  "voice announcement + live listening" service such as 10010. The menu is driven only by
+  DTMF keys and ends when the call hangs up; there is no separate "exit IVR → two-way"
+  switch — as long as a capture device is selected, the inbound call is bridged two-way.
+- The red line is unchanged: IVR playback only does TTS playback and DTMF reading — no
+  recording, no DSP; although the call is bridged two-way, TeleFlow records no call audio,
+  writes no call WAV, and applies no transformation.
 
 ---
 
-## 电话汇报（外呼 + 单向播放）：本地 RPC 控制通道
+## Phone report (outbound + one-way playback): local RPC control channel
 
-TeleFlow 不仅能接呼入，还能**主动外呼**物理座机并播放一段汇报。外部脚本（如 AI 助手的 Stop hook）用一条带 token 的本地 HTTP 请求（`POST /v1/report`）把**文本**交给 TeleFlow，由它内部完成 TTS 合成、转码、外呼、播放、播完挂断——外部脚本无需自己实现 TTS 或 SIP。这就是「通过 hook 反向给对应号码打电话」。
+TeleFlow can not only take inbound calls but also **dial the physical landline
+outbound** and play a report. An external script (e.g. an AI assistant's Stop hook) hands
+TeleFlow the **text** via a token-authenticated local HTTP request
+(`POST /v1/report`); TeleFlow internally does the TTS synthesis, transcoding, outbound
+call, playback, and hang-up on EOF — the external script needs no TTS or SIP of its own.
+This is "calling the corresponding number back through a hook".
 
 ```
-外部脚本 / hook（AI 助手任务完成）
+External script / hook (AI assistant task done)
    │ POST /v1/report  { "text": "…", "voice"?: "…" }
    │ Authorization: Bearer <rpc_token>
    ▼
-TeleFlow 本地 RPC 服务（127.0.0.1:<rpc_port>，默认 8731）
-   │ 校验 token / SIP 状态 / 座机目标 report_target
+TeleFlow local RPC service (127.0.0.1:<rpc_port>, default 8731)
+   │ verify token / SIP state / landline target report_target
    ▼
-TTS 合成（edge-tts）→ ffmpeg 转 8kHz 单声道 wav（可缓存）
+TTS synthesis (edge-tts) → ffmpeg transcode to 8kHz mono wav (cacheable)
    │
    ▼
-TeleFlow makeCall → 座机（report_target，如 sip:8000@192.168.1.116）
-   │ 座机摘机（EVENT_CALL_CONNECTED）
+TeleFlow makeCall → landline (report_target, e.g. sip:8000@192.168.1.116)
+   │ landline off-hook (EVENT_CALL_CONNECTED)
    ▼
-单向播放 wav 进通话（不桥接麦克风）
-   │ 播放结束 EOF
+One-way playback of wav into the call (no mic bridging)
+   │ playback ends (EOF)
    ▼
-自动挂断（EVENT_REPORT_COMPLETED）
+Auto hang-up (EVENT_REPORT_COMPLETED)
 ```
 
-- **本地、受控**：RPC 仅绑 `127.0.0.1`，需 `Authorization: Bearer <rpc_token>`；token 首次启动随机生成并持久化，可在设置查看/重置。并发汇报返回 `409`（单汇报槽）。
-- **文本即一切**：RPC 只发文本（+ 可选 `voice` 覆盖），合成/转码/拨号全在 TeleFlow 内；也支持 `audio_path` 覆盖跳过 TTS 直接播放。
-- **配置**：`report_target`（座机目标 SIP URI）、`report_caller_id`、`tts_voice`、`ffmpeg_path`（空 = `PATH` 自动查找）、`rpc_enabled` / `rpc_port` / `rpc_token`，以及面板上的「测试汇报」按钮。
-- 红线不变：汇报是**单向播放合成文件**，不录音通话、不写通话 WAV、不做 DSP。
-- 另有 `POST /v1/play`（向活动呼入播放提示）与 `POST /v1/ivr/replay`（重播 IVR 菜单），以及 `GET /v1/status` 探测就绪状态。
+- **Local and controlled**: the RPC binds only `127.0.0.1` and requires
+  `Authorization: Bearer <rpc_token>`; the token is randomly generated on first launch
+  and persisted, viewable/resettable in Settings. Concurrent reports return `409` (single
+  report slot).
+- **Text is everything**: the RPC sends only text (+ optional `voice` override); synthesis
+  / transcoding / dialing all happen inside TeleFlow; an `audio_path` override is also
+  supported to skip TTS and play directly.
+- **Config**: `report_target` (landline target SIP URI), `report_caller_id`, `tts_voice`,
+  `ffmpeg_path` (empty = auto-discover via `PATH`), `rpc_enabled` / `rpc_port` /
+  `rpc_token`, plus the "Test report" button on the panel.
+- The red line is unchanged: the report is **one-way playback of a synthesized file** — no
+  call recording, no call WAV, no DSP.
+- There are also `POST /v1/play` (play a prompt to an active inbound call) and
+  `POST /v1/ivr/replay` (replay the IVR menu), plus `GET /v1/status` to probe readiness.
 
 ---
 
-## Hook 命令（摘机 / 挂机）
+## Hook commands (off-hook / on-hook)
 
-TeleFlow 可以在通话生命周期的关键时刻执行 **你配置的本地命令/脚本**。这是把来电事件接入外部自动化（弹窗通知、开门、写数据库、触发录音等）的最简单方式。
+TeleFlow can run **local commands/scripts you configure** at key moments of the call
+lifecycle. This is the simplest way to wire inbound-call events into external automation
+(popup notifications, door opening, writing to a database, triggering recording, etc.).
 
-### 两个触发点
+### Two trigger points
 
-| 名称 | 配置字段 | 触发时机 | 事件 |
-|------|----------|----------|------|
-| **摘机（off-hook）** | `off_hook_cmd` | 当前 SIP **自动应答** 来电的瞬间 | `CALL_CONNECTED` |
-| **挂机（on-hook）** | `on_hook_cmd` | 通话**结束**时（座机发送 `BYE`，或应答前 `CANCEL`） | `CALL_ENDED` |
+| Name | Config field | When it fires | Event |
+|------|--------------|--------------|-------|
+| **Off-hook** | `off_hook_cmd` | The moment the current SIP **auto-answers** an inbound call | `CALL_CONNECTED` |
+| **On-hook** | `on_hook_cmd` | When the call **ends** (landline sends `BYE`, or `CANCEL` before answer) | `CALL_ENDED` |
 
-### 配置
+### Configuration
 
-在托盘菜单 → **设置** 中填写「摘机命令」「挂机命令」（留空 = 不执行）。设置写入
-`~/.config/teleflow/config.json`，**下次通话即生效，无需重启**。
+In the tray menu → **Settings**, fill in "Off-hook command" / "On-hook command" (empty =
+no command). Settings are written to `~/.config/teleflow/config.json` and **take effect on
+the next call, no restart needed**.
 
-命令中可用占位符 `{call_id}`（本次来电 ID）、`{last_digit}`（挂机前最后一个 IVR 按键，未按键则为空串）与 `{digit}`（IVR 按键事件的按键），会在执行时替换：
-
-```
-摘机命令：/usr/local/bin/on-answer.sh {call_id}
-挂机命令：/usr/local/bin/on-hangup.sh {call_id} --last-digit {last_digit}
-```
-
-### 行为约定
-
-- **非阻塞**：命令在后台线程（`daemon` 线程）中执行，`run()` 立即返回，绝不拖慢 SIP 信令或界面线程。
-- **输出被丢弃**，退出码被忽略——hook 是旁路副作用，不是通话关键路径。
-- **失败被吞掉并记入实时日志**：命令不存在或非零退出只会以 `[HOOK][ERROR] …` 形式出现在日志面板，不会中断通话。
-- 示例日志：`[HOOK] 执行命令: /usr/local/bin/on-answer.sh CALL-AB12CD`。
-
-### 平台示例
-
-**macOS —— 用系统通知验证摘机：**
+Placeholders `{call_id}` (this call's ID), `{last_digit}` (the last IVR key before
+hang-up, empty string if none), and `{digit}` (the key of an IVR digit event) are
+substituted at execution time:
 
 ```
-摘机命令：osascript -e 'display notification "摘机 {call_id}" with title "TeleFlow"'
+Off-hook command: /usr/local/bin/on-answer.sh {call_id}
+On-hook command:  /usr/local/bin/on-hangup.sh {call_id} --last-digit {last_digit}
 ```
 
-**Linux —— 写一行到呼叫日志：**
+### Behavior
+
+- **Non-blocking**: the command runs in a background (`daemon`) thread; `run()` returns
+  immediately and never slows SIP signaling or the UI thread.
+- **Output is discarded** and the exit code is ignored — a hook is a side-effect bypass,
+  not a call-critical path.
+- **Failures are swallowed and logged live**: a missing command or non-zero exit only shows
+  up in the log panel as `[HOOK][ERROR] …` and never interrupts the call.
+- Example log line: `[HOOK] 执行命令: /usr/local/bin/on-answer.sh CALL-AB12CD`.
+
+### Platform examples
+
+**macOS — verify off-hook with a system notification:**
 
 ```
-摘机命令：echo "$(date) off-hook {call_id}" >> /var/log/teleflow-hooks.log
-挂机命令：echo "$(date) on-hook  {call_id}" >> /var/log/teleflow-hooks.log
+Off-hook command: osascript -e 'display notification "摘机 {call_id}" with title "TeleFlow"'
 ```
 
-**任意脚本：** 直接写脚本路径即可，TeleFlow 以 `shell=True` 执行，因此可带参数与管道：
+**Linux — append a line to a call log:**
 
 ```
-摘机命令：/opt/teleflow/on-answer.sh --id {call_id} | logger -t teleflow
+Off-hook command: echo "$(date) off-hook {call_id}" >> /var/log/teleflow-hooks.log
+On-hook command:  echo "$(date) on-hook  {call_id}" >> /var/log/teleflow-hooks.log
 ```
 
-### 安全须知
+**Any script:** just write the script path; TeleFlow runs it with `shell=True`, so it can
+carry arguments and pipes:
 
-命令通过 `shell=True` 以**你本地配置中写定的模板**执行，并以**非交互方式**运行。两点请注意：
+```
+Off-hook command: /opt/teleflow/on-answer.sh --id {call_id} | logger -t teleflow
+```
 
-1. 只配置你自己信任的命令；配置文件的读写为本地用户权限。
-2. `{call_id}` 的值来自网关发来的 INVITE（即对方提供的 call-id），会**原样替换进命令行**。在不可信网络/网关上，恶意的 call-id 可能构成 shell 注入。若环境不可信，请勿把 `{call_id}` 直接拼进 shell 命令，或仅在内网/可信网关下使用本功能。
+### Security note
+
+Commands run via `shell=True` from **the template you wrote in your local config**, and
+they run **non-interactively**. Two points to note:
+
+1. Only configure commands you trust; config file read/write is under the local user's
+   permissions.
+2. The value of `{call_id}` comes from the INVITE sent by the gateway (i.e. the peer-
+   supplied call-id) and is substituted **verbatim into the command line**. On an
+   untrusted network/gateway, a malicious call-id could be a shell-injection source. If the
+   environment is untrusted, do not splice `{call_id}` directly into a shell command, or
+   only use this feature on an intranet / trusted gateway.
 
 ---
 
-## 开发与测试
+## Development and testing
 
 ```bash
 pip install -e ".[dev]"     # pytest + mypy
-pytest                       # 全量单测（含 FakeSipBackend 脚本化网关）
-mypy src/teleflow            # 类型检查
+pytest                       # full suite (incl. the scripted FakeSipBackend gateway)
+mypy src/teleflow            # type check
 ```
 
-- 测试通过 `pythonpath=["src"]` 解析包，并将 SIP/音频后端替换为假实现，无需显示器或原生库（CI 用 `QT_QPA_PLATFORM=offscreen`）。
-- 功能开发建议在独立 git worktree 中进行，并把该功能的 `.scratch/<slug>` issue 一并带入 worktree（保持 `master` 工作树干净），见 `.scratch/` 下的 issue 跟踪约定（`docs/agents/issue-tracker.md`）。
+- Tests resolve the package via `pythonpath=["src"]` and swap the SIP/audio backends for
+  fake implementations, needing no display or native library (CI uses
+  `QT_QPA_PLATFORM=offscreen`).
+- Feature work should happen in a separate git worktree, bringing that feature's
+  `.scratch/<slug>` issues along into the worktree (keeping the `master` working tree
+  clean); see the issue-tracking convention under `.scratch/`
+  (`docs/agents/issue-tracker.md`).
 
-## UI 原型
+## UI prototype
 
-`prototypes/teleflow-ui-prototype.html` 是一个可交互的 HTML 原型：用托盘菜单打开「设置」即可看到摘机/挂机命令输入框；用「演示事件」按钮触发呼入/挂断，日志面板会以紫色 `[HOOK]` 行展示命令执行情况。
+`prototypes/teleflow-ui-prototype.html` is an interactive HTML prototype: open "Settings"
+from the tray menu to see the off-hook/on-hook command inputs; use the "Demo events"
+button to trigger inbound/hang-up, and the log panel shows command execution as purple
+`[HOOK]` lines.

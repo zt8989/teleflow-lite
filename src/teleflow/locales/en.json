@@ -1,0 +1,6 @@
+{
+  "language.english": "English",
+  "language.chinese": "Chinese",
+  "app.name": "TeleFlow",
+  "greet": "Hello {name}"
+}

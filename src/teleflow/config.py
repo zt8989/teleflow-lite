@@ -78,6 +78,10 @@ class Settings:
     # the config is incomplete or startup fails.
     sip_auto_connect: bool = True
     log_level: str = "INFO"
+    # UI language (ticket teleflow-i18n): "auto" resolves to the system language
+    # at startup (zh_CN on a Chinese system, en elsewhere); "en" / "zh_CN" pin it.
+    # Stored verbatim, so a future locale just needs its own locales/<lang>.json.
+    language: str = "auto"
     # Hook commands (ticket 01/02): local shell commands run at call-lifecycle
     # moments, with {call_id} substituted. Empty means no hook.
     #   off_hook_cmd — when the current SIP auto-answers an incoming call (摘机).

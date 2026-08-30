@@ -30,6 +30,9 @@ a = Analysis(
     datas=[
         (os.path.join(_REPO, "prototypes", "teleflow-icon.svg"), "prototypes"),
         (os.path.join(_REPO, "prototypes", "teleflow-icon-mono.svg"), "prototypes"),
+        # i18n locale catalogs: collected next to the frozen modules
+        # (src/teleflow/locales -> teleflow/locales) so i18n._locales_dir finds them.
+        (os.path.join(_REPO, "src", "teleflow", "locales"), "teleflow/locales"),
     ],
     hiddenimports=["pjsua2"],
     hookspath=[],
