@@ -18,6 +18,7 @@ which is exactly the lossless, no-recording, no-DSP guarantee of ticket 04.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -257,7 +258,40 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
             code = getattr(prm, "code", 0)
             expiration = getattr(prm, "expiration", 0)
             if code == 200 and expiration > 0:
-                backend._handler("register", {})
+                # Forward the contact URI so the log line "SIP registered:
+                # <contact>" is populated. The field name varies across pjsua2
+                # builds: newer ones expose ``regContactURI`` on AccountInfo,
+                # while this 2.17 build only exposes ``uri`` (the account's
+                # bare AOR, e.g. "sip:1002@192.168.1.189" with no port or
+                # transport). getInfo() can also throw if the account isn't
+                # fully ready, so read everything defensively.
+                contact = ""
+                try:
+                    info = self.getInfo()
+                    contact = (
+                        getattr(info, "regContactURI", "")
+                        or getattr(info, "uri", "")
+                        or ""
+                    )
+                except Exception:  # noqa: BLE001 - never let a register callback crash
+                    contact = ""
+                if not contact:
+                    try:
+                        contact = getattr(self.cfg, "idUri", "") or ""
+                    except Exception:  # noqa: BLE001
+                        contact = ""
+                # The bare AOR lacks the bound transport port/protocol that the
+                # registrar echoes back (e.g. "...:5061;transport=UDP"). Enrich
+                # it so the log shows the real contact. backend.port is the port
+                # transportCreate() actually bound (auto-selected when the
+                # preferred one was taken), and the only transport we create is
+                # UDP.
+                if contact and getattr(backend, "port", None):
+                    m = re.match(r"^(sips?):([^@;?]+)@([^;?]+)", contact, re.IGNORECASE)
+                    if m:
+                        scheme, user, host = m.group(1), m.group(2), m.group(3).split(":")[0]
+                        contact = f"{scheme}:{user}@{host}:{backend.port};transport=UDP"
+                backend._handler("register", {"contact": contact})
             elif code == 200 and expiration == 0:
                 backend._handler("unregister", {})
             elif code not in (401, 407):
