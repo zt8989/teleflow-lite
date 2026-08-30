@@ -69,7 +69,21 @@ def _detect_windows_ui_language() -> str:
 
 
 def _detect_posix_locale() -> str:
-    """POSIX/macOS system language via the C locale (env already tried)."""
+    """POSIX/macOS system language: env vars first, then the C locale.
+
+    On these platforms ``LANGUAGE``/``LC_ALL``/``LANG`` are the canonical display
+    language signal, so they are honored here. Windows does NOT use these vars for
+    its UI language (terminals export ``LANG`` for tooling only), so Windows takes
+    a separate path in ``_detect_system_language``.
+    """
+    raw = (
+        os.environ.get("LANGUAGE")
+        or os.environ.get("LC_ALL")
+        or os.environ.get("LANG")
+        or ""
+    ).split(":")[0].split(".")[0].strip().lower()
+    if raw:
+        return "zh_CN" if raw.startswith("zh") else _FALLBACK
     try:
         raw = (locale.getlocale()[0] or "").lower()
     except (ValueError, OSError):
@@ -85,18 +99,11 @@ def _detect_posix_locale() -> str:
 def _detect_system_language() -> str:
     """Resolve the OS language to one of our supported locales.
 
-    Honors ``LANGUAGE``/``LC_ALL``/``LANG`` first, then the Windows UI language
-    (kernel32) on Windows, then the C locale on POSIX/macOS. Anything resolving to
-    ``zh*`` is Chinese; everything else falls back to English.
+    On Windows the display language comes from the OS (``GetUserDefaultUILanguage``)
+    — POSIX ``LANG`` is ignored because terminal sessions set it for tooling and it
+    does not reflect the UI the user sees. On POSIX/macOS the env vars + C locale
+    are authoritative. Anything resolving to ``zh*`` is Chinese; else English.
     """
-    raw = (
-        os.environ.get("LANGUAGE")
-        or os.environ.get("LC_ALL")
-        or os.environ.get("LANG")
-        or ""
-    ).split(":")[0].split(".")[0].strip().lower()
-    if raw:
-        return "zh_CN" if raw.startswith("zh") else _FALLBACK
     if sys.platform == "win32":
         win = _detect_windows_ui_language()
         if win:

@@ -8,6 +8,7 @@ these tests do not depend on the full UI catalog.
 from __future__ import annotations
 
 import locale
+import sys
 
 import pytest
 
@@ -72,7 +73,10 @@ def test_auto_resolves_to_english_on_non_chinese_system(fresh_i18n):
 
 
 def test_auto_resolves_to_chinese_when_lang_is_zh(fresh_i18n, monkeypatch):
+    # POSIX path: a zh_CN LANG selects Chinese. (Windows ignores LANG for UI
+    # language, so this path is only exercised off-win32.)
     monkeypatch.setenv("LANG", "zh_CN.UTF-8")
+    monkeypatch.setattr(sys, "platform", "linux")
     i18n.set_language("auto")
     assert i18n.tr("language.chinese") == "中文"
 
