@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
 from teleflow.config import ConfigStore, Settings
@@ -112,13 +113,18 @@ class PortAudioBackend:
         # aborts if a second ``pj.Endpoint()`` is constructed. The library state
         # is an int in 2.17 (0 = not created, 1 = created, 2 = initialized); only
         # create/init what the SIP backend has not already initialized.
-        from teleflow.pjsua2_backend import get_shared_endpoint
+        from teleflow.pjsua2_backend import _ep_config, get_shared_endpoint
 
         ep = get_shared_endpoint(pj)
         if ep.libGetState() == 0:  # pragma: no cover - needs lib
             ep.libCreate()
         if ep.libGetState() < 2:  # pragma: no cover - needs lib
-            ep.libInit(pj.EpConfig())
+            ep.libInit(
+                _ep_config(
+                    pj,
+                    log_file=str(Path.home() / ".config" / "teleflow" / "pjsua2.log"),
+                )
+            )
 
         manager = ep.audDevManager()
         count = manager.getDevCount()  # pragma: no cover - needs lib

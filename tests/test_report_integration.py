@@ -22,6 +22,7 @@ from teleflow.rpc import RpcServer
 from teleflow.sip import (
     EVENT_REPORT_COMPLETED,
     EVENT_REPORT_CONNECTED,
+    EVENT_REPORT_FAILED,
     EVENT_REPORT_STARTED,
     FakeSipBackend,
     SipCoreService,
@@ -184,6 +185,103 @@ def test_ffmpeg_missing_via_rpc_returns_400_and_recovers(tmp_path: Path) -> None
         service._tts = FakeTtsBackend()
         status2, _ = _post(rpc, token, {"text": "汇报内容 2"})
         assert status2 == 202
+    finally:
+        rpc.stop()
+
+
+def test_report_call_failure_resets_slot(tmp_path: Path) -> None:
+    """A report call that never connects (busy / no answer / rejected) must not
+    wedge the report slot: ``report_disconnected`` resets it so the next
+    /v1/report works instead of 409-ing forever."""
+    store = _tmp_store(tmp_path)
+    backend = FakeSipBackend()
+    service = SipCoreService(backend, store, tts=FakeTtsBackend())
+    collected: list[dict] = []
+    service.on(EVENT_REPORT_FAILED, lambda **kw: collected.append(kw))
+    service.start()
+    rpc = RpcServer(service, store)
+    rpc.start()
+    try:
+        token = store.load().rpc_token
+        status, body = _post(rpc, token, {"text": "汇报内容"})
+        assert status == 202, body
+        assert service.report_in_progress is True
+
+        # Desk phone never answers; the call tears down before any media came
+        # up. No "bye" event fires for report calls (by design), so the service
+        # must reset on report_disconnected.
+        backend.receive_report_disconnected("rpt-1")
+        assert service.report_in_progress is False
+        assert collected and collected[0]["reason"] == "call_failed"
+
+        # A subsequent report succeeds again (the slot was freed).
+        status2, _ = _post(rpc, token, {"text": "汇报内容 2"})
+        assert status2 == 202
+    finally:
+        rpc.stop()
+
+
+def test_report_eof_resets_before_deferred_hangup(tmp_path: Path) -> None:
+    """The EOF handler must free the report slot immediately even when the
+    hangup itself is deferred (production marshals it onto the Qt main thread —
+    pjsua2 deadlocks if hangup re-enters from the EOF callback thread, which
+    used to leave report_in_progress stuck true after every report)."""
+    store = _tmp_store(tmp_path)
+    backend = FakeSipBackend()
+    service = SipCoreService(backend, store, tts=FakeTtsBackend())
+    collected: list[tuple[str, dict]] = []
+    service.on(EVENT_REPORT_COMPLETED, lambda **kw: collected.append(("completed", kw)))
+    deferred: list = []
+    service._defer = deferred.append  # non-blocking, like MainWindow.gui
+    service.start()
+    rpc = RpcServer(service, store)
+    rpc.start()
+    try:
+        token = store.load().rpc_token
+        status, _ = _post(rpc, token, {"text": "汇报内容"})
+        assert status == 202
+        backend.receive_report_connected("rpt-1")
+        backend.receive_report_playback_done("rpt-1")
+
+        # Slot freed and event delivered immediately, hangup still queued.
+        assert service.report_in_progress is False
+        assert collected and collected[0][0] == "completed"
+        assert backend.hung_up == []
+
+        # The deferred hangup runs later (Qt main thread in production).
+        for fn in deferred:
+            fn()
+        assert "rpt-1" in backend.hung_up
+    finally:
+        rpc.stop()
+
+
+class _NoPlaybackBackend(FakeSipBackend):
+    """Backend whose media never comes up for the connected report call."""
+
+    def play_file_to_call(self, call_id: str, wav_path: str, *, hangup_on_eof: bool = False) -> bool:  # noqa: ARG002
+        return False
+
+
+def test_report_playback_unavailable_fails_and_resets(tmp_path: Path) -> None:
+    """If the connected report call's media can't be played, the report fails
+    explicitly (and hangs up) instead of waiting forever for an EOF."""
+    store = _tmp_store(tmp_path)
+    backend = _NoPlaybackBackend()
+    service = SipCoreService(backend, store, tts=FakeTtsBackend())
+    collected: list[dict] = []
+    service.on(EVENT_REPORT_FAILED, lambda **kw: collected.append(kw))
+    service.start()
+    rpc = RpcServer(service, store)
+    rpc.start()
+    try:
+        token = store.load().rpc_token
+        status, body = _post(rpc, token, {"text": "汇报内容"})
+        assert status == 202, body
+        backend.receive_report_connected("rpt-1")
+        assert service.report_in_progress is False
+        assert collected and collected[0]["reason"] == "playback_unavailable"
+        assert "rpt-1" in backend.hung_up
     finally:
         rpc.stop()
 

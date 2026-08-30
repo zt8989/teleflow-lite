@@ -18,6 +18,7 @@ which is exactly the lossless, no-recording, no-DSP guarantee of ticket 04.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Callable
 
 from teleflow.config import ConfigStore
@@ -94,6 +95,19 @@ def _registrar_uri(host: str, port: int) -> str:
 def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
     """Build the pjsua2 Account/Call subclasses wired to this backend."""
 
+    def _audio_media_active(info: Any) -> bool:
+        """True when the call's media list has an ACTIVE audio stream.
+
+        Early media (a 183 with SDP) already activates the stream while the
+        peer is still ringing, so alone this must never mean "the phone was
+        picked up"; callers combine it with the INVITE state (CONFIRMED).
+        """
+        return any(
+            m.type == pj.PJMEDIA_TYPE_AUDIO
+            and m.status == pj.PJSUA_CALL_MEDIA_ACTIVE
+            for m in info.media
+        )
+
     class Call(pj.Call):  # type: ignore[misc, valid-type]
         def __init__(self, account: Any, call_id: int = -1) -> None:
             # For an inbound call the object must be constructed with the
@@ -106,6 +120,24 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
 
         def onCallState(self, prm: Any) -> None:  # noqa: ARG002 - prm unused
             info = self.getInfo()
+            if (
+                getattr(self, "_is_report", False)
+                and info.state == pj.PJSIP_INV_STATE_CONFIRMED
+            ):
+                # Early media (183 w/ SDP) activates the media while the phone
+                # is still ringing; playback must not start until the peer
+                # actually answers (200/INVITE -> CONFIRMED), or the caller
+                # hears the middle of the report when they pick up.
+                self._report_call_confirmed = True
+                if (
+                    not getattr(self, "_report_connected_fired", False)
+                    and _audio_media_active(info)
+                    and backend._handler is not None
+                ):
+                    self._report_connected_fired = True
+                    backend._handler(
+                        "report_connected", {"call_id": str(info.id)}
+                    )
             if info.state != pj.PJSIP_INV_STATE_DISCONNECTED:
                 return
             call_id = str(info.id)
@@ -119,8 +151,17 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
             # otherwise the UI stays stuck on "通话中" after a hang-up. pjsua2
             # dispatches this callback to the attached Call object once the
             # call is torn down. A report call drives its own lifecycle via
-            # "report_eof", so it must not emit the normal call-ended event.
-            if not getattr(self, "_is_report", False) and backend._handler is not None:
+            # "report_eof", so it must not emit the normal call-ended event;
+            # but a report call that never connected (busy / no answer /
+            # rejected) has no EOF coming, so it signals "report_disconnected"
+            # instead and the service resets the report slot.
+            if getattr(self, "_is_report", False):
+                if (
+                    not getattr(self, "_report_connected_fired", False)
+                    and backend._handler is not None
+                ):
+                    backend._handler("report_disconnected", {"call_id": call_id})
+            elif backend._handler is not None:
                 backend._handler("bye", {"call_id": call_id})
 
         def onCallMediaState(self, prm: Any) -> None:  # noqa: ARG002 - prm unused
@@ -133,14 +174,19 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
                     continue
                 # A report call is played into (one-way) by the service on
                 # connect; it must NOT be bridged to the user's sound devices.
-                # Signal connect exactly once and let the service drive playback.
+                # Signal connect exactly once — only after the call was truly
+                # answered (CONFIRMED), never on early media (183) — and let
+                # the service drive playback.
                 if getattr(self, "_is_report", False):
-                    if not getattr(self, "_report_connected_fired", False):
+                    if (
+                        not getattr(self, "_report_connected_fired", False)
+                        and getattr(self, "_report_call_confirmed", False)
+                        and backend._handler is not None
+                    ):
                         self._report_connected_fired = True
-                        if backend._handler is not None:
-                            backend._handler(
-                                "report_connected", {"call_id": str(info.id)}
-                            )
+                        backend._handler(
+                            "report_connected", {"call_id": str(info.id)}
+                        )
                     return
             # Inbound calls (incl. IVR) are always bridged two-way. Tell the
             # service the media is active so it can (re)start IVR playback; a
@@ -290,6 +336,28 @@ def _new_call_op(pj: Any) -> Any:
     return op
 
 
+def _ep_config(pj: Any, log_file: str | None = None) -> Any:
+    """Shared ``EpConfig`` for the process-wide pjsua2 endpoint.
+
+    The audio layer and the SIP backend both create/init the shared endpoint;
+    whichever runs first wins, so both must apply the same config. In
+    particular pjsua2's C-side logging holds its internal write lock; another
+    thread making a pjsua2 API call (which also logs) then blocks on it while
+    the writer waits on the pjsua mutex the caller holds — a deadlock that
+    froze the app at every report EOF and on the outbound 407. Directing the
+    log to a dedicated file keeps that lock off the shared stdio stream.
+    """
+    cfg = pj.EpConfig()
+    if log_file is not None:
+        cfg.logConfig.level = 5
+        cfg.logConfig.consoleLevel = 0
+        try:
+            cfg.logConfig.filename = log_file
+        except Exception:  # noqa: BLE001 - logging stays best-effort
+            pass
+    return cfg
+
+
 class Pjsua2Backend:
     """Native SIP backend. Construction fails fast if pjsua2 is absent."""
 
@@ -333,7 +401,12 @@ class Pjsua2Backend:
         if self._ep.libGetState() == 0:
             self._ep.libCreate()
         if self._ep.libGetState() < 2:
-            self._ep.libInit(self._pj.EpConfig())
+            self._ep.libInit(
+                _ep_config(
+                    self._pj,
+                    log_file=str(Path.home() / ".config" / "teleflow" / "pjsua2.log"),
+                )
+            )
         mgr = self._ep.audDevManager()
         self._bridge = MediaBridge(Pjsua2AudioController(mgr, self._pj))
         self._call_cls, self._account_cls = _make_classes(self._pj, self)
@@ -421,7 +494,11 @@ class Pjsua2Backend:
     def hangup(self, call_id: str) -> None:  # pragma: no cover
         call = self._calls.get(call_id)
         if call is not None:
-            call.hangup()
+            # Call.hangup() has no default for prm either (same SWIG quirk as
+            # Call.makeCall's prm): omitting it is a TypeError, which used to be
+            # swallowed by the EOF callback and left the report slot wedged.
+            op = _new_call_op(self._pj)
+            call.hangup(op)
 
     def place_call(self, target: str) -> None:  # pragma: no cover
         self._apply_route()
@@ -445,6 +522,7 @@ class Pjsua2Backend:
         call._is_report = True
         call._report_file = wav_path
         call._report_connected_fired = False
+        call._report_call_confirmed = False
         op = _new_call_op(self._pj)
         call.makeCall(target, op)
         # Keep a reference (see place_call: GC of the wrapper hangs up the call).

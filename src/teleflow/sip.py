@@ -300,6 +300,10 @@ class FakeSipBackend:
         """Simulate playback EOF for the report call (test hook)."""
         self._fire("report_eof", call_id=call_id)
 
+    def receive_report_disconnected(self, call_id: str) -> None:
+        """Simulate the outbound report call ending before playback (test hook)."""
+        self._fire("report_disconnected", call_id=call_id)
+
     def receive_playback_done(self, call_id: str) -> None:
         """Simulate an IVR menu item's playback EOF (test hook). The stock fake
         fires this synchronously inside play_file_to_call; a holding fake uses
@@ -361,6 +365,11 @@ class SipCoreService:
         self._report_id: str | None = None
         self._report_call_id: str | None = None
         self._report_wav: Path | None = None
+        # Optional non-blocking marshal onto the GUI thread (wired by the app
+        # shell to MainWindow.gui). The report EOF's hangup must not run on
+        # pjsua2's callback thread; headless tests and the scripted backend run
+        # it inline.
+        self._defer: Callable[[Callable[[], None]], None] = lambda fn: fn()
         # Inbound IVR state (feature teleflow-call-ivr): after auto-answer, play a
         # welcome message then a per-digit menu, then act on the first DTMF key.
         self._ivr_active = False
@@ -560,22 +569,42 @@ class SipCoreService:
         self._emit(EVENT_REPORT_CONNECTED, call_id=call_id)
         self._emit(EVENT_REPORT_PLAYING, call_id=call_id)
         assert self._report_wav is not None
-        self._backend.play_file_to_call(call_id, str(self._report_wav), hangup_on_eof=True)
+        ok = self._backend.play_file_to_call(
+            call_id, str(self._report_wav), hangup_on_eof=True
+        )
+        if not ok:
+            # Media never became playable (codec/format mismatch): no EOF would
+            # ever fire for this call. Fail explicitly and hang up instead of
+            # leaving the report slot wedged for the rest of the session.
+            self._log_line(f"[REPORT] 无法开始播放, 挂断 (call {call_id})")
+            self._backend.hangup(call_id)
+            self._fail_report("playback_unavailable")
 
     def _on_report_eof(self, call_id: str) -> None:
         if not self._report_active:
             return
+        report_id = self._report_id or ""
         self._log_line(f"[REPORT] 播放结束, 挂断 (call {call_id})")
-        self._backend.hangup(call_id)
         self._report_state = ReportState.COMPLETED
-        self._emit(EVENT_REPORT_COMPLETED, report_id=self._report_id or "", call_id=call_id)
+        # Reset BEFORE anything that can fail: a wedged pjsua2 call or a raising
+        # subscriber must never leave the report slot stuck (repro: after every
+        # successful report, report_in_progress stayed true).
         self._reset_report()
+        self._emit(EVENT_REPORT_COMPLETED, report_id=report_id, call_id=call_id)
+        # Hang up on the GUI thread (app shell wires _defer to MainWindow.gui):
+        # pjsua2 API calls must not re-enter from its own callback thread, and
+        # by the time the queued call runs, the EOF callback has fully unwound
+        # so no pjsua2 lock is contended. Headless tests run it inline.
+        self._defer(lambda: self._backend.hangup(call_id))
 
     def _fail_report(self, reason: str) -> None:
+        report_id = self._report_id or ""
         self._log_line(f"[REPORT] 汇报失败: {reason}")
         self._report_state = ReportState.FAILED
-        self._emit(EVENT_REPORT_FAILED, reason=reason, report_id=self._report_id or "")
+        # Reset before emitting (see _on_report_eof): a raising subscriber must
+        # not leave the report slot wedged.
         self._reset_report()
+        self._emit(EVENT_REPORT_FAILED, reason=reason, report_id=report_id)
 
     def _reset_report(self) -> None:
         self._report_active = False
@@ -840,6 +869,15 @@ class SipCoreService:
             self._on_report_connected(str(data["call_id"]))
         elif name == "report_eof":
             self._on_report_eof(str(data["call_id"]))
+        elif name == "report_disconnected":
+            # The outbound report call tore down before playback EOF (busy,
+            # no answer, rejected, or the peer hung up before the file ended).
+            # No other event resets the report slot for a call that never
+            # connected, so without this /v1/report would stay wedged with
+            # "report already in progress" until the app is restarted.
+            if self._report_active:
+                self._report_call_id = None
+                self._fail_report("call_failed")
         elif name == "call_media_active":
             self._on_call_media_active(str(data["call_id"]))
         elif name == "media_error":

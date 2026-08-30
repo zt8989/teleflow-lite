@@ -5,8 +5,10 @@ and TTS backends — no pjsua2, no network, no ffmpeg.
 """
 
 import json
+import time
 import urllib.request
 from pathlib import Path
+from typing import Callable
 
 from teleflow.config import ConfigStore
 from teleflow.rpc import RpcServer
@@ -239,6 +241,16 @@ def test_ivr_replay_without_active_call_returns_404(tmp_path: Path) -> None:
         assert json.loads(e.read())["error"] == "no active call"
 
 
+def _wait_for(predicate: Callable[[], bool], timeout: float = 2.0) -> bool:
+    """Poll ``predicate`` until it holds or ``timeout`` elapses."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
 def test_rpc_requests_log_to_unified_logger(tmp_path: Path) -> None:
     # Every RPC response is recorded via the unified log API (file + UI panel
     # get the same line): 2xx as INFO, 4xx as WARNING — and never the token.
@@ -260,7 +272,7 @@ def test_rpc_requests_log_to_unified_logger(tmp_path: Path) -> None:
         )
         with urllib.request.urlopen(req, timeout=5):
             pass
-        assert "[RPC] GET /v1/status -> 200" in lines
+        assert _wait_for(lambda: "[RPC] GET /v1/status -> 200" in lines)
 
         bad = urllib.request.Request(
             f"http://127.0.0.1:{rpc.port}/v1/status",
@@ -271,7 +283,10 @@ def test_rpc_requests_log_to_unified_logger(tmp_path: Path) -> None:
             assert False, "expected 401"
         except urllib.error.HTTPError as e:
             assert e.code == 401
-        assert any("[RPC][WARN] GET /v1/status -> 401" in l for l in lines)
+        # The [RPC] log line is appended after the response bytes are written,
+        # so the client can see the status before the line lands — poll briefly
+        # instead of asserting on a race.
+        assert _wait_for(lambda: any("[RPC][WARN] GET /v1/status -> 401" in l for l in lines))
         # The bearer token must never appear in a log line.
         assert all("tok" not in l for l in lines)
     finally:

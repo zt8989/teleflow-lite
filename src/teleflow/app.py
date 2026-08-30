@@ -689,6 +689,24 @@ class SettingsDialog(QDialog):
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
+class _RpcCall:
+    """One blocking RPC dispatch onto the GUI thread.
+
+    The RPC server hands report/play/replay work to a scheduler so it runs on
+    the Qt main thread (pjsua2 is not thread-safe; see ``scheduler`` above).
+    ``done`` is set once the main thread ran the call; ``error`` re-raises any
+    exception on the waiting HTTP thread so status codes still map correctly.
+    """
+
+    __slots__ = ("fn", "value", "error", "done")
+
+    def __init__(self, fn: Callable[[], object]) -> None:
+        self.fn = fn
+        self.value: object | None = None
+        self.error: BaseException | None = None
+        self.done = threading.Event()
+
+
 class MainWindow(QMainWindow):
     # Worker->GUI handoff for the async test-report path: emitted from the
     # synthesis thread, delivered as a queued call on the GUI thread (PyQt6's
@@ -700,6 +718,9 @@ class MainWindow(QMainWindow):
     # updates flow from there; PyQt widgets must only be touched on the GUI
     # thread, or QPlainTextEdit etc. can access-violate (Qt6Gui.dll 0xc0000005).
     _gui_task = pyqtSignal(object)
+    # Blocking RPC dispatcher: an HTTP handler thread waits on the call while
+    # it executes on the GUI thread (see _RpcCall / rpc_scheduler below).
+    _rpc_task = pyqtSignal(object)
 
     def __init__(
         self,
@@ -725,6 +746,7 @@ class MainWindow(QMainWindow):
         self._synth_done.connect(self._finish_test_report)
         self._synth_timed_out.connect(self._log_synth_timeout)
         self._gui_task.connect(self._run_gui_task)
+        self._rpc_task.connect(self._run_rpc_task)
         self.setWindowTitle("TeleFlow — 座机声音流转助手")
         self.setWindowIcon(_load_icon())
         self.resize(680, 520)
@@ -757,6 +779,32 @@ class MainWindow(QMainWindow):
 
     def _run_gui_task(self, fn: Callable[[], None]) -> None:
         fn()
+
+    def rpc_scheduler(self, fn: Callable[[], object]) -> object:
+        """Blocking marshal of an RPC-triggered service call onto the GUI thread.
+
+        ``RpcServer`` hands report/play/replay work here so pjsua2 calls (e.g.
+        an outbound ``makeCall``) never run on the HTTP handler thread: that
+        used to deadlock against pjsua2's worker thread while it processed the
+        peer's 407 auth challenge, freezing the whole app (the pjsua log cut
+        off mid-line) and leaving the report slot wedged. The handler waits on
+        ``_RpcCall.done`` so the reply is sent only after the call finished and
+        exceptions still map to the documented HTTP status codes.
+        """
+        call = _RpcCall(fn)
+        self._rpc_task.emit(call)
+        call.done.wait()
+        if call.error is not None:
+            raise call.error
+        return call.value
+
+    def _run_rpc_task(self, call: _RpcCall) -> None:
+        try:
+            call.value = call.fn()
+        except Exception as exc:  # noqa: BLE001 - re-raised on the HTTP thread
+            call.error = exc
+        finally:
+            call.done.set()
 
     def append_log_line(self, line: str) -> None:
         """Public log entry: routed through the unified logger so the UI panel
@@ -1103,6 +1151,11 @@ def build_app(
     # Route the service's ad-hoc lines ([IVR]/[REPORT]/[TTS]/[FFMPEG]) and the
     # hook runner's [HOOK] lines through the same logger (file + UI panel).
     service._log = logger.log_line
+    # pjsua2 API calls must not re-enter from a callback thread: the report
+    # EOF's hangup used to wedge the whole app (report_in_progress stuck true
+    # after every report). gui() schedules it on the Qt main thread,
+    # non-blocking for the callback thread.
+    service._defer = window.gui
     tts.logger = logger.log_line
 
     # Re-route a live call when the user switches the playback/capture device.
@@ -1126,7 +1179,11 @@ def build_app(
 
     # Local loopback RPC control channel (feature teleflow-phone-report). Bound to
     # 127.0.0.1 only, bearer-token authenticated. Skipped if disabled in settings.
-    rpc = RpcServer(service, store, log=logger.log_line)
+    # The scheduler runs every RPC-triggered service call (report/play/replay)
+    # on the Qt main thread: pjsua2 is not thread-safe, and an outbound report
+    # call driven from an HTTP handler thread used to deadlock the whole app
+    # against pjsua2's worker thread (see MainWindow.rpc_scheduler).
+    rpc = RpcServer(service, store, log=logger.log_line, scheduler=window.rpc_scheduler)
     rpc.start()
 
     if settings.autostart:
