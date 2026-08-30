@@ -15,6 +15,7 @@ call. See the feature spec's red-line note.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import os
 import re
 import shutil
@@ -30,6 +31,10 @@ DEFAULT_CACHE_DIR = DEFAULT_CONFIG_PATH.parent / "reports"
 # Transcode params mirror the user's battle-tested FreeSWITCH pipeline:
 # 8 kHz, mono, 16-bit PCM — exactly what pjsua2's wav player expects.
 TRANSCODE_ARGS = ["-ar", "8000", "-ac", "1", "-c:a", "pcm_s16le"]
+
+# Per-attempt deadline for a single edge-tts synthesis call. An edge-tts request
+# that exceeds this is treated as a timeout and retried (see EdgeTtsBackend).
+EDGE_TTS_TIMEOUT_SECONDS = 30
 
 
 class TtsError(Exception):
@@ -80,22 +85,38 @@ class TtsBackend(Protocol):
         """Transcode ``mp3_path`` to ``wav_path`` (8k mono pcm_s16le); return wav."""
         ...
 
-    def synthesize_to_wav(self, text: str, voice: str) -> Path:
+    def synthesize_to_wav(self, text: str, voice: str, prefix: str = "ivr") -> Path:
         """Render ``text`` with ``voice`` straight to a playable wav (8k mono).
 
-        The default implementation sequences ``synthesize`` + ``transcode``; a
-        caching wrapper overrides it to reuse a previously rendered wav.
+        ``prefix`` is a filename namespace (e.g. ``"ivr"`` / ``"report"``) used
+        by caching backends; it never affects the cache *key*. The default
+        implementation sequences ``synthesize`` + ``transcode``; a caching
+        wrapper overrides it to reuse a previously rendered wav.
         """
         ...
 
 
 class EdgeTtsBackend:
-    """Real backend: edge-tts for speech, external ffmpeg for transcode."""
+    """Real backend: edge-tts for speech, external ffmpeg for transcode.
 
-    def __init__(self, ffmpeg_path: str = "", cache_dir: Path | None = None) -> None:
+    A single edge-tts synthesis is bounded by ``EDGE_TTS_TIMEOUT_SECONDS`` and
+    retried up to ``retry_attempts`` times on transient failures (timeouts,
+    network blips) before giving up — a flaky network should not abort the whole
+    report/IVR prompt.
+    """
+
+    def __init__(
+        self,
+        ffmpeg_path: str = "",
+        cache_dir: Path | None = None,
+        retry_attempts: int = 3,
+        logger: Callable[[str], None] | None = None,
+    ) -> None:
         self._ffmpeg_path = ffmpeg_path
         self._cache_dir = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE_DIR
         self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._retry_attempts = retry_attempts
+        self.logger = logger
 
     def _ffmpeg_bin(self) -> str:
         """Resolve the ffmpeg binary: configured path first, else PATH.
@@ -109,13 +130,33 @@ class EdgeTtsBackend:
             )
         return candidate
 
-    def synthesize(self, text: str, voice: str) -> Path:  # pragma: no cover - needs network
+    def synthesize(self, text: str, voice: str) -> Path:
+        """Render ``text`` with ``voice`` to an mp3, retrying transient edge-tts
+        / network failures (incl. timeouts) up to ``retry_attempts`` times."""
+        last_err: Exception | None = None
+        for attempt in range(1, self._retry_attempts + 1):
+            try:
+                return self._synthesize_once(text, voice)
+            except Exception as exc:  # noqa: BLE001 - transient network errors are retried
+                last_err = exc
+                if self.logger is not None:
+                    self.logger(
+                        f"[TTS] 合成失败(第{attempt}/{self._retry_attempts}次, 将重试): {exc}"
+                    )
+        raise TtsError(
+            f"edge-tts 合成失败(已重试{self._retry_attempts}次): {last_err}"
+        ) from last_err
+
+    def _synthesize_once(self, text: str, voice: str) -> Path:  # pragma: no cover - needs network
+        """One best-effort edge-tts synthesis, bounded by EDGE_TTS_TIMEOUT_SECONDS."""
         import edge_tts
 
         ts = time.strftime("%Y%m%d_%H%M%S")
         mp3 = self._cache_dir / f"report_{ts}.mp3"
         communicate = edge_tts.Communicate(text, voice)
-        asyncio.run(communicate.save(str(mp3)))
+        asyncio.run(
+            asyncio.wait_for(communicate.save(str(mp3)), timeout=EDGE_TTS_TIMEOUT_SECONDS)
+        )
         return mp3
 
     def transcode(self, mp3_path: Path, wav_path: Path) -> Path:
@@ -130,7 +171,7 @@ class EdgeTtsBackend:
             raise FfmpegError(f"ffmpeg transcode failed: {err}")
         return wav_path
 
-    def synthesize_to_wav(self, text: str, voice: str) -> Path:  # pragma: no cover - needs network
+    def synthesize_to_wav(self, text: str, voice: str, prefix: str = "ivr") -> Path:  # pragma: no cover - needs network
         """Sequence ``synthesize`` + ``transcode`` into one wav (intermediate mp3)."""
         mp3 = self.synthesize(text, voice)
         wav_path = mp3.with_suffix(".wav")
@@ -158,7 +199,7 @@ class FakeTtsBackend:
         self.transcoded.append((mp3_path, wav_path))
         return wav_path
 
-    def synthesize_to_wav(self, text: str, voice: str) -> Path:
+    def synthesize_to_wav(self, text: str, voice: str, prefix: str = "ivr") -> Path:
         # Record the synthesize call so caching tests can observe cache hits
         # (a hit never reaches this method on the caching wrapper's inner).
         self.synthesized.append((text, voice))
@@ -179,10 +220,12 @@ class CachingTtsBackend:
         inner: TtsBackend,
         cache_dir: Path | None = None,
         logger: Callable[[str], None] | None = None,
+        cache_ttl_seconds: int = 604800,
     ) -> None:
         self._inner = inner
         self._cache_dir = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE_DIR
         self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._cache_ttl = cache_ttl_seconds
         self.logger = logger
         # Recorded for tests: (text, voice) tuples that actually reached the inner
         # backend (i.e. cache misses / changes).
@@ -201,8 +244,11 @@ class CachingTtsBackend:
     def synthesize_to_wav(self, text: str, voice: str, prefix: str = "ivr") -> Path:
         key = self._cache_key(text, voice)
         wav_path = self._cache_dir / f"{prefix}_{key}.wav"
-        if wav_path.exists():
-            # Cache hit: no edge-tts / ffmpeg, return the previously rendered wav.
+        fresh = wav_path.exists() and (
+            time.time() - wav_path.stat().st_mtime
+        ) <= self._cache_ttl
+        if fresh:
+            # Cache hit (within TTL): no edge-tts / ffmpeg, return the wav.
             if self.logger is not None:
                 self.logger(f"[TTS] 缓存命中: {prefix}_{key}.wav")
             return wav_path
@@ -211,6 +257,9 @@ class CachingTtsBackend:
         mp3 = self._inner.synthesize(clean_markdown(text), voice)
         wav = self._inner.transcode(mp3, wav_path)
         self.rendered.append((text, voice))
+        if self.logger is not None:
+            self.logger(f"[TTS] 合成完成: {wav_path}")
+            self.logger(f"[FFMPEG] 转码完成: {wav_path}")
         return wav
 
     # Delegate the lower-level protocol methods so this wrapper satisfies
@@ -221,3 +270,101 @@ class CachingTtsBackend:
 
     def transcode(self, mp3_path: Path, wav_path: Path) -> Path:
         return self._inner.transcode(mp3_path, wav_path)
+
+
+# ---------------------------------------------------------------------------
+# Conversion queue: render text -> wav off the call / event thread.
+# ---------------------------------------------------------------------------
+class ConversionQueue:
+    """Background converter: submits ``(text, voice)`` jobs to a bounded worker
+    pool and delivers each result via
+    ``on_done(wav_path, error=..., order=...)``.
+
+    Used in production. Results are marshalled onto the GUI thread via
+    ``marshal`` (the app wires ``service._defer`` -> ``MainWindow.gui``) so the
+    callback can safely touch Qt / pjsua2. ``order`` is an opaque tag the caller
+    uses to keep playback ordering independent of completion order (see the IVR
+    flow, which submits all prompts in parallel but plays them by ``order``).
+    """
+
+    def __init__(
+        self,
+        backend: TtsBackend,
+        max_workers: int = 4,
+        marshal: Callable[[Callable[[], None]], None] | None = None,
+        logger: Callable[[str], None] | None = None,
+    ) -> None:
+        self._backend = backend
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="teleflow-tts"
+        )
+        self._marshal = marshal
+        self.logger = logger
+
+    def submit(
+        self,
+        text: str,
+        voice: str,
+        *,
+        prefix: str = "ivr",
+        order: object = None,
+        on_done: Callable[..., None],
+    ) -> None:
+        def _run() -> None:
+            try:
+                wav = self._backend.synthesize_to_wav(text, voice, prefix=prefix)
+            except Exception as exc:  # noqa: BLE001 - report, don't crash the pool
+                result: Path | None = None
+                err: Exception | None = exc
+            else:
+                result, err = wav, None
+
+            def _deliver() -> None:
+                on_done(result, error=err, order=order)
+
+            if self._marshal is not None:
+                self._marshal(_deliver)
+            else:
+                _deliver()
+
+        self._executor.submit(_run)
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(wait=False)
+
+
+class SyncConversionQueue:
+    """Inline variant of :class:`ConversionQueue` that runs the conversion and
+    delivers ``on_done`` synchronously (no threads). Used by headless tests so
+    assertions about playback / placement stay deterministic, mirroring
+    ``FakeSipBackend`` / ``FakeTtsBackend``.
+    """
+
+    def __init__(
+        self,
+        backend: TtsBackend,
+        logger: Callable[[str], None] | None = None,
+    ) -> None:
+        self._backend = backend
+        self.logger = logger
+
+    def submit(
+        self,
+        text: str,
+        voice: str,
+        *,
+        prefix: str = "ivr",
+        order: object = None,
+        on_done: Callable[..., None],
+    ) -> None:
+        try:
+            wav = self._backend.synthesize_to_wav(text, voice, prefix=prefix)
+        except Exception as exc:  # noqa: BLE001
+            result: Path | None = None
+            err: Exception | None = exc
+        else:
+            result, err = wav, None
+        on_done(result, error=err, order=order)
+
+    def shutdown(self) -> None:
+        pass

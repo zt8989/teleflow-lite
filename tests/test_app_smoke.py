@@ -182,6 +182,27 @@ def test_settings_dialog_ivr_digit_edits_round_trip(tmp_path) -> None:
     window.close()
 
 
+def test_settings_dialog_exposes_all_remaining_fields(tmp_path) -> None:
+    """Every setting that used to be config-only now has a dialog control and
+    round-trips through _load_settings/_save_and_close."""
+    app, window, service, manager, _ = _make_window(tmp_path)
+    dialog = SettingsDialog(manager, window)
+    dialog.sip_port.setText("5062")
+    dialog.sip_auto_connect.setChecked(False)
+    dialog.report_hangup_on_eof.setChecked(False)
+    dialog.tts_cache_ttl_seconds.setValue(3600)
+    dialog.tts_retry_attempts.setValue(5)
+    dialog._save_and_close()
+
+    reloaded = ConfigStore(tmp_path / "config.json").load()
+    assert reloaded.sip_port == "5062"
+    assert reloaded.sip_auto_connect is False
+    assert reloaded.report_hangup_on_eof is False
+    assert reloaded.tts_cache_ttl_seconds == 3600
+    assert reloaded.tts_retry_attempts == 5
+    window.close()
+
+
 # --- dashboard top menu shares the tray's actions (gateway-auto-connect) ---
 
 

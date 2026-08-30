@@ -94,6 +94,9 @@ class _FfmpegMissingTts:
     def transcode(self, mp3_path: Path, wav_path: Path) -> Path:
         raise FfmpegNotFound("ffmpeg not found (test)")
 
+    def synthesize_to_wav(self, text: str, voice: str, prefix: str = "ivr") -> Path:
+        raise FfmpegNotFound("ffmpeg not found (test)")
+
 
 def test_hook_like_report_drives_full_flow(tmp_path: Path) -> None:
     store = _tmp_store(tmp_path)
@@ -119,8 +122,8 @@ def test_hook_like_report_drives_full_flow(tmp_path: Path) -> None:
         assert backend.report_calls, "no outbound report call was placed"
         target, wav = backend.report_calls[0]
         assert target == "sip:8000@192.168.1.116:5060"
-        # TTS ran (synthesize + transcode) because no audio_path was supplied.
-        assert tts.synthesized and tts.transcoded
+        # TTS ran (unified synthesize_to_wav entry) because no audio_path was supplied.
+        assert tts.synthesized
         assert service.report_state.value == "dialing"
 
         # Desk phone answers -> file is played one-way into the call.

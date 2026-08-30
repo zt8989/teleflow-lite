@@ -108,6 +108,10 @@ class Settings:
     #   report_caller_id — caller display name for the outbound report call.
     #   report_hangup_on_eof — hang up automatically when playback finishes.
     #   tts_voice     — default edge-tts voice/timbre for report synthesis.
+    #   tts_cache_ttl_seconds — TTL for the synthesized-wav cache; entries
+    #       older than this are re-rendered on next use (bounds disk + refreshes).
+    #   tts_retry_attempts — how many times a failing edge-tts conversion (incl.
+    #       timeouts) is retried before giving up; 1 == no retry.
     #   ffmpeg_path   — external ffmpeg binary; empty => auto-discover via PATH.
     rpc_enabled: bool = True
     rpc_port: int = 8731
@@ -118,11 +122,31 @@ class Settings:
     report_caller_id: str = "TeleFlow"
     report_hangup_on_eof: bool = True
     tts_voice: str = "zh-CN-XiaoxiaoNeural"
+    tts_cache_ttl_seconds: int = 604800
+    tts_retry_attempts: int = 3
     ffmpeg_path: str = ""
+
 
     @classmethod
     def field_names(cls) -> frozenset[str]:
         return frozenset(f.name for f in fields(cls))
+
+
+# Built-in edge-tts voices offered in the settings dropdown (friendly name, ID).
+# The default (zh-CN-XiaoxiaoNeural) is the first entry so a fresh config lands
+# on it. A trailing "自定义…" option in the UI lets users type any other ID.
+BUILTIN_TTS_VOICES: list[tuple[str, str]] = [
+    ("晓晓（女）", "zh-CN-XiaoxiaoNeural"),
+    ("云希（男）", "zh-CN-YunxiNeural"),
+    ("云扬（男·新闻）", "zh-CN-YunyangNeural"),
+    ("晓伊（女·川渝）", "zh-CN-XiaoyiNeural"),
+    ("云健（男）", "zh-CN-YunjianNeural"),
+    ("晓辰（女）", "zh-CN-XiaochenNeural"),
+    ("云霞（女）", "zh-CN-YunxiaNeural"),
+    ("云野（男）", "zh-CN-YunyeNeural"),
+    ("Aria（en-US 女）", "en-US-AriaNeural"),
+    ("Guy（en-US 男）", "en-US-GuyNeural"),
+]
 
 
 class ConfigStore:

@@ -380,3 +380,54 @@ def test_ivr_digit_during_playback_no_auto_eof_chain(tmp_path: Path) -> None:
     backend.receive_playback_done("C1")  # stray EOF from the stopped player
     assert len(backend.report_played) == 1
 
+
+
+class _CapturingConversionQueue:
+    """Controllable stand-in for ConversionQueue: it records every submission and
+    lets the test drive completion in any order, so out-of-order conversion
+    finishes can be simulated against the ordered-playback logic."""
+
+    def __init__(self) -> None:
+        self.submitted: list[tuple[str, str, str, int]] = []
+        self._pending: dict[int, tuple[str, str, str, object]] = {}
+
+    def submit(self, text, voice, *, prefix="ivr", order=None, on_done) -> None:
+        self.submitted.append((text, voice, prefix, order))
+        self._pending[order] = (text, voice, prefix, on_done)
+
+    def complete(self, *orders: int) -> None:
+        for o in orders:
+            _text, _voice, _prefix, on_done = self._pending.pop(o)
+            on_done(Path(f"/tmp/ivr_slot_{o}.wav"), error=None, order=o)
+
+    def shutdown(self) -> None:
+        pass
+
+
+def test_ivr_submits_all_prompts_in_parallel_then_plays_in_order(tmp_path: Path) -> None:
+    # All prompts are converted at once (parallel queue), not one-then-wait-
+    # then-next; yet playback still follows prompt order even when conversions
+    # finish out of order.
+    settings = Settings(ivr_enabled=True)
+    settings.ivr_welcome = "欢迎"
+    settings.ivr_digit_text = {"1": "菜单一", "2": "", "3": "菜单三"}
+    store = ConfigStore(tmp_path / "c.json")
+    store.save(settings)
+    backend = FakeSipBackend()
+    tts = FakeTtsBackend()
+    queue = _CapturingConversionQueue()
+    service = SipCoreService(backend, store, tts=tts, conversion_queue=queue)
+    service.start()
+
+    backend.receive_invite("C1")
+    # Every non-empty prompt (welcome + 2 digits = 3) was submitted up front.
+    assert len(queue.submitted) == 3
+    assert [o for _t, _v, _p, o in queue.submitted] == [0, 1, 2]
+    # Nothing has played yet: conversion is async and hasn't completed.
+    assert backend.report_played == []
+
+    # Completions arrive out of order (last prompt first); playback must still
+    # follow prompt order 0, 1, 2.
+    queue.complete(2, 0, 1)
+    played = [wav for _cid, wav in backend.report_played]
+    assert played == [str(Path(f"/tmp/ivr_slot_{o}.wav")) for o in (0, 1, 2)]

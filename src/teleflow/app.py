@@ -55,7 +55,7 @@ from teleflow.audio import (
     PortAudioBackend,
 )
 from teleflow.autostart import set_autostart
-from teleflow.config import ConfigStore, Settings
+from teleflow.config import BUILTIN_TTS_VOICES, ConfigStore, Settings
 from teleflow.logging import EventLogger, LogLevel, attach
 from teleflow.hooks import SubprocessHookRunner, attach_hooks
 from teleflow.pjsua2_backend import Pjsua2Backend
@@ -464,6 +464,18 @@ class SettingsDialog(QDialog):
             QLabel("提示：此为电话汇报的默认路由（走网关）。汇报页只填分机号即可，"
                    "仅当配置了“座机地址”时才改走该地址。")
         )
+        # SIP 本地监听端口（选填）: 留空则自动检测空闲端口（避免与本机其他
+        # SIP 服务如 FreeSWITCH 抢占同一端口）。
+        port_row = QHBoxLayout()
+        port_row.setSpacing(6)
+        port_row.addWidget(QLabel("SIP 端口（选填，留空=自动检测）:"))
+        self.sip_port = QLineEdit()
+        self.sip_port.setPlaceholderText("例如 5062")
+        port_row.addWidget(self.sip_port)
+        port_row.addStretch()
+        al.addLayout(port_row)
+        self.sip_auto_connect = QCheckBox("启动时自动连接网关")
+        al.addWidget(self.sip_auto_connect)
         al.addStretch()
 
         # --- Page: 钩子命令 ---
@@ -541,8 +553,16 @@ class SettingsDialog(QDialog):
         self.report_extension.setPlaceholderText("例如 8000")
         self.report_caller_id = QLineEdit()
         self.report_caller_id.setPlaceholderText("主叫显示名（默认 TeleFlow）")
-        self.tts_voice = QLineEdit()
-        self.tts_voice.setPlaceholderText("例如 zh-CN-XiaoxiaoNeural")
+        # TTS voice: a dropdown of built-in edge-tts roles + a "自定义…" entry
+        # that reveals a free-text field for any other voice ID.
+        self._tts_voice_ids = [vid for _name, vid in BUILTIN_TTS_VOICES]
+        self.tts_voice = QComboBox()
+        self.tts_voice.addItems([f"{name} — {vid}" for name, vid in BUILTIN_TTS_VOICES])
+        self.tts_voice.addItem("自定义…")
+        self.tts_voice.currentIndexChanged.connect(self._on_tts_voice_changed)
+        self.tts_voice_custom = QLineEdit()
+        self.tts_voice_custom.setPlaceholderText("自定义 edge-tts 音色 ID，如 zh-CN-YunyangNeural")
+        self.tts_voice_custom.hide()
         self.ffmpeg_path = QLineEdit()
         rp.addWidget(self.rpc_enabled)
         rp.addWidget(QLabel("RPC 监听端口:"))
@@ -567,8 +587,23 @@ class SettingsDialog(QDialog):
         rp.addWidget(self.report_caller_id)
         rp.addWidget(QLabel("TTS 音色:"))
         rp.addWidget(self.tts_voice)
+        rp.addWidget(self.tts_voice_custom)
         rp.addWidget(QLabel("ffmpeg 路径 (可选):"))
         rp.addWidget(self.ffmpeg_path)
+        # 汇报播报结束后是否自动挂机。
+        self.report_hangup_on_eof = QCheckBox("汇报播放结束后自动挂机")
+        rp.addWidget(self.report_hangup_on_eof)
+        # TTS 合成参数: 缓存 TTL 与失败重试次数，均可通过设置调整。
+        rp.addWidget(QLabel("TTS 缓存 TTL（秒，0=每次重新合成）:"))
+        self.tts_cache_ttl_seconds = QSpinBox()
+        self.tts_cache_ttl_seconds.setRange(0, 31_536_000)
+        self.tts_cache_ttl_seconds.setValue(604800)
+        rp.addWidget(self.tts_cache_ttl_seconds)
+        rp.addWidget(QLabel("TTS 合成失败重试次数:"))
+        self.tts_retry_attempts = QSpinBox()
+        self.tts_retry_attempts.setRange(1, 10)
+        self.tts_retry_attempts.setValue(3)
+        rp.addWidget(self.tts_retry_attempts)
         rp.addStretch()
 
         # --- Page: 日志与启动 ---
@@ -626,6 +661,8 @@ class SettingsDialog(QDialog):
         self.sip_server_port.setValue(settings.sip_server_port)
         self.sip_user.setText(settings.sip_user)
         self.sip_password.setText(settings.sip_password)
+        self.sip_port.setText(settings.sip_port)
+        self.sip_auto_connect.setChecked(settings.sip_auto_connect)
         self.off_hook_cmd.setText(settings.off_hook_cmd)
         self.on_hook_cmd.setText(settings.on_hook_cmd)
         self.ivr_enabled.setChecked(settings.ivr_enabled)
@@ -641,7 +678,10 @@ class SettingsDialog(QDialog):
         self.report_port.setValue(settings.report_port)
         self.report_extension.setText(settings.report_extension)
         self.report_caller_id.setText(settings.report_caller_id)
-        self.tts_voice.setText(settings.tts_voice)
+        self._select_tts_voice(settings.tts_voice)
+        self.report_hangup_on_eof.setChecked(settings.report_hangup_on_eof)
+        self.tts_cache_ttl_seconds.setValue(settings.tts_cache_ttl_seconds)
+        self.tts_retry_attempts.setValue(settings.tts_retry_attempts)
         self.ffmpeg_path.setText(settings.ffmpeg_path)
         self.log_level.setCurrentText(settings.log_level)
         self.autostart.setChecked(settings.autostart)
@@ -653,6 +693,8 @@ class SettingsDialog(QDialog):
         settings.sip_server_port = self.sip_server_port.value()
         settings.sip_user = self.sip_user.text().strip()
         settings.sip_password = self.sip_password.text()
+        settings.sip_port = self.sip_port.text().strip()
+        settings.sip_auto_connect = self.sip_auto_connect.isChecked()
         settings.off_hook_cmd = self.off_hook_cmd.text().strip()
         settings.on_hook_cmd = self.on_hook_cmd.text().strip()
         settings.ivr_enabled = self.ivr_enabled.isChecked()
@@ -670,13 +712,37 @@ class SettingsDialog(QDialog):
         settings.report_port = self.report_port.value()
         settings.report_extension = self.report_extension.text().strip()
         settings.report_caller_id = self.report_caller_id.text().strip()
-        settings.tts_voice = self.tts_voice.text().strip()
+        settings.tts_voice = self._current_tts_voice()
+        settings.report_hangup_on_eof = self.report_hangup_on_eof.isChecked()
+        settings.tts_cache_ttl_seconds = self.tts_cache_ttl_seconds.value()
+        settings.tts_retry_attempts = self.tts_retry_attempts.value()
         settings.ffmpeg_path = self.ffmpeg_path.text().strip()
         settings.log_level = self.log_level.currentText()
         settings.autostart = self.autostart.isChecked()
         settings.start_minimized = self.start_minimized.isChecked()
         self._store.save(settings)
         self.accept()
+
+    def _on_tts_voice_changed(self, idx: int) -> None:
+        """Show the custom voice-ID field only while the '自定义…' entry is selected."""
+        self.tts_voice_custom.setVisible(idx == len(self._tts_voice_ids))
+
+    def _current_tts_voice(self) -> str:
+        """Return the chosen edge-tts voice ID — a built-in selection, or the
+        custom field's text when the custom entry is the active one."""
+        if self.tts_voice.currentIndex() == len(self._tts_voice_ids):
+            return self.tts_voice_custom.text().strip()
+        return self._tts_voice_ids[self.tts_voice.currentIndex()]
+
+    def _select_tts_voice(self, value: str) -> None:
+        """Restore the dropdown to ``value`` when it's a built-in ID; otherwise
+        switch to the custom entry and fill the free-text field with it."""
+        if value in self._tts_voice_ids:
+            self.tts_voice.setCurrentIndex(self._tts_voice_ids.index(value))
+            self.tts_voice_custom.clear()
+        else:
+            self.tts_voice.setCurrentIndex(len(self._tts_voice_ids))
+            self.tts_voice_custom.setText(value)
 
     def _reset_token(self) -> None:
         """Generate a fresh random RPC token (writes on Save)."""
@@ -905,11 +971,17 @@ class MainWindow(QMainWindow):
                 from teleflow.tts import CachingTtsBackend, EdgeTtsBackend
 
                 tts = CachingTtsBackend(
-                    EdgeTtsBackend(ffmpeg_path=ffmpeg), logger=self.append_log_line
+                    EdgeTtsBackend(
+                        ffmpeg_path=ffmpeg,
+                        retry_attempts=settings.tts_retry_attempts,
+                        logger=self.append_log_line,
+                    ),
+                    logger=self.append_log_line,
+                    cache_ttl_seconds=settings.tts_cache_ttl_seconds,
                 )
-                mp3 = tts.synthesize(text, voice)
-                wav = tts.transcode(mp3, mp3.with_suffix(".wav"))
-                self._pending_report_mp3 = str(mp3)
+                # Unified conversion path: cache + TTL applied (keyed by text+voice).
+                wav = tts.synthesize_to_wav(text, voice, prefix="report")
+                self._pending_report_mp3 = str(wav)
                 self._pending_report_wav = str(wav)
                 self._pending_report_error = None
             except Exception as exc:  # noqa: BLE001 - surface failures in the log
@@ -1132,7 +1204,13 @@ def build_app(
     audio_backend = audio_backend or _default_audio_backend()
     sip_backend = sip_backend or _default_sip_backend()
     manager = AudioDeviceManager(audio_backend, store)
-    tts = CachingTtsBackend(EdgeTtsBackend(ffmpeg_path=settings.ffmpeg_path))
+    tts = CachingTtsBackend(
+        EdgeTtsBackend(
+            ffmpeg_path=settings.ffmpeg_path,
+            retry_attempts=settings.tts_retry_attempts,
+        ),
+        cache_ttl_seconds=settings.tts_cache_ttl_seconds,
+    )
     service = SipCoreService(sip_backend, store, tts=tts)
     # tts.logger is wired to the unified logger below, after it exists.
     window = MainWindow(manager, service, store)

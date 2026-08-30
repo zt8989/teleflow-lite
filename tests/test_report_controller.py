@@ -213,6 +213,9 @@ class _FailingTts(FakeTtsBackend):
     def synthesize(self, text: str, voice: str) -> Path:
         raise TtsError("edge-tts boom")
 
+    def synthesize_to_wav(self, text: str, voice: str, prefix: str = "ivr") -> Path:
+        raise TtsError("edge-tts boom")
+
 
 def test_tts_failure_reports_failed(tmp_path: Path) -> None:
     svc, backend, _ = _service(tmp_path, tts=_FailingTts())

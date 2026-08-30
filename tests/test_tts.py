@@ -15,8 +15,11 @@ from teleflow.tts import (
     FfmpegError,
     FfmpegNotFound,
     CachingTtsBackend,
+    ConversionQueue,
     EdgeTtsBackend,
     FakeTtsBackend,
+    SyncConversionQueue,
+    TtsError,
     clean_markdown,
 )
 
@@ -145,3 +148,168 @@ def test_caching_backend_logs_hit_and_miss(tmp_path: Path) -> None:
     cache.synthesize_to_wav("你好", "v")  # hit  -> 复用
     assert any("缓存未命中" in m for m in logged)
     assert any("缓存命中" in m for m in logged)
+
+
+def test_cache_key_is_text_plus_voice_hash(tmp_path: Path) -> None:
+    # Key = sha256(clean_markdown(text) + "\0" + voice)[:16]; the same text under
+    # a different voice must NOT collide, and 16 hex chars is the expected length.
+    a = CachingTtsBackend._cache_key("你好", "voiceA")
+    b = CachingTtsBackend._cache_key("你好", "voiceB")
+    same = CachingTtsBackend._cache_key("你好", "voiceA")
+    md = CachingTtsBackend._cache_key("**你好**", "voiceA")  # markdown stripped
+    assert len(a) == 16
+    assert all(c in "0123456789abcdef" for c in a)
+    assert a != b
+    assert a == same
+    assert md == a  # clean_markdown normalizes the bold markers away
+
+
+def test_caching_backend_ttl_reuses_fresh_entry(tmp_path: Path) -> None:
+    inner = _FileFakeTts(fake_wav=tmp_path / "inner.wav")
+    cache = CachingTtsBackend(inner, cache_dir=tmp_path / "cache", cache_ttl_seconds=604800)
+    first = cache.synthesize_to_wav("你好", "v")
+    rendered = len(inner.synthesized)
+    second = cache.synthesize_to_wav("你好", "v")
+    # Fresh wav (mtime just written) is within TTL -> reused, no second render.
+    assert first == second
+    assert len(inner.synthesized) == rendered
+
+
+def test_caching_backend_ttl_expires_stale_entry(tmp_path: Path) -> None:
+    import os
+    import time
+
+    inner = _FileFakeTts(fake_wav=tmp_path / "inner.wav")
+    cache = CachingTtsBackend(inner, cache_dir=tmp_path / "cache", cache_ttl_seconds=60)
+    first = cache.synthesize_to_wav("你好", "v")
+    # Age the cached wav beyond the TTL (mtime in the past) to simulate staleness.
+    stale_mtime = time.time() - 3600
+    os.utime(first, (stale_mtime, stale_mtime))
+    rendered = len(inner.synthesized)
+    second = cache.synthesize_to_wav("你好", "v")
+    # Expired entry is re-rendered rather than reused.
+    assert len(inner.synthesized) == rendered + 1
+    assert first == second
+
+
+class _RaiseTts(FakeTtsBackend):
+    """Fake TTS whose unified entry always raises, to exercise the queue error path."""
+
+    def synthesize_to_wav(self, text: str, voice: str, prefix: str = "ivr") -> Path:
+        raise RuntimeError("boom")
+
+
+def test_sync_conversion_queue_delivers_inline(tmp_path: Path) -> None:
+    # SyncConversionQueue runs the callback inline (deterministic, test-friendly).
+    q: SyncConversionQueue = SyncConversionQueue(_FileFakeTts(fake_wav=tmp_path / "i.wav"))
+    delivered: list[tuple[object, object, object]] = []
+
+    def on_done(wav, error=None, order=None) -> None:
+        delivered.append((wav, error, order))
+
+    q.submit("a", "v", prefix="ivr", order=7, on_done=on_done)
+    q.submit("b", "v", prefix="ivr", order=3, on_done=on_done)
+    # Inline: both callbacks have already run by the time submit returns.
+    assert len(delivered) == 2
+    orders = sorted(o for _w, _e, o in delivered)
+    assert orders == [3, 7]
+    assert all(e is None for _w, e, _o in delivered)
+
+
+def test_conversion_queue_delivers_asynchronously(tmp_path: Path) -> None:
+    import threading
+
+    # Real ConversionQueue dispatches work to a worker pool; on_done fires (with
+    # the original order) once each conversion completes, off the calling thread.
+    q = ConversionQueue(_FileFakeTts(fake_wav=tmp_path / "i.wav"), max_workers=2)
+    delivered: list[tuple[object, object, object]] = []
+    ready = threading.Event()
+
+    def on_done(wav, error=None, order=None) -> None:
+        delivered.append((wav, error, order))
+        if len(delivered) == 2:
+            ready.set()
+
+    q.submit("a", "v", order=0, on_done=on_done)
+    q.submit("b", "v", order=1, on_done=on_done)
+    assert ready.wait(timeout=5)
+    q.shutdown()
+    orders = sorted(o for _w, _e, o in delivered)
+    assert orders == [0, 1]
+    assert all(e is None for _w, e, _o in delivered)
+
+
+def test_conversion_queue_delivers_error(tmp_path: Path) -> None:
+    import threading
+
+    q = ConversionQueue(_RaiseTts(), max_workers=1)
+    captured: list[object] = []
+    ready = threading.Event()
+
+    def on_done(wav, error=None, order=None) -> None:
+        captured.append(error)
+        ready.set()
+
+    q.submit("a", "v", order=0, on_done=on_done)
+    assert ready.wait(timeout=5)
+    q.shutdown()
+    assert len(captured) == 1
+    assert isinstance(captured[0], RuntimeError)
+
+
+
+class _RetryProbe(EdgeTtsBackend):
+    """EdgeTtsBackend whose single-shot synthesis fails the first ``fail_times``
+    calls, so the retry loop is exercised without any network/ffmpeg."""
+
+    def __init__(self, *args, fail_times: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fail_times = fail_times
+        self.calls = 0
+
+    def _synthesize_once(self, text: str, voice: str) -> Path:
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise TimeoutError("edge-tts timed out (simulated)")
+        out = self._cache_dir / "ok.mp3"
+        out.write_bytes(b"x")
+        return out
+
+    def transcode(self, mp3_path: Path, wav_path: Path) -> Path:
+        Path(wav_path).write_bytes(b"x")
+        return wav_path
+
+
+def test_edge_tts_retries_then_succeeds(tmp_path: Path) -> None:
+    probe = _RetryProbe(cache_dir=tmp_path, retry_attempts=3, fail_times=1)
+    wav = probe.synthesize_to_wav("你好", "v")
+    # First attempt failed, the second succeeded -> exactly 2 calls, no error.
+    assert probe.calls == 2
+    assert wav.exists()
+
+
+def test_edge_tts_retries_until_exhausted_then_raises(tmp_path: Path) -> None:
+    logged: list[str] = []
+    probe = _RetryProbe(
+        cache_dir=tmp_path, retry_attempts=3, fail_times=99, logger=logged.append
+    )
+    with pytest.raises(TtsError):
+        probe.synthesize("你好", "v")
+    # All 3 attempts were made before giving up.
+    assert probe.calls == 3
+    # A log line was emitted for each failed attempt.
+    assert sum("将重试" in m for m in logged) == 3
+
+
+def test_edge_tts_retry_attempts_default_is_three(tmp_path: Path) -> None:
+    probe = _RetryProbe(cache_dir=tmp_path)
+    assert probe._retry_attempts == 3
+
+
+def test_caching_backend_retries_inner_on_miss(tmp_path: Path) -> None:
+    # The production path wraps EdgeTtsBackend in CachingTtsBackend; a cache miss
+    # must still reach the inner retry loop (2 failures then a success).
+    probe = _RetryProbe(cache_dir=tmp_path, retry_attempts=3, fail_times=2)
+    cache = CachingTtsBackend(probe, cache_dir=tmp_path / "cache")
+    cache.synthesize_to_wav("你好", "v")
+    assert probe.calls == 3

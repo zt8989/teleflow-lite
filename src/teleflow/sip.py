@@ -16,7 +16,14 @@ from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
 from teleflow.config import ConfigStore, Settings
-from teleflow.tts import CachingTtsBackend, TtsBackend, TtsError, clean_markdown
+from teleflow.tts import (
+    CachingTtsBackend,
+    ConversionQueue,
+    SyncConversionQueue,
+    TtsBackend,
+    TtsError,
+    clean_markdown,
+)
 
 # Domain events emitted to subscribers.
 EVENT_SIP_STARTED = "sip_started"
@@ -350,10 +357,12 @@ class SipCoreService:
         backend: SipBackend,
         store: ConfigStore,
         tts: TtsBackend | None = None,
+        conversion_queue: ConversionQueue | SyncConversionQueue | None = None,
     ) -> None:
         self._backend = backend
         self._store = store
         self._tts = tts
+        self._conversion_queue: ConversionQueue | SyncConversionQueue | None = conversion_queue
         self._state = CallState.IDLE
         self._contact: str | None = None
         self._registered = False
@@ -375,6 +384,13 @@ class SipCoreService:
         self._ivr_active = False
         self._ivr_call_id: str | None = None
         self._ivr_queue: list[str] = []
+        # Parallel conversion bookkeeping: one slot per prompt (None until its
+        # wav is ready), plus the play cursor and total count used to feed the
+        # playback queue in order regardless of conversion completion order.
+        self._ivr_slots: list[str | None] = []
+        self._ivr_next = 0
+        self._ivr_total = 0
+        self._ivr_playing = False
         self._ivr_listening = False
         self._ivr_digit_fired = False
         self._last_digit = ""
@@ -398,6 +414,34 @@ class SipCoreService:
     def _log_line(self, message: str) -> None:
         if self._log is not None:
             self._log(message)
+
+    def _tts_marshal(self, fn: Callable[[], None]) -> None:
+        """Run ``fn`` on the GUI thread (see ``self._defer``, wired by the app
+        shell). Used so conversion-completion callbacks can safely touch Qt /
+        pjsua2 — read dynamically so later assignment of ``_defer`` is honoured.
+        """
+        self._defer(fn)
+
+    @property
+    def conversion_queue(self) -> ConversionQueue | SyncConversionQueue:
+        """The audio-conversion queue, built lazily from the TTS backend.
+
+        A real :class:`ConversionQueue` (async worker pool, results marshalled
+        to the GUI thread) is used in production where ``self._tts`` is a
+        :class:`CachingTtsBackend`; tests inject a :class:`FakeTtsBackend`, so a
+        :class:`SyncConversionQueue` is used instead to stay deterministic.
+        """
+        if self._conversion_queue is None:
+            backend = self._tts or self._default_tts(self._store.load())
+            if isinstance(backend, CachingTtsBackend):
+                self._conversion_queue = ConversionQueue(
+                    backend, marshal=self._tts_marshal, logger=self._log_line
+                )
+            else:
+                self._conversion_queue = SyncConversionQueue(
+                    backend, logger=self._log_line
+                )
+        return self._conversion_queue
 
     @property
     def call_state(self) -> CallState:
@@ -528,26 +572,11 @@ class SipCoreService:
         tts = self._tts or self._default_tts(settings)
         voice_name = voice or settings.tts_voice
         cleaned = clean_markdown(text)
-        if isinstance(tts, CachingTtsBackend):
-            # Route through the caching backend so the report/play prompt reuses a
-            # previously rendered wav (and surfaces a [TTS] cache hit/miss line),
-            # matching the inbound IVR path. 合成完成 / 转码完成 are only emitted on
-            # a real miss so a cache hit isn't mislabelled as a fresh render.
-            cache_file = tts._cache_dir / f"{prefix}_{CachingTtsBackend._cache_key(cleaned, voice_name)}.wav"
-            was_cached = cache_file.exists()
-            wav_path = tts.synthesize_to_wav(cleaned, voice_name, prefix=prefix)
-            if not was_cached:
-                self._log_line(f"[TTS] 合成完成: {wav_path}")
-                self._log_line(f"[FFMPEG] 转码完成: {wav_path}")
-            return wav_path
-        # Non-caching backend (tests' FakeTtsBackend): keep the original
-        # synthesize + transcode path with its own synthesis/transcode logs.
-        self._log_line(f"[TTS] 合成中: voice={voice_name}")
-        mp3 = tts.synthesize(cleaned, voice_name)
-        self._log_line(f"[TTS] 合成完成: {mp3}")
-        wav_path = tts.transcode(mp3, mp3.with_suffix(".wav"))
-        self._log_line(f"[FFMPEG] 转码完成: {wav_path}")
-        return wav_path
+        # Unified conversion path: every TtsBackend implements synthesize_to_wav
+        # (CachingTtsBackend adds cache + TTL; FakeTtsBackend returns a canned
+        # wav). This is the single place text -> wav happens for reports and
+        # ad-hoc playback, so caching/TTL is applied consistently.
+        return tts.synthesize_to_wav(cleaned, voice_name, prefix=prefix)
 
     def _default_tts(self, settings) -> TtsBackend:
         # Imported lazily so the real backend (edge-tts) is only constructed when
@@ -556,7 +585,13 @@ class SipCoreService:
         from teleflow.tts import EdgeTtsBackend
 
         self._tts = CachingTtsBackend(
-            EdgeTtsBackend(ffmpeg_path=settings.ffmpeg_path), logger=self._log_line
+            EdgeTtsBackend(
+                ffmpeg_path=settings.ffmpeg_path,
+                retry_attempts=settings.tts_retry_attempts,
+                logger=self._log_line,
+            ),
+            logger=self._log_line,
+            cache_ttl_seconds=settings.tts_cache_ttl_seconds,
         )
         return self._tts
 
@@ -622,66 +657,109 @@ class SipCoreService:
     # listening for further keys. {last_digit} is surfaced on CALL_ENDED for
     # the on-hook hook.
     # ------------------------------------------------------------------
-    def _build_ivr_digit_queue(self, settings: Settings) -> list[str]:
-        """Synthesize the per-digit menu prompts in 1~9~0 order (empty text
-        skipped). Each item is announced as ``"{text} 请按{digit}"`` so the
-        caller hears the option first and then which key triggers it.
-        """
-        assert self._tts is not None  # callers guard _tts before queueing playback
-        queue: list[str] = []
+    def _ivr_prompts(self, settings: Settings) -> list[str]:
+        """Welcome (if any) then each non-empty digit menu prompt in 1~9~0 order,
+        rendered as "{text} 请按{digit}"."""
+        prompts: list[str] = []
+        if settings.ivr_welcome.strip():
+            prompts.append(settings.ivr_welcome)
+        prompts.extend(self._ivr_digit_prompts(settings))
+        return prompts
+
+    def _ivr_digit_prompts(self, settings: Settings) -> list[str]:
+        prompts: list[str] = []
         for digit in "1234567890":
             text = settings.ivr_digit_text.get(digit, "").strip()
             if not text:
                 continue
-            prompt = f"{text} 请按{digit}"
-            queue.append(str(self._tts.synthesize_to_wav(prompt, settings.tts_voice)))
-        return queue
+            prompts.append(f"{text} 请按{digit}")
+        return prompts
 
     def _maybe_start_ivr(self, call_id: str) -> None:
         settings = self._store.load()
         if not settings.ivr_enabled or self._tts is None:
             return
-        voice = settings.tts_voice
-        # Synthesize first so a TTS failure leaves the call as a normal two-way
-        # bridge instead of a silently-mic-suppressed call.
-        try:
-            queue: list[str] = []
-            if settings.ivr_welcome.strip():
-                queue.append(str(self._tts.synthesize_to_wav(settings.ivr_welcome, voice)))
-            queue.extend(self._build_ivr_digit_queue(settings))
-        except TtsError as exc:
-            self._log_line(f"[IVR] TTS 失败, 跳过 IVR: {exc}")
-            return
-        # TTS succeeded: start the menu. The call is bridged two-way throughout
-        # (the mic is never suppressed during IVR), so the AI side can talk back
-        # or barge in at any time.
+        self._ivr_begin(call_id, self._ivr_prompts(settings), settings.tts_voice)
+
+    def _ivr_begin(self, call_id: str, prompts: list[str], voice: str) -> None:
+        """Kick off the IVR menu: convert every prompt in parallel (via the
+        conversion queue) and play them in order as each completes.
+
+        Unlike the old render-up-front loop, submission is non-blocking — the
+        inbound-call handler returns immediately and the first prompt starts
+        playing as soon as its wav is ready, even while later prompts are still
+        rendering. ``order`` preserves playback order regardless of which
+        conversion finishes first.
+        """
         self._ivr_active = True
         self._ivr_call_id = call_id
-        self._ivr_queue = queue
+        self._ivr_queue = []
+        self._ivr_slots = [None] * len(prompts)
+        self._ivr_total = len(prompts)
+        self._ivr_next = 0
+        self._ivr_playing = False
         self._ivr_listening = False
         self._ivr_digit_fired = False
         self._last_digit = ""
-        self._log_line(f"[IVR] 启动菜单: call={call_id} 条目数={len(queue)}")
+        self._log_line(f"[IVR] 启动菜单: call={call_id} 条目数={len(prompts)}")
+        if not prompts:
+            # Nothing to announce: behave as a normal two-way bridge that is
+            # already "listening" for a key.
+            self._ivr_listening = True
+            self._log_line(f"[IVR] 菜单播报完成 (call {call_id})")
+            return
+        for order, text in enumerate(prompts):
+            self.conversion_queue.submit(
+                text,
+                voice,
+                prefix="ivr",
+                order=order,
+                on_done=lambda wav, error=None, order=order: self._on_ivr_converted(
+                    order, wav, error
+                ),
+            )
+
+    def _on_ivr_converted(self, order: int, wav, error) -> None:
+        if not self._ivr_active or order >= len(self._ivr_slots) or self._ivr_digit_fired:
+            return
+        if error is not None:
+            # A synthesis failure leaves the call as a normal two-way bridge
+            # instead of a silently-mic-suppressed IVR menu.
+            self._log_line(f"[IVR] TTS 失败, 跳过 IVR: {error}")
+            self._reset_ivr()
+            return
+        self._ivr_slots[order] = str(wav)
+        self._ivr_feed_queue()
         self._ivr_play_next()
+
+    def _ivr_feed_queue(self) -> None:
+        """Move any now-ready conversion slots (in order) into the play queue."""
+        while (
+            self._ivr_next < self._ivr_total
+            and self._ivr_slots[self._ivr_next] is not None
+        ):
+            self._ivr_queue.append(self._ivr_slots[self._ivr_next])  # type: ignore[arg-type]
+            self._ivr_next += 1
 
     def _ivr_play_next(self) -> None:
         if not self._ivr_active or self._ivr_call_id is None:
             return
-        if not self._ivr_queue:
-            # Menu queue drained. Keys are honoured at any time (see _on_dtmf),
-            # so this flag is informational here.
-            self._ivr_listening = True
-            self._log_line(f"[IVR] 菜单播报完成 (call {self._ivr_call_id})")
+        if self._ivr_playing:
+            # A prompt is still announcing; the playback_done chain will call us
+            # again to start the next one. Avoid overlapping announcements.
             return
-        # Pop the front item. The fake backend starts playback and fires
-        # playback_done synchronously, so on success the chain advances to the
-        # next item. On the real pjsua2 backend the audio media is usually not
-        # ACTIVE yet at answer time, so play_file_to_call returns False: re-queue
-        # the item at the front so the media-active retry can replay it (instead
-        # of silently dropping it as a naive pop-then-play would).
+        if not self._ivr_queue:
+            if self._ivr_next >= self._ivr_total:
+                self._ivr_listening = True
+                self._log_line(f"[IVR] 菜单播报完成 (call {self._ivr_call_id})")
+            return
         wav = self._ivr_queue.pop(0)
+        self._ivr_playing = True
         started = self._backend.play_file_to_call(self._ivr_call_id, wav, hangup_on_eof=False)
         if not started:
+            # Media not ACTIVE yet (early pjsua2): release the playing flag and
+            # re-queue so the media-active retry can replay it.
+            self._ivr_playing = False
             self._ivr_queue.insert(0, wav)
             return
         self._ivr_started = True
@@ -689,15 +767,15 @@ class SipCoreService:
     def _on_ivr_playback_done(self, call_id: str) -> None:
         if not self._ivr_active or call_id != self._ivr_call_id:
             return
+        self._ivr_playing = False
         self._ivr_play_next()
 
     def _on_call_media_active(self, call_id: str) -> None:
         # The real backend signals this once an inbound call's audio media is
         # up. IVR playback may have been attempted (and failed) at answer time;
-        # retry the front of the queue now. Only triggers once — once anything
-        # has started playing the playback_done chain owns the rest, and once a
-        # key has fired (barge-in canceled the queue) the menu must not be
-        # resurrected by a late media-active event.
+        # retry now. Only triggers once — once anything has started playing the
+        # playback_done chain owns the rest, and once a key has fired (barge-in
+        # canceled the queue) the menu must not be resurrected.
         if not self._ivr_active or call_id != self._ivr_call_id:
             return
         if self._ivr_started or self._ivr_digit_fired:
@@ -756,13 +834,12 @@ class SipCoreService:
         if self._tts is None:
             raise NoActiveCallError("ivr tts not initialized")
         settings = self._store.load()
-        queue = self._build_ivr_digit_queue(settings)
+        prompts = self._ivr_digit_prompts(settings)
         self._ivr_digit_fired = False
         self._ivr_listening = False
         self._ivr_started = False
-        self._ivr_queue = queue
-        self._log_line(f"[IVR] 重播菜单: call={call_id} 条目数={len(queue)}")
-        self._ivr_play_next()
+        self._log_line(f"[IVR] 重播菜单: call={call_id} 条目数={len(prompts)}")
+        self._ivr_begin(call_id, prompts, settings.tts_voice)
 
     def _on_dtmf(self, call_id: str, digit: str) -> None:
         if not self._ivr_active or call_id != self._ivr_call_id:
@@ -772,11 +849,13 @@ class SipCoreService:
         self._ivr_digit_fired = True
         self._ivr_listening = False
         self._last_digit = digit
-        if self._ivr_queue:
+        if self._ivr_queue or self._ivr_playing:
             # Barge-in: a key pressed while the menu is still announcing wins
-            # over the remaining prompts. Cancel the queue and stop the current
-            # playback so the caller's choice isn't drowned out by the menu tail.
+            # over the remaining prompts. Cancel the queue, release the play
+            # flag, and stop the current playback so the caller's choice isn't
+            # drowned out by the menu tail.
             self._ivr_queue = []
+            self._ivr_playing = False
             self._backend.stop_playback(call_id)
         self._log_line(f"[IVR] 收到按键 {digit} (call {call_id})")
         # Every digit fires its per-digit hook; the call stays bridged two-way
@@ -788,6 +867,10 @@ class SipCoreService:
         self._ivr_active = False
         self._ivr_call_id = None
         self._ivr_queue = []
+        self._ivr_slots = []
+        self._ivr_next = 0
+        self._ivr_total = 0
+        self._ivr_playing = False
         self._ivr_listening = False
         self._ivr_digit_fired = False
         self._last_digit = ""
