@@ -347,3 +347,54 @@ def test_hook_script_no_marker_exits_clean(tmp_path: Path) -> None:
         {"messages": [{"role": "assistant", "content": "普通消息，没有标记"}]},
         expect_report=False,
     )
+
+
+def test_notify_phone_script_decodes_utf8_stdin_like_workbuddy(tmp_path: Path) -> None:
+    """notify_phone.py is the WorkBuddy Stop hook: its stdin carries UTF-8
+    bytes and the child has no PYTHONUTF8/LANG env (a text-mode read would
+    decode with GBK on zh-CN Windows and garble the message). Simulate that
+    spawn: process-local fake RPC + a mock ~/.config/teleflow config + a
+    stripped environment."""
+    store = _tmp_store(tmp_path)
+    backend = FakeSipBackend()
+    tts = FakeTtsBackend()
+    service = SipCoreService(backend, store, tts=tts)
+    service.start()
+    rpc = RpcServer(service, store)
+    rpc.start()
+    try:
+        # RpcServer.start auto-generated and persisted the token; write the
+        # config file the hook script reads from its (faked) home directory.
+        conf_dir = tmp_path / "home" / ".config" / "teleflow"
+        conf_dir.mkdir(parents=True)
+        (conf_dir / "config.json").write_text(
+            json.dumps({"rpc_port": rpc.port, "rpc_token": store.load().rpc_token}),
+            encoding="utf-8",
+        )
+        env = {
+            **os.environ,
+            "USERPROFILE": str(tmp_path / "home"),
+            "HOME": str(tmp_path / "home"),
+        }
+        for key in ("PYTHONUTF8", "PYTHONIOENCODING", "LANG", "LC_ALL", "LC_CTYPE"):
+            env.pop(key, None)
+        env["TELEFLOW_HOOK_DEBUG_LOG"] = str(tmp_path / "hook_debug.log")
+        script = Path(__file__).resolve().parents[1] / "examples" / "notify_phone.py"
+        payload = json.dumps(
+            {"last_assistant_message": "宁波天气 __PHONE_REPORT__ 汇报正文。"},
+            ensure_ascii=False,
+        )
+        proc = subprocess.run(
+            [sys.executable, str(script)],
+            input=payload.encode("utf-8"),  # WorkBuddy (Node) writes UTF-8 to stdin
+            capture_output=True,
+            env=env,
+        )
+        err = proc.stderr.decode("utf-8", errors="replace")
+        assert proc.returncode == 0, err
+        assert backend.report_calls, err
+        synthesized = tts.synthesized[0][0]
+        assert "宁波天气" in synthesized  # decoded clean, not GBK mojibake
+        assert "__PHONE_REPORT__" not in synthesized
+    finally:
+        rpc.stop()

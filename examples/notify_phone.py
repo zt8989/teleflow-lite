@@ -33,7 +33,7 @@ MAX_TEXT = 1500                              # 播报文本上限(字), 防超�
 TELEFLOW_CONFIG = os.path.join(
     os.path.expanduser("~"), ".config", "teleflow", "config.json"
 )
-DEBUG_LOG = r"C:/Users/zhouteng/sip-lab/hook_debug.log"   # hook stdin 参数完整记录
+DEBUG_LOG = os.environ.get("TELEFLOW_HOOK_DEBUG_LOG") or r"C:/Users/zhouteng/sip-lab/hook_debug.log"   # hook stdin 参数完整记录
 
 
 def log(msg):
@@ -50,6 +50,20 @@ def debug_log(msg):
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
     except Exception:
         pass
+
+
+def read_stdin_text(stream=None):
+    """按字节读 stdin: WorkBuddy(Node) 以 UTF-8 写入, 但钩子进程在中文
+    Windows 无 PYTHONUTF8 环境时按 GBK 解码文本流, 直接 sys.stdin.read()
+    会得到乱码和孤立代理项(曾致 TeleFlow RPC 400)。先按 UTF-8 解码,
+    失败回退 GBK。"""
+    raw = (stream or sys.stdin.buffer).read()
+    for encoding in ("utf-8", "gbk"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def robust_parse(raw):
@@ -208,7 +222,7 @@ def extract_last_assistant_from_transcript(path):
 def main():
     raw = ""
     try:
-        raw = sys.stdin.read()
+        raw = read_stdin_text()
     except Exception as e:
         debug_log(f"stdin 读取失败: {e}")
     debug_log(f"=== hook 调用 === stdin_raw_len={len(raw)}")
@@ -253,4 +267,5 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         log(f"异常: {e}")
+        debug_log(f"异常: {e}")
         sys.exit(1)
