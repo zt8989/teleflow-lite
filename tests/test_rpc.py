@@ -123,6 +123,66 @@ def test_status_requires_token_and_returns_state(tmp_path: Path) -> None:
     assert body["tts_voice"]
 
 
+def test_report_reset_requires_token(tmp_path: Path) -> None:
+    rpc, _, _, _ = _rpc(tmp_path)
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{rpc.port}/v1/report/reset",
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        assert False, "expected 401"
+    except urllib.error.HTTPError as e:
+        assert e.code == 401
+
+
+def test_report_reset_clears_wedged_slot(tmp_path: Path) -> None:
+    # Regression: a report whose playback EOF never fired left report_in_progress
+    # stuck True (every later /v1/report got 409). POST /v1/report/reset must
+    # clear the slot so reports can be submitted again, without restarting.
+    rpc, svc, backend, _ = _rpc(tmp_path)
+    with _post(f"http://127.0.0.1:{rpc.port}", "tok", {"text": "first"}) as resp:
+        assert resp.status == 202
+    backend.receive_report_connected("R1")
+    # No receive_report_playback_done -> slot wedged.
+    assert svc.report_in_progress is True
+    try:
+        _post(f"http://127.0.0.1:{rpc.port}", "tok", {"text": "second"})
+        assert False, "expected 409"
+    except urllib.error.HTTPError as e:
+        assert e.code == 409
+
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{rpc.port}/v1/report/reset",
+        headers={"Authorization": "Bearer tok"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        body = json.loads(resp.read())
+    assert body["reset"] is True
+    assert body["report_in_progress"] is False
+    assert svc.report_in_progress is False
+
+    # A report can now be submitted again.
+    with _post(f"http://127.0.0.1:{rpc.port}", "tok", {"text": "third"}) as resp:
+        assert resp.status == 202
+
+
+def test_report_reset_aliases_accepted(tmp_path: Path) -> None:
+    rpc, svc, _, _ = _rpc(tmp_path)
+    svc.start_report("first")
+    assert svc.report_in_progress is True
+    for alias in ("/v1/report/abort", "/v1/report/cancel"):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{rpc.port}{alias}",
+            headers={"Authorization": "Bearer tok"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert json.loads(resp.read())["reset"] is True
+    assert svc.report_in_progress is False
+
+
 def test_status_reports_active_call_id(tmp_path: Path) -> None:
     rpc, svc, backend, _ = _rpc(tmp_path)
     # No call yet -> empty string.

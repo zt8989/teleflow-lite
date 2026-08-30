@@ -209,6 +209,84 @@ def test_concurrency_guard_blocks_second_report(tmp_path: Path) -> None:
         svc.start_report("second")
 
 
+def test_report_connected_then_disconnected_without_eof_resets_slot(tmp_path: Path) -> None:
+    # Regression: a report call that answers and starts playback, but whose
+    # EOF never arrives (callback didn't fire / peer hung up mid-playback),
+    # used to leave report_in_progress stuck True forever. Disconnecting the
+    # call must reset the slot so the next /v1/report is accepted.
+    tts = FakeTtsBackend()
+    svc, backend, _ = _service(tmp_path, tts=tts)
+    svc.start()
+    failed: list[str] = []
+    svc.on(EVENT_REPORT_FAILED, lambda reason, report_id: failed.append(reason))
+
+    svc.start_report("会议纪要")
+    backend.receive_report_connected("call-9")
+    # Peer hangs up / call drops before playback EOF fires (the wedge case).
+    backend.receive_report_disconnected("call-9")
+
+    assert svc.report_in_progress is False
+    assert svc.report_state is ReportState.FAILED
+    assert failed == ["call_failed"]
+    # A new report can now be started.
+    svc.start_report("下一条")
+    assert svc.report_in_progress is True
+
+
+def test_report_rejected_call_disconnect_resets_slot(tmp_path: Path) -> None:
+    # A report call that never connected (busy / no answer / rejected) signals
+    # report_disconnected and must reset the slot.
+    tts = FakeTtsBackend()
+    svc, backend, _ = _service(tmp_path, tts=tts)
+    svc.start()
+    failed: list[str] = []
+    svc.on(EVENT_REPORT_FAILED, lambda reason, report_id: failed.append(reason))
+
+    svc.start_report("会议纪要")
+    backend.receive_report_disconnected("call-9")  # never answered
+
+    assert svc.report_in_progress is False
+    assert failed == ["call_failed"]
+
+
+def test_report_disconnect_after_completion_is_noop(tmp_path: Path) -> None:
+    # Normal completion (EOF) already resets the slot; the later disconnect
+    # from the deferred hang-up must not emit a spurious FAILED.
+    tts = FakeTtsBackend()
+    svc, backend, _ = _service(tmp_path, tts=tts)
+    svc.start()
+    failed: list[str] = []
+    svc.on(EVENT_REPORT_FAILED, lambda reason, report_id: failed.append(reason))
+
+    svc.start_report("会议纪要")
+    backend.receive_report_connected("call-9")
+    backend.receive_report_playback_done("call-9")
+    assert svc.report_in_progress is False
+
+    backend.receive_report_disconnected("call-9")
+    assert svc.report_in_progress is False
+    assert failed == []  # no spurious FAILED after a successful completion
+
+
+def test_reset_report_clears_wedged_slot(tmp_path: Path) -> None:
+    tts = FakeTtsBackend()
+    svc, backend, _ = _service(tmp_path, tts=tts)
+    svc.start()
+
+    svc.start_report("first")
+    backend.receive_report_connected("call-9")
+    # Simulate the EOF callback never firing -> slot wedged.
+    assert svc.report_in_progress is True
+
+    svc.reset_report()
+    assert svc.report_in_progress is False
+    assert svc.report_state is ReportState.IDLE
+
+    # A new report can be submitted again.
+    svc.start_report("second")
+    assert svc.report_in_progress is True
+
+
 class _FailingTts(FakeTtsBackend):
     def synthesize(self, text: str, voice: str) -> Path:
         raise TtsError("edge-tts boom")

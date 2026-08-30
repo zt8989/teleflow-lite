@@ -157,10 +157,17 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
             # rejected) has no EOF coming, so it signals "report_disconnected"
             # instead and the service resets the report slot.
             if getattr(self, "_is_report", False):
-                if (
-                    not getattr(self, "_report_connected_fired", False)
-                    and backend._handler is not None
-                ):
+                # Always signal teardown when a report call disconnects. The
+                # player's onEof2 normally drives completion via "report_eof",
+                # but if the call tears down before EOF ever arrives — the file
+                # ended without the callback firing, the peer hung up mid-
+                # playback, or the network dropped — "report_eof" will never
+                # come and the service would leave its report slot wedged as
+                # "in progress", so every later /v1/report is rejected with 409
+                # until the app restarts. The service ignores this once the
+                # report has already been reset (guarded by `if self._report_active`),
+                # so emitting unconditionally is safe and closes the wedge.
+                if backend._handler is not None:
                     backend._handler("report_disconnected", {"call_id": call_id})
             elif backend._handler is not None:
                 backend._handler("bye", {"call_id": call_id})

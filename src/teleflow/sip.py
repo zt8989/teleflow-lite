@@ -668,6 +668,25 @@ class SipCoreService:
         self._report_call_id = None
         self._report_wav = None
 
+    def reset_report(self) -> None:
+        """Force-clear a wedged report slot (manual recovery).
+
+        Driven by the ``POST /v1/report/reset`` RPC endpoint so a stuck
+        report — e.g. a previous report whose playback EOF never fired and
+        left ``report_in_progress`` stuck True — can be recovered without
+        restarting the app. If a report call is still up, it is hung up on
+        the GUI thread; the slot is reset regardless so the next
+        ``/v1/report`` is accepted. No EVENT_REPORT_* is emitted, to avoid
+        firing user hooks on a manual recovery."""
+        call_id = self._report_call_id
+        if not self._report_active and not call_id:
+            return
+        self._log_line("[REPORT] 手动复位汇报状态 (reset)")
+        self._report_state = ReportState.IDLE
+        self._reset_report()
+        if call_id:
+            self._defer(lambda: self._backend.hangup(call_id))
+
     # ------------------------------------------------------------------
     # Inbound IVR flow (feature teleflow-call-ivr).
     # After auto-answer (ivr_enabled): synthesize + queue the welcome message

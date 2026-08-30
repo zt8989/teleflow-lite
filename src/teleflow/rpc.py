@@ -101,12 +101,30 @@ def _make_handler(
                 },
             )
 
+        def _do_report_reset(self) -> None:
+            """``POST /v1/report/reset`` (aliases /abort, /cancel) — force-clear a
+            wedged report slot so /v1/report can be retried without restarting."""
+            if not self._authorized():
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            service.reset_report()
+            self._send_json(
+                200,
+                {
+                    "reset": True,
+                    "report_in_progress": service.report_in_progress,
+                },
+            )
+
         def do_POST(self) -> None:  # noqa: N802 - http.server naming
             if self.path == "/v1/play":
                 self._do_play()
                 return
             if self.path == "/v1/ivr/replay":
                 self._do_ivr_replay()
+                return
+            if self.path in ("/v1/report/reset", "/v1/report/abort", "/v1/report/cancel"):
+                self._do_report_reset()
                 return
             if self.path != "/v1/report":
                 self._send_json(404, {"error": "not found"})
