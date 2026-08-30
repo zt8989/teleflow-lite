@@ -49,12 +49,45 @@ def _locales_dir() -> Path:
     return Path(__file__).parent / "locales"
 
 
+def _detect_windows_ui_language() -> str:
+    """Best-effort Windows UI language via kernel32.
+
+    On Windows ``locale.getlocale()``/``getdefaultlocale()`` are unreliable (often
+    ``None``), so the only dependable signal for the *display* language is the
+    user's preferred UI language from the OS. Primary language id ``0x04`` is
+    Chinese; anything else -> English. Returns ``""`` when it can't be determined.
+    """
+    try:
+        import ctypes
+
+        langid = ctypes.windll.kernel32.GetUserDefaultUILanguage()  # type: ignore[attr-defined]
+    except Exception:
+        return ""
+    if (langid & 0x3FF) == 0x04:
+        return "zh_CN"
+    return ""
+
+
+def _detect_posix_locale() -> str:
+    """POSIX/macOS system language via the C locale (env already tried)."""
+    try:
+        raw = (locale.getlocale()[0] or "").lower()
+    except (ValueError, OSError):
+        raw = ""
+    if not raw:
+        try:
+            raw = (locale.getdefaultlocale()[0] or "").lower()
+        except (ValueError, OSError, NotImplementedError):
+            raw = ""
+    return "zh_CN" if raw.startswith("zh") else _FALLBACK
+
+
 def _detect_system_language() -> str:
     """Resolve the OS language to one of our supported locales.
 
-    Honors ``LANGUAGE``/``LC_ALL``/``LANG`` first, then falls back to
-    ``locale.getlocale``. Anything starting with ``zh`` is Chinese; everything
-    else falls back to English.
+    Honors ``LANGUAGE``/``LC_ALL``/``LANG`` first, then the Windows UI language
+    (kernel32) on Windows, then the C locale on POSIX/macOS. Anything resolving to
+    ``zh*`` is Chinese; everything else falls back to English.
     """
     raw = (
         os.environ.get("LANGUAGE")
@@ -62,12 +95,13 @@ def _detect_system_language() -> str:
         or os.environ.get("LANG")
         or ""
     ).split(":")[0].split(".")[0].strip().lower()
-    if not raw:
-        try:
-            raw = (locale.getlocale()[0] or "").lower()
-        except (ValueError, OSError):
-            raw = ""
-    return "zh_CN" if raw.startswith("zh") else _FALLBACK
+    if raw:
+        return "zh_CN" if raw.startswith("zh") else _FALLBACK
+    if sys.platform == "win32":
+        win = _detect_windows_ui_language()
+        if win:
+            return win
+    return _detect_posix_locale()
 
 
 def _resolve(lang: str) -> str:

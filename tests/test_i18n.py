@@ -17,8 +17,10 @@ from teleflow import i18n
 @pytest.fixture
 def fresh_i18n(monkeypatch):
     i18n.reset()
-    # Force a deterministic non-Chinese system so "auto" is English by default.
+    # Force a deterministic non-Chinese system so "auto" is English by default,
+    # regardless of the host OS UI language (env unset + Windows UI lang forced en).
     monkeypatch.setattr(locale, "getdefaultlocale", lambda: ("en_US", "UTF-8"))
+    monkeypatch.setattr(i18n, "_detect_windows_ui_language", lambda: "en")
     for var in ("LANGUAGE", "LC_ALL", "LANG"):
         monkeypatch.delenv(var, raising=False)
     yield
@@ -73,6 +75,18 @@ def test_auto_resolves_to_chinese_when_lang_is_zh(fresh_i18n, monkeypatch):
     monkeypatch.setenv("LANG", "zh_CN.UTF-8")
     i18n.set_language("auto")
     assert i18n.tr("language.chinese") == "中文"
+
+
+def test_auto_resolves_to_chinese_via_windows_ui_language(monkeypatch):
+    # On a Chinese Windows host (env unset) the kernel32 UI language wins; the
+    # fixture's windows stub is overridden here to prove the path is used.
+    i18n.reset()
+    for var in ("LANGUAGE", "LC_ALL", "LANG"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(i18n, "_detect_windows_ui_language", lambda: "zh_CN")
+    i18n.set_language("auto")
+    assert i18n.tr("language.chinese") == "中文"
+    i18n.reset()
 
 
 def test_invalid_language_falls_back_safely(fresh_i18n):
