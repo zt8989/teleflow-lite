@@ -3,9 +3,13 @@
 """Apply the IVR digit-hook + Vibe-Coding key-send config to TeleFlow's local
 config (config.json) via ``ConfigStore`` — the sanctioned save path.
 
-Run from the repo root with the venv python::
+Run from the repo root with the venv python. On Windows::
 
     .venv\\Scripts\\python.exe examples\\setup_ivr_hooks.py
+
+On macOS/Linux::
+
+    .venv/bin/python examples/setup_ivr_hooks.py
 
 What it sets:
   * ``ivr_digit_text`` : menu prompts for 0 / 1 / 2
@@ -26,12 +30,16 @@ at hook-fire time; they are intentionally kept as raw braces below.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from teleflow.config import ConfigStore
 
 REPO = Path(__file__).resolve().parent.parent
-VENV_PY = REPO / ".venv" / "Scripts" / "python.exe"
+if sys.platform == "win32":
+    VENV_PY = REPO / ".venv" / "Scripts" / "python.exe"
+else:
+    VENV_PY = REPO / ".venv" / "bin" / "python"
 EXAMPLES = REPO / "examples"
 CTRL_KEYS = EXAMPLES / "phone_ctrl_keys.py"
 WEATHER = EXAMPLES / "weather_hook.py"
