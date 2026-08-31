@@ -68,6 +68,50 @@ def _detect_windows_ui_language() -> str:
     return ""
 
 
+def _detect_darwin_language() -> str:
+    """macOS system UI language via the global Apple preferences.
+
+    macOS stores the *display* language in the user's global preferences
+    (``AppleLanguages`` / ``AppleLocale``), which the terminal ``LANG`` does
+    not reliably mirror — a Chinese system can have an unset or ``en_US`` LANG
+    in the shell. So the OS language is read directly, and env vars are only a
+    fallback. Returns ``""`` when it can't be determined.
+    """
+    import subprocess
+
+    def _looks_chinese(value: str) -> bool:
+        return value.strip().lower().startswith("zh")
+
+    # AppleLanguages is the authoritative preferred-language list (most-preferred
+    # first). It is a plist array; grab its first entry.
+    try:
+        out = subprocess.run(
+            ["defaults", "read", "-g", "AppleLanguages"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if out.returncode == 0:
+            for token in re.findall(r'"([^"]+)"', out.stdout):
+                if token:
+                    return "zh_CN" if _looks_chinese(token) else _FALLBACK
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # Fallback: a single locale string like "zh_CN".
+    try:
+        out = subprocess.run(
+            ["defaults", "read", "-g", "AppleLocale"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return "zh_CN" if _looks_chinese(out.stdout) else _FALLBACK
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
 def _detect_posix_locale() -> str:
     """POSIX/macOS system language: env vars first, then the C locale.
 
@@ -101,13 +145,20 @@ def _detect_system_language() -> str:
 
     On Windows the display language comes from the OS (``GetUserDefaultUILanguage``)
     — POSIX ``LANG`` is ignored because terminal sessions set it for tooling and it
-    does not reflect the UI the user sees. On POSIX/macOS the env vars + C locale
-    are authoritative. Anything resolving to ``zh*`` is Chinese; else English.
+    does not reflect the UI the user sees. On macOS the UI language lives in the
+    global ``AppleLanguages``/``AppleLocale`` preferences, which the shell ``LANG``
+    does not reliably mirror, so those are read directly. Elsewhere (Linux and
+    fallbacks) the env vars + C locale are authoritative. Anything resolving to
+    ``zh*`` is Chinese; else English.
     """
     if sys.platform == "win32":
         win = _detect_windows_ui_language()
         if win:
             return win
+    if sys.platform == "darwin":
+        mac = _detect_darwin_language()
+        if mac:
+            return mac
     return _detect_posix_locale()
 
 

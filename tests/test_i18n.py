@@ -19,9 +19,11 @@ from teleflow import i18n
 def fresh_i18n(monkeypatch):
     i18n.reset()
     # Force a deterministic non-Chinese system so "auto" is English by default,
-    # regardless of the host OS UI language (env unset + Windows UI lang forced en).
+    # regardless of the host OS UI language (env unset + Windows/macOS UI lang
+    # forced to non-Chinese so the POSIX fallback resolves to English).
     monkeypatch.setattr(locale, "getdefaultlocale", lambda: ("en_US", "UTF-8"))
     monkeypatch.setattr(i18n, "_detect_windows_ui_language", lambda: "en")
+    monkeypatch.setattr(i18n, "_detect_darwin_language", lambda: "")
     for var in ("LANGUAGE", "LC_ALL", "LANG"):
         monkeypatch.delenv(var, raising=False)
     yield
@@ -91,6 +93,34 @@ def test_auto_resolves_to_chinese_via_windows_ui_language(monkeypatch):
     i18n.set_language("auto")
     assert i18n.tr("language.chinese") == "中文"
     i18n.reset()
+
+
+def test_detect_darwin_language_reads_apple_preferences(monkeypatch):
+    # macOS keeps the UI language in AppleLanguages/AppleLocale, which the shell
+    # LANG does not reflect. A Chinese AppleLanguages must win over an en_US LANG.
+    class _Run:
+        def __init__(self, stdout, rc=0):
+            self.stdout = stdout
+            self.returncode = rc
+
+    def _fake_run(cmd, **kwargs):
+        if cmd[-1] == "AppleLanguages":
+            return _Run('(\n    "zh-Hans",\n    en\n)')
+        return _Run("en_US")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    assert i18n._detect_darwin_language() == "zh_CN"
+
+
+def test_detect_darwin_language_falls_through_to_posix(monkeypatch):
+    # When Apple preferences are unavailable (defaults errors out) the function
+    # returns "" so the caller falls back to the POSIX env-var detection.
+    def _fake_run(cmd, **kwargs):
+        raise OSError("no defaults")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    assert i18n._detect_darwin_language() == ""
 
 
 def test_invalid_language_falls_back_safely(fresh_i18n):
