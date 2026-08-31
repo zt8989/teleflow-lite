@@ -4,6 +4,13 @@
 **懒加载** `import pjsua2 as pj`，因此需要把 pjsua2 的原生 Python 模块编译并安装进项目的
 `.venv`。本文记录从源码构建 pjproject 2.17 并产出 `_pjsua2.so` 的完整流程，以及踩过的坑。
 
+> 📦 **pjsua2 现已以「本地 wheel」形式 vendored**（`dist/`，见下方「打包成 wheel」
+> 一节），并作为普通依赖写进 `pyproject.toml`。因此 `uv sync` / `uv run` 会**自动安装**它，
+> 干净检出不再需要单独编原生模块。只有当 **Python 版本或 CPU 架构变化**时才需要按本文从源码重编，
+> 然后跑 `scripts/build_pjsua2_wheel.py` 重新打包、再 `uv sync` 重装即可。重编 SWIG 模块前若缺
+> `setuptools` / `wheel`（它们也在 `dev` 依赖组里），先 `uv pip install setuptools wheel`。
+> 本文件里的 `.venv/bin/python` 路径在 uv 创建的虚拟环境里依然有效。
+
 环境：macOS arm64（Apple M），clang 17，`/opt/homebrew` 与 `/opt/local`（MacPorts）并存。
 
 ---
@@ -15,7 +22,7 @@
 | GNU make | `/usr/bin/make`（3.81） | 系统自带即可，pjsip 用 autoconf 构建 |
 | C/C++ 编译器 | `/usr/bin/g++`（Apple clang 17） | pjsua2 是 C++，需要 CXX |
 | SWIG | `/opt/homebrew/bin/swig` | 生成 Python 包装代码 |
-| Python | 项目 `.venv`（`python3.14`，含 setuptools 84） | **必须用 venv 里的 python 编 SWIG 模块** |
+| Python | 项目 `.venv`（由 uv 创建，Python 3.14；需含 setuptools 84，缺失时用 `uv pip install setuptools` 补装） | **必须用 venv 里的 python 编 SWIG 模块** |
 | OpenSSL | `/opt/homebrew/opt/openssl@3` | macOS 上 pjsip 默认用 Darwin SSL，无需手动指定；openssl 仅被动态链接 |
 
 无需 `autoconf`/`pkg-config`（源码包已带 `configure` 脚本）。
@@ -77,7 +84,53 @@ print('OK')
 
 ---
 
-## 4. 踩过的坑
+## 4. 打包成 vendored wheel（供 uv 依赖）
+
+上面把 `pjsua2` 装进了 `.venv`，但 `.venv` 由 uv 管理、`uv sync` 会重建它，手装的模块会丢。
+为让 `pjsua2` 成为真正的依赖、随 `uv sync` / `uv run` 自动重装，把它打包成本地 wheel 放进仓库
+根目录的 `dist/`（`dist/` 已在 `.gitignore` 中忽略，仅同平台可用），再通过 `pyproject.toml` 的
+`[tool.uv.sources]` 指向它：
+
+```bash
+# 从当前 .venv 里已编好的 pjsua2 生成 wheel（top-level: pjsua2.py + _pjsua2*.so）。
+# 用 venv 的 python 跑脚本（跨平台，Windows 用 .venv\Scripts\python.exe）：
+.venv/bin/python scripts/build_pjsua2_wheel.py
+# 产物示例：dist/pjsua2-2.17-cp314-cp314-macosx_11_0_arm64.whl
+```
+
+`build_pjsua2_wheel.py` 会**自动探测**当前 Python 版本与平台，把正确的 wheel tag 写进 WHEEL 元数据，
+并把 `pyproject.toml` 里 `[tool.uv.sources].pjsua2.path` 与依赖的 **marker** 改写为本次产出的
+wheel 对应的平台，因此在同一仓库下换平台构建无需手改 pyproject。
+
+`pyproject.toml` 里对应的声明（相对路径 + 平台 marker，做到可移植、跨平台）：
+
+```toml
+dependencies = [
+    # pjsua2 是原生扩展，平台/Python 相关，只在本机构建平台上需要，用 marker 限定；
+    # 其它平台（如 CI/Linux）会被 marker 跳过——测试与 FakeSipBackend 不依赖它。
+    "pjsua2 ; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version == '3.14'",
+]
+
+# [tool.uv.sources] 的 path 相对仓库根目录解析（PEP 508 的 file:// 直接引用要求绝对路径，
+# 而 uv 的 sources.path 支持相对路径，因此仓库换机器/换位置都无需改路径）。build_pjsua2_wheel.py
+# 会把它改写为本次构建产物的真实文件名（含平台 tag）。
+[tool.uv.sources]
+pjsua2 = { path = "dist/pjsua2-2.17-cp314-cp314-macosx_11_0_arm64.whl" }
+```
+
+要点：
+- pjsua2 是 **原生扩展**，一个 wheel 无法跨平台。因此用 `sys_platform` / `platform_machine` /
+  `python_version` marker 把安装限定在构建它的平台；其它平台 `uv sync` 直接跳过 pjsua2（测试用
+  FakeSipBackend，不需要它），不会报错。换 Python 版本或架构时按第 2 节重编，再跑
+  `scripts/build_pjsua2_wheel.py`（自动改写 pyproject 的 path 与 marker）。
+- 之所以不在 `dependencies` 里写 `file://./...` 相对直接引用：PEP 508 要求直接引用必须是带
+  scheme 的绝对 URL，相对路径会被 packaging 直接拒绝（`relative path without a working directory`）。
+  uv 的 `[tool.uv.sources]` `path` 字段则相对项目根目录解析，是 vendored 本地包的标准做法。
+- wheel 用 `SOURCE_DATE_EPOCH=0` 打包，产物可复现（相同输入 hash 不变），`uv.lock` 不会因重打包而失配。
+
+---
+
+## 5. 踩过的坑
 
 ### 坑 1：系统 `python3` 没有 setuptools / distutils，SWIG 模块编不过
 
@@ -134,10 +187,12 @@ pjsua2 **并未被排除**。`./configure` 的输出也已确认
 
 ---
 
-## 5. 何时需要重新构建
+## 6. 何时需要重新构建
 
 - pjproject 升级到新版本时；
-- 删除并重建 `.venv` 后（模块装在 venv 内，重建即丢失）；
-- 升级 macOS / Xcode 导致 clang 或系统框架变化后。
+- 换了 **Python 版本或 CPU 架构**（wheel 是 cp314 / macOS arm64 专用，须按第 2 节重编后
+  重新跑 `scripts/build_pjsua2_wheel.py` 打包，再 `uv sync`）；
+- 删除并重建 `.venv` 后（只要有 `uv.lock` + 本地 wheel，`uv sync` 会自动重装 pjsua2，无需手编）；
+- 升级 macOS / Xcode 导致 clang 或系统框架变化、且 `.so` 动态链接的系统库（见坑 4）变动后。
 
 流程不变，照第 2 节重跑即可。
