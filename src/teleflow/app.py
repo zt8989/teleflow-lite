@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QSystemTrayIcon,
@@ -558,7 +559,7 @@ class SettingsDialog(QDialog):
         ivr_page = QWidget()
         ivl = QVBoxLayout(ivr_page)
         ivl.setContentsMargins(12, 12, 12, 12)
-        ivl.setSpacing(6)
+        ivl.setSpacing(8)
         self.ivr_enabled = self._chk("settings.ivr.enabled")
         ivl.addWidget(self.ivr_enabled)
         ivl.addWidget(self._lbl("settings.ivr.welcome"))
@@ -597,16 +598,21 @@ class SettingsDialog(QDialog):
         ivl.addStretch()
 
         # --- Page: 电话汇报 (RPC) ---
+        report_scroll = QScrollArea()
+        report_scroll.setWidgetResizable(True)
+        report_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         report_page = QWidget()
         rp = QVBoxLayout(report_page)
         rp.setContentsMargins(12, 12, 12, 12)
-        rp.setSpacing(6)
+        rp.setSpacing(8)
+        report_scroll.setWidget(report_page)
         self.rpc_enabled = self._chk("settings.rpc.enabled")
         self.rpc_port = QSpinBox()
         self.rpc_port.setRange(1, 65535)
         self.rpc_token = QLineEdit()
         self.rpc_token.setReadOnly(True)
         self.rpc_token_reset_btn = QPushButton(tr("settings.reset_token"))
+        self.rpc_token_reset_btn.setMinimumWidth(96)
         self._retranslatable.append((self.rpc_token_reset_btn, "settings.reset_token"))
         self.rpc_token_reset_btn.clicked.connect(self._reset_token)
         rpc_token_row = QHBoxLayout()
@@ -700,7 +706,7 @@ class SettingsDialog(QDialog):
             ("settings.sip_account", acct_page),
             ("settings.hooks", hook_page),
             ("settings.ivr", ivr_page),
-            ("settings.report", report_page),
+            ("settings.report", report_scroll),
             ("settings.log_start", log_page),
         ]:
             self._menu.addItem(tr(title_key))
