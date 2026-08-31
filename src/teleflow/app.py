@@ -911,8 +911,15 @@ class SettingsDialog(QDialog):
         self.ivr_welcome.setPlaceholderText(tr("settings.ivr.welcome.ph"))
         self.sip_port.setPlaceholderText(tr("settings.sip_port.ph"))
         self.report_extension.setPlaceholderText(tr("settings.ext.ph"))
+        self.report_host.setPlaceholderText(tr("settings.desk_addr.ph"))
         self.report_caller_id.setPlaceholderText(tr("settings.caller_id.ph"))
         self.tts_voice_custom.setPlaceholderText(tr("settings.tts_voice_custom.ph"))
+        for edit in self.ivr_digit_text_edits.values():
+            edit.setPlaceholderText(tr("settings.ivr.text.ph"))
+        for edit in self.ivr_digit_hook_edits.values():
+            edit.setPlaceholderText(tr("settings.ivr.cmd.ph"))
+        for cb in self.ivr_exit_checkboxes.values():
+            cb.setToolTip(tr("settings.ivr.exit.tip"))
         self._populate_tts_voice_combo(preserve=True)
         self._refresh_ffmpeg_placeholder()
         self._language_combo.setItemText(0, tr("language.auto"))
