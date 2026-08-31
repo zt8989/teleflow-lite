@@ -66,7 +66,7 @@ digit_hook = {
 digit_text = {
     "0": "开始 Vibe Coding",
     "1": "查询宁波天气",
-    "2": "查询待办事项：示例待办一、示例待办二，请在终端查看。",
+    "2": "查询待办事",
 }
 
 store = ConfigStore()
