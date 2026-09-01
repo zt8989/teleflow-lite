@@ -19,7 +19,6 @@ Runs only when PyQt6 and pty are importable.
 
 import json
 import os
-import pty
 import select
 import signal
 import socket
@@ -37,8 +36,15 @@ try:
 except Exception:  # pragma: no cover - environment dependent
     _HAVE_GUI = False
 
+try:
+    import pty  # noqa: F401  (import fails on Windows: termios is Unix-only)
+
+    _HAVE_PTY = True
+except (ImportError, OSError):  # pragma: no cover - environment dependent
+    _HAVE_PTY = False
+
 pytestmark = pytest.mark.skipif(
-    not (_HAVE_GUI and hasattr(pty, "fork")),
+    not (_HAVE_GUI and _HAVE_PTY),
     reason="PyQt6 or pty not available",
 )
 
