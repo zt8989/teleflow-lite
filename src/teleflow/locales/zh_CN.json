@@ -105,6 +105,9 @@
 
   "tray.register.title": "TeleFlow — 网关注册",
   "tray.port_conflict": "指定端口 {requested} 已被占用，已自动改用端口 {selected}",
+  "tray.rpc.title": "TeleFlow — 本地控制端口",
+  "tray.rpc_port_conflict": "本地控制端口 {requested} 已被占用，已自动改用端口 {selected}",
+  "tray.rpc_port_unavailable": "本地控制端口 {requested} 已被占用，且无可用的备用端口，本地控制接口未启动",
 
   "reg.registered": "已注册",
   "reg.unregistered": "未注册",

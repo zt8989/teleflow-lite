@@ -105,6 +105,9 @@
 
   "tray.register.title": "TeleFlow — Gateway Registration",
   "tray.port_conflict": "Port {requested} was occupied; auto-switched to {selected}",
+  "tray.rpc.title": "TeleFlow — Local Control Port",
+  "tray.rpc_port_conflict": "Local control port {requested} was occupied; auto-switched to {selected}",
+  "tray.rpc_port_unavailable": "Local control port {requested} was occupied and no fallback port is free; the local control interface did not start",
 
   "reg.registered": "Registered",
   "reg.unregistered": "Unregistered",

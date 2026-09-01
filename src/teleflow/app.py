@@ -1236,6 +1236,30 @@ class MainWindow(QMainWindow):
                 5000,
             )
 
+    def _notify_rpc_port_conflict(self, requested: int, selected: int) -> None:
+        """The configured local control port was occupied; RPC auto-moved to a
+        free one. Surface that to the user so external callers can be repointed
+        (the [RPC][WARN] log line is written by RpcServer.start)."""
+        if self._tray is not None:
+            self._tray.showMessage(
+                tr("tray.rpc.title"),
+                tr("tray.rpc_port_conflict", requested=requested, selected=selected),
+                QSystemTrayIcon.MessageIcon.Warning,
+                5000,
+            )
+
+    def _notify_rpc_port_unavailable(self, requested: int) -> None:
+        """No free port was found in the scan window, so the local control
+        interface did not start. Tell the user plainly so they can free the
+        port or pick another one in Settings."""
+        if self._tray is not None:
+            self._tray.showMessage(
+                tr("tray.rpc.title"),
+                tr("tray.rpc_port_unavailable", requested=requested),
+                QSystemTrayIcon.MessageIcon.Warning,
+                8000,
+            )
+
     def _wire_service(self) -> None:
         svc = self._service
         # All handlers are marshaled to the GUI thread via self.gui: service
@@ -1568,6 +1592,17 @@ def build_app(
     # against pjsua2's worker thread (see MainWindow.rpc_scheduler).
     rpc = RpcServer(service, store, log=logger.log_line, scheduler=window.rpc_scheduler)
     rpc.start()
+    # A busy RPC port no longer crashes the app (RpcServer walks to a free one,
+    # or disables RPC). Either way, tell the user via a tray warning so a
+    # duplicate instance / leftover listener isn't silent. Deferred to the GUI
+    # thread so it shows once the event loop is running.
+    conflict = rpc.port_conflict
+    if conflict is not None:
+        requested, selected = conflict
+        if selected is None:
+            window.gui(lambda: window._notify_rpc_port_unavailable(requested))
+        else:
+            window.gui(lambda: window._notify_rpc_port_conflict(requested, selected))
 
     if settings.autostart:
         set_autostart(True)

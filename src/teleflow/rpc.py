@@ -26,6 +26,7 @@ without a secret.
 
 from __future__ import annotations
 
+import errno
 import json
 import secrets
 import threading
@@ -38,6 +39,39 @@ from teleflow.tts import TtsError
 
 DEFAULT_RPC_PORT = 8731
 _MAX_BODY = 1_000_000  # 1 MB cap on request bodies
+# When the configured port is occupied, walk this many ports upward and bind
+# the first free one so a stray duplicate instance or a leftover listener can't
+# crash the app. Mirrors the SIP transport's port-conflict auto-move.
+_RPC_PORT_SCAN_LIMIT = 10
+
+
+def _bind_rpc(preferred: int, handler: type) -> tuple[ThreadingHTTPServer | None, int | None]:
+    """Bind the loopback RPC server, tolerating a busy preferred port.
+
+    Returns ``(server, requested)``: ``requested`` is ``None`` when ``preferred``
+    was free (bound as-is), or the preferred port when it had to move. A ``None``
+    server with a non-``None`` requested means nothing in the scan window was
+    free — the caller should leave RPC disabled rather than crash.
+    """
+
+    def attempt(port: int) -> ThreadingHTTPServer | None:
+        try:
+            return ThreadingHTTPServer(("127.0.0.1", port), handler)
+        except OSError as exc:
+            # EADDRINUSE (48 on macOS/Linux) or EACCES => port taken / not ours;
+            # let the caller walk to the next one. Anything else is unexpected.
+            if exc.errno in (errno.EADDRINUSE, errno.EACCES):
+                return None
+            raise
+
+    server = attempt(preferred)
+    if server is not None:
+        return server, None
+    for candidate in range(preferred + 1, preferred + _RPC_PORT_SCAN_LIMIT):
+        server = attempt(candidate)
+        if server is not None:
+            return server, preferred
+    return None, preferred
 
 
 def _make_handler(
@@ -271,6 +305,10 @@ class RpcServer:
         self._log = log
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        # (requested, selected) when the preferred port was occupied and we
+        # auto-moved, or (requested, None) when nothing in the scan window was
+        # free and RPC is disabled. Read by the app to warn the user.
+        self._port_conflict: tuple[int, int | None] | None = None
 
     def start(self) -> None:
         settings = self._store.load()
@@ -282,7 +320,34 @@ class RpcServer:
         # Per-request [RPC] lines are emitted by the handler via ``log`` (the
         # unified logger; file + UI panel).
         handler = _make_handler(self._service, self._store, self._scheduler, log=self._log)
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", settings.rpc_port), handler)
+        # Bind gracefully: a busy preferred port would otherwise raise on
+        # server_bind() and crash the whole app before the window even opens.
+        # Walk to a free port instead, remembering the conflict so the UI can
+        # warn the user (mirrors the SIP transport port-conflict handling).
+        try:
+            preferred = int(settings.rpc_port)
+        except (TypeError, ValueError):
+            preferred = DEFAULT_RPC_PORT
+        server, requested = _bind_rpc(preferred, handler)
+        if server is None:
+            # _bind_rpc returns (None, preferred) here: no port in the scan
+            # window was free, so the busy port is always the configured one.
+            self._port_conflict = (preferred, None)
+            if self._log is not None:
+                self._log(
+                    f"[RPC][WARN] 本地控制端口 {preferred} 已被占用，"
+                    f"且无可用的备用端口（扫描 {preferred + 1}-"
+                    f"{preferred + _RPC_PORT_SCAN_LIMIT - 1}），本地控制接口未启动"
+                )
+            return
+        if requested is not None:
+            selected = server.server_address[1]
+            self._port_conflict = (requested, selected)
+            if self._log is not None:
+                self._log(
+                    f"[RPC][WARN] 指定端口 {requested} 已被占用，已自动改用端口 {selected}"
+                )
+        self._httpd = server
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
 
@@ -296,3 +361,10 @@ class RpcServer:
     @property
     def port(self) -> int | None:
         return self._httpd.server_address[1] if self._httpd is not None else None
+
+    @property
+    def port_conflict(self) -> tuple[int, int | None] | None:
+        """``(requested, selected)`` when the preferred port was occupied (or
+        ``(requested, None)`` when RPC is disabled for lack of a free port);
+        ``None`` when the preferred port bound cleanly."""
+        return self._port_conflict
