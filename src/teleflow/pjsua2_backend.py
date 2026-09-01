@@ -19,6 +19,7 @@ which is exactly the lossless, no-recording, no-DSP guarantee of ticket 04.
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -412,6 +413,28 @@ def _ep_config(pj: Any, log_file: str | None = None) -> Any:
             cfg.logConfig.filename = log_file
         except Exception:  # noqa: BLE001 - logging stays best-effort
             pass
+    if sys.platform == "darwin":
+        # macOS 音频卡顿修复（Windows/WMME 无此问题）：
+        # 1) pjsua2 默认 ecTailLen=200 会让 CoreAudio 后端启用
+        #    VoiceProcessingIO —— 苹果的语音处理单元（AEC/AGC/降噪），它
+        #    忽略所选声卡、以 16k 客户端驱动 48k 设备。关掉 EC 让它退回
+        #    HALOutput 并尊重 Settings 里选的播放/采集设备。
+        # 2) 主时钟对齐设备原生 48k：端点不再做 16k<->48k 重采样，也少走
+        #    WSOLA delay buffer；8k TTS WAV 只经一次重采样进入通话。
+        # 3) 媒体时钟由 pjsua 的 worker 线程(定时器堆)驱动；单 worker 在
+        #    macOS 上会被 GUI/GIL/Python 回调拖慢，表现为发出的 RTP
+        #    周期性地抖动/停发（RTCP 显示 TX jitter 124-188ms、丢失 1-7%）。
+        #    多开几个 GIL-free 的 C worker 让定时器堆总能被准时轮询。
+        # 4) pjsua 默认 VAD(静音检测)开启：菜单播报间隙/空闲时完全停发
+        #    RTP，每次恢复发送的边界接收端 jitter buffer 恰好被掏空 →
+        #    每段提示音开头卡一下。noVad 让流持续发送（静音也发 RTP），
+        #    消除"发-停"边界。
+        cfg.medConfig.ecTailLen = 0
+        cfg.medConfig.ecOptions = 0
+        cfg.medConfig.clockRate = 48000
+        cfg.medConfig.sndClockRate = 48000
+        cfg.uaConfig.threadCnt = 3
+        cfg.medConfig.noVad = True
     return cfg
 
 
@@ -503,6 +526,23 @@ class Pjsua2Backend:
             self._pj.PJSIP_TRANSPORT_UDP, tcfg
         )
         self._ep.libStart()
+
+        if sys.platform == "darwin":
+            # Prefer Opus/48k so an Opus-first softphone (linphone, its Android
+            # sibling) negotiates Opus end-to-end and FreeSWITCH bridges the two
+            # legs without transcoding. When teleflow was limited to 8k PCMU,
+            # FreeSWITCH had to transcode 8k PCMU <-> 48k Opus, and its
+            # write-resampler filled the IVR's word gaps with noise — the user
+            # heard "正文持续卡" on inbound IVR while outbound reports (PCMU on
+            # both legs) stayed clean. G722/16k is a fallback; the narrowband-only
+            # speex/iLBC/GSM are disabled so they can never win negotiation.
+            self._ep.codecSetPriority("OPUS", 255)
+            self._ep.codecSetPriority("G722", 250)
+            for codec_id in ("speex/8000", "speex/16000", "speex/32000", "iLBC/8000", "GSM/8000"):
+                try:
+                    self._ep.codecSetPriority(codec_id, 0)
+                except Exception:  # noqa: BLE001 - absent codecs are fine
+                    pass
 
         acc_cfg = self._pj.AccountConfig()
         settings = self._store.load()

@@ -799,7 +799,7 @@ name = "pjsua2"
 version = "2.17"
 source = { path = "dist/pjsua2-2.17-cp314-cp314-macosx_11_0_arm64.whl" }
 wheels = [
-    { filename = "pjsua2-2.17-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:f0a014ff76424ca3bd39c116b7cc641641bc2a579e2915b473285c52018e77ee" },
+    { filename = "pjsua2-2.17-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:840288e85a44bcc79c42b949e3b7140d969c09e9ba46e1c8f46b51fb0c8fd4dd" },
 ]
 
 [[package]]
