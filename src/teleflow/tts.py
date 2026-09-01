@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
@@ -152,7 +153,11 @@ class EdgeTtsBackend:
         import edge_tts
 
         ts = time.strftime("%Y%m%d_%H%M%S")
-        mp3 = self._cache_dir / f"report_{ts}.mp3"
+        # Unique per render: the IVR flow synthesizes all prompts concurrently, so
+        # two jobs in the same second must not share one report_*.mp3 — they would
+        # clobber each other's file and both transcode the same audio into their
+        # own keyed wav (two cache keys ending up with byte-identical audio).
+        mp3 = self._cache_dir / f"report_{ts}_{uuid.uuid4().hex[:8]}.mp3"
         communicate = edge_tts.Communicate(text, voice)
         asyncio.run(
             asyncio.wait_for(communicate.save(str(mp3)), timeout=EDGE_TTS_TIMEOUT_SECONDS)

@@ -44,5 +44,13 @@ Windows EXE 暂不构建（本机为 macOS，无 Windows 构建环境）。
 
 ## 依赖
 
-- 必须在项目 `.venv` 中已安装 `pjsua2`（见 `docs/build-pjsua2.md`）与 `PyQt6`，
-  且 `pyinstaller` 已安装（`.venv/bin/pip install pyinstaller`）。
+- 依赖用 **uv** 管理：一条 `uv sync` 即可装好运行时依赖（`PyQt6`）、vendored 的 `pjsua2`
+  wheel，以及开发工具；再用 uv 把 `pyinstaller` 装进同一个 `.venv`：
+
+  ```bash
+  uv sync
+  uv pip install pyinstaller
+  ```
+
+- 打包时要求项目 `.venv` 中已装好 `pjsua2`（来自 vendored wheel，随 `uv sync` 自动安装）、
+  `PyQt6` 与 `pyinstaller`。

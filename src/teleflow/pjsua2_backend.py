@@ -19,6 +19,7 @@ which is exactly the lossless, no-recording, no-DSP guarantee of ticket 04.
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -118,6 +119,11 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
             # data only when call_id != PJSUA_INVALID_ID. Outbound calls
             # pass the default so makeCall assigns the id itself.
             pj.Call.__init__(self, account, call_id)
+            # Gate the two-way conference bridge so a re-INVITE (hold /
+            # resume / session-timer refresh) from the far end can't re-run
+            # the bridge (and re-open the audio device) on every media-state
+            # event — see onCallMediaState.
+            self._bridged = False
 
         def onCallState(self, prm: Any) -> None:  # noqa: ARG002 - prm unused
             info = self.getInfo()
@@ -214,8 +220,18 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
                     backend._handler(
                         "call_media_active", {"call_id": str(info.id)}
                     )
-                _bridge_two_way(backend, self, media.index)
-                # A pjsua2 call has a single audio stream; bridge it once.
+                # Bridge exactly once. A re-INVITE from the far end (hold /
+                # resume / session-timer refresh) flips the media state again,
+                # and without this guard we would re-run _bridge_two_way on every
+                # event — re-issuing startTransmit and re-opening the audio
+                # device. On macOS CoreAudio that re-config stalls pjsua2's 200
+                # OK to the re-INVITE, so the PJSIP transaction times out (~32s)
+                # and the real BYE only lands once the far end gives up — the
+                # "挂机很久才检测到" symptom. The conference bridge stays wired, so
+                # re-bridging is never needed.
+                if not self._bridged:
+                    _bridge_two_way(backend, self, media.index)
+                    self._bridged = True
                 return
 
         def onDtmfDigit(self, prm: Any) -> None:  # noqa: ARG002 - pjsua2 callback signature
@@ -351,8 +367,30 @@ def _make_report_player(pj: Any, backend: "Pjsua2Backend", call_id: str, *, hang
 
 
 def _release_report_player(backend: "Pjsua2Backend", call_id: str) -> None:  # pragma: no cover
-    """Drop our reference to a report player once its call is gone."""
-    backend._report_players.pop(call_id, None)
+    """Drop our reference to a report player once its call is gone.
+
+    Pop the player from the live dict *and* destroy its pjsua2 C object so the
+    conference port is freed immediately. Without the explicit destroy the player
+    stays alive on the bridge while pjsua2 tears the call down, and the call's
+    media shutdown can stall waiting on that port — another path to a late
+    "挂机" detection. Best-effort: the player may already be stopped by EOF or a
+    prior stop_playback, so every native call is guarded.
+    """
+    player = backend._report_players.pop(call_id, None)
+    if player is None:
+        return
+    sink = getattr(player, "_sink", None)
+    if sink is not None:
+        try:
+            player.stopTransmit(sink)
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
+    destroy = getattr(player, "destroyPlayer", None)
+    if destroy is not None:
+        try:
+            destroy()
+        except Exception:  # noqa: BLE001 - already torn down is fine
+            pass
 
 
 def _bridge_two_way(backend: "Pjsua2Backend", call: Any, media_index: int) -> None:  # pragma: no cover
@@ -412,6 +450,28 @@ def _ep_config(pj: Any, log_file: str | None = None) -> Any:
             cfg.logConfig.filename = log_file
         except Exception:  # noqa: BLE001 - logging stays best-effort
             pass
+    if sys.platform == "darwin":
+        # macOS 音频卡顿修复（Windows/WMME 无此问题）：
+        # 1) pjsua2 默认 ecTailLen=200 会让 CoreAudio 后端启用
+        #    VoiceProcessingIO —— 苹果的语音处理单元（AEC/AGC/降噪），它
+        #    忽略所选声卡、以 16k 客户端驱动 48k 设备。关掉 EC 让它退回
+        #    HALOutput 并尊重 Settings 里选的播放/采集设备。
+        # 2) 主时钟对齐设备原生 48k：端点不再做 16k<->48k 重采样，也少走
+        #    WSOLA delay buffer；8k TTS WAV 只经一次重采样进入通话。
+        # 3) 媒体时钟由 pjsua 的 worker 线程(定时器堆)驱动；单 worker 在
+        #    macOS 上会被 GUI/GIL/Python 回调拖慢，表现为发出的 RTP
+        #    周期性地抖动/停发（RTCP 显示 TX jitter 124-188ms、丢失 1-7%）。
+        #    多开几个 GIL-free 的 C worker 让定时器堆总能被准时轮询。
+        # 4) pjsua 默认 VAD(静音检测)开启：菜单播报间隙/空闲时完全停发
+        #    RTP，每次恢复发送的边界接收端 jitter buffer 恰好被掏空 →
+        #    每段提示音开头卡一下。noVad 让流持续发送（静音也发 RTP），
+        #    消除"发-停"边界。
+        cfg.medConfig.ecTailLen = 0
+        cfg.medConfig.ecOptions = 0
+        cfg.medConfig.clockRate = 48000
+        cfg.medConfig.sndClockRate = 48000
+        cfg.uaConfig.threadCnt = 3
+        cfg.medConfig.noVad = True
     return cfg
 
 
@@ -503,6 +563,23 @@ class Pjsua2Backend:
             self._pj.PJSIP_TRANSPORT_UDP, tcfg
         )
         self._ep.libStart()
+
+        if sys.platform == "darwin":
+            # Prefer Opus/48k so an Opus-first softphone (linphone, its Android
+            # sibling) negotiates Opus end-to-end and FreeSWITCH bridges the two
+            # legs without transcoding. When teleflow was limited to 8k PCMU,
+            # FreeSWITCH had to transcode 8k PCMU <-> 48k Opus, and its
+            # write-resampler filled the IVR's word gaps with noise — the user
+            # heard "正文持续卡" on inbound IVR while outbound reports (PCMU on
+            # both legs) stayed clean. G722/16k is a fallback; the narrowband-only
+            # speex/iLBC/GSM are disabled so they can never win negotiation.
+            self._ep.codecSetPriority("OPUS", 255)
+            self._ep.codecSetPriority("G722", 250)
+            for codec_id in ("speex/8000", "speex/16000", "speex/32000", "iLBC/8000", "GSM/8000"):
+                try:
+                    self._ep.codecSetPriority(codec_id, 0)
+                except Exception:  # noqa: BLE001 - absent codecs are fine
+                    pass
 
         acc_cfg = self._pj.AccountConfig()
         settings = self._store.load()
@@ -684,6 +761,9 @@ class Pjsua2Backend:
                 and media.status == self._pj.PJSUA_CALL_MEDIA_ACTIVE
             ):
                 _bridge_two_way(self, call, media.index)
+                # Mark bridged so a later re-INVITE (hold/resume) can't re-run the
+                # bridge and re-open the audio device (see onCallMediaState).
+                call._bridged = True
                 break
 
     def reroute(self) -> None:  # pragma: no cover

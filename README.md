@@ -18,10 +18,11 @@ example, a virtual sound card in production mode, headphones in debug mode).
 ## Quick start
 
 ```bash
-# Dependencies (Python >= 3.10)
-pip install -e .            # install PyQt6 and other runtime dependencies
-# The pjsua2 native library must be built separately; see docs/build-pjsua2.md
-python -m teleflow.app     # launch the GUI
+# Dependencies are managed with uv (https://github.com/astral-sh/uv); `uv.lock` pins them.
+uv sync                        # install PyQt6, pjsua2 (vendored wheel) and dev tools
+# pjsua2 is vendored as a local wheel (see docs/build-pjsua2.md) — no separate native
+# build needed for a clean checkout unless you change Python version / architecture.
+uv run python -m teleflow.app  # launch the GUI
 ```
 
 After launch the window minimizes to the system tray: the tray menu in the
@@ -281,14 +282,18 @@ they run **non-interactively**. Two points to note:
 ## Development and testing
 
 ```bash
-pip install -e ".[dev]"     # pytest + mypy
-pytest                       # full suite (incl. the scripted FakeSipBackend gateway)
-mypy src/teleflow            # type check
+uv sync                      # install runtime + dev deps (PyQt6, pjsua2 wheel, pytest, mypy)
+uv run pytest               # full suite (incl. the scripted FakeSipBackend gateway)
+uv run mypy src/teleflow    # type check
 ```
 
 - Tests resolve the package via `pythonpath=["src"]` and swap the SIP/audio backends for
   fake implementations, needing no display or native library (CI uses
   `QT_QPA_PLATFORM=offscreen`).
+- Dependencies are managed with **uv**. `pjsua2` is vendored as a local wheel
+  (`dist/`, see `docs/build-pjsua2.md`) and is a normal dependency, so
+  `uv sync` / `uv run` install it automatically — no separate native build is needed for a
+  clean checkout (rebuild the wheel only when you change the Python version or architecture).
 - Feature work should happen in a separate git worktree, bringing that feature's
   `.scratch/<slug>` issues along into the worktree (keeping the `master` working tree
   clean); see the issue-tracking convention under `.scratch/`

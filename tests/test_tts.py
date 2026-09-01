@@ -7,6 +7,7 @@ requires network and is intentionally not asserted in CI (native/network-only).
 
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -304,6 +305,36 @@ def test_edge_tts_retries_until_exhausted_then_raises(tmp_path: Path) -> None:
 def test_edge_tts_retry_attempts_default_is_three(tmp_path: Path) -> None:
     probe = _RetryProbe(cache_dir=tmp_path)
     assert probe._retry_attempts == 3
+
+
+class _FakeEdgeTtsModule:
+    """Stand-in for the lazily imported ``edge_tts`` package (no network)."""
+
+    class _Communicate:
+        def __init__(self, text: str, voice: str) -> None:
+            self.text, self.voice = text, voice
+
+        async def save(self, path: str) -> None:
+            Path(path).write_bytes(b"fake-mp3")
+
+    def Communicate(self, text: str, voice: str) -> "_FakeEdgeTtsModule._Communicate":
+        return self._Communicate(text, voice)
+
+
+def test_synthesize_once_mp3_names_unique_in_same_second(
+    monkeypatch, tmp_path: Path
+) -> None:
+    # Regression: parallel IVR syntheses landing in the same wall-clock second
+    # must not share one report_<ts>.mp3 — a shared intermediate made two cache
+    # keys ("1234567890" and "1234567890 请按2") come out byte-identical, so the
+    # caller heard the digit-2 prompt while the welcome was announcing.
+    monkeypatch.setitem(sys.modules, "edge_tts", _FakeEdgeTtsModule())
+    monkeypatch.setattr(time, "strftime", lambda _fmt: "20260901_000000")
+    backend = EdgeTtsBackend(cache_dir=tmp_path)
+    first = backend._synthesize_once("1234567890", "v")
+    second = backend._synthesize_once("1234567890 请按2", "v")
+    assert first != second
+    assert first.exists() and second.exists()
 
 
 def test_caching_backend_retries_inner_on_miss(tmp_path: Path) -> None:

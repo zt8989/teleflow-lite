@@ -10,6 +10,7 @@ window is testable without a display, real hardware, or the native library.
 from __future__ import annotations
 
 import shutil
+import signal
 import sys
 import threading
 import time
@@ -17,7 +18,7 @@ import warnings
 from pathlib import Path
 from typing import Callable
 
-from PyQt6.QtCore import QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QMetaObject, QObject, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QIcon, QPixmap, QTextCharFormat
 from PyQt6.QtWidgets import (
     QApplication,
@@ -37,6 +38,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QSystemTrayIcon,
@@ -558,7 +560,7 @@ class SettingsDialog(QDialog):
         ivr_page = QWidget()
         ivl = QVBoxLayout(ivr_page)
         ivl.setContentsMargins(12, 12, 12, 12)
-        ivl.setSpacing(6)
+        ivl.setSpacing(8)
         self.ivr_enabled = self._chk("settings.ivr.enabled")
         ivl.addWidget(self.ivr_enabled)
         ivl.addWidget(self._lbl("settings.ivr.welcome"))
@@ -597,16 +599,21 @@ class SettingsDialog(QDialog):
         ivl.addStretch()
 
         # --- Page: 电话汇报 (RPC) ---
+        report_scroll = QScrollArea()
+        report_scroll.setWidgetResizable(True)
+        report_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         report_page = QWidget()
         rp = QVBoxLayout(report_page)
         rp.setContentsMargins(12, 12, 12, 12)
-        rp.setSpacing(6)
+        rp.setSpacing(8)
+        report_scroll.setWidget(report_page)
         self.rpc_enabled = self._chk("settings.rpc.enabled")
         self.rpc_port = QSpinBox()
         self.rpc_port.setRange(1, 65535)
         self.rpc_token = QLineEdit()
         self.rpc_token.setReadOnly(True)
         self.rpc_token_reset_btn = QPushButton(tr("settings.reset_token"))
+        self.rpc_token_reset_btn.setMinimumWidth(96)
         self._retranslatable.append((self.rpc_token_reset_btn, "settings.reset_token"))
         self.rpc_token_reset_btn.clicked.connect(self._reset_token)
         rpc_token_row = QHBoxLayout()
@@ -700,7 +707,7 @@ class SettingsDialog(QDialog):
             ("settings.sip_account", acct_page),
             ("settings.hooks", hook_page),
             ("settings.ivr", ivr_page),
-            ("settings.report", report_page),
+            ("settings.report", report_scroll),
             ("settings.log_start", log_page),
         ]:
             self._menu.addItem(tr(title_key))
@@ -904,8 +911,15 @@ class SettingsDialog(QDialog):
         self.ivr_welcome.setPlaceholderText(tr("settings.ivr.welcome.ph"))
         self.sip_port.setPlaceholderText(tr("settings.sip_port.ph"))
         self.report_extension.setPlaceholderText(tr("settings.ext.ph"))
+        self.report_host.setPlaceholderText(tr("settings.desk_addr.ph"))
         self.report_caller_id.setPlaceholderText(tr("settings.caller_id.ph"))
         self.tts_voice_custom.setPlaceholderText(tr("settings.tts_voice_custom.ph"))
+        for edit in self.ivr_digit_text_edits.values():
+            edit.setPlaceholderText(tr("settings.ivr.text.ph"))
+        for edit in self.ivr_digit_hook_edits.values():
+            edit.setPlaceholderText(tr("settings.ivr.cmd.ph"))
+        for cb in self.ivr_exit_checkboxes.values():
+            cb.setToolTip(tr("settings.ivr.exit.tip"))
         self._populate_tts_voice_combo(preserve=True)
         self._refresh_ffmpeg_placeholder()
         self._language_combo.setItemText(0, tr("language.auto"))
@@ -1124,14 +1138,10 @@ class MainWindow(QMainWindow):
         self._force_quit = True
         # Tear down before leaving the event loop: quitting with a live pjsua2
         # stack and/or the tray menu still open has crashed Qt6Gui.dll on this
-        # Windows build (access violation, exit code 0xC0000005).
-        if self._service.running:
-            self._service.stop()
-        tray = self._tray
-        if tray is not None:
-            menu = tray.contextMenu()
-            if menu is not None and menu.isVisible():
-                menu.close()
+        # Windows build (access violation, exit code 0xC0000005). _cleanup is
+        # also wired to aboutToQuit, so the service stops before any widget is
+        # destroyed even if this path is bypassed.
+        self._cleanup()
         QApplication.processEvents()
         QApplication.quit()
 
@@ -1226,6 +1236,30 @@ class MainWindow(QMainWindow):
                 5000,
             )
 
+    def _notify_rpc_port_conflict(self, requested: int, selected: int) -> None:
+        """The configured local control port was occupied; RPC auto-moved to a
+        free one. Surface that to the user so external callers can be repointed
+        (the [RPC][WARN] log line is written by RpcServer.start)."""
+        if self._tray is not None:
+            self._tray.showMessage(
+                tr("tray.rpc.title"),
+                tr("tray.rpc_port_conflict", requested=requested, selected=selected),
+                QSystemTrayIcon.MessageIcon.Warning,
+                5000,
+            )
+
+    def _notify_rpc_port_unavailable(self, requested: int) -> None:
+        """No free port was found in the scan window, so the local control
+        interface did not start. Tell the user plainly so they can free the
+        port or pick another one in Settings."""
+        if self._tray is not None:
+            self._tray.showMessage(
+                tr("tray.rpc.title"),
+                tr("tray.rpc_port_unavailable", requested=requested),
+                QSystemTrayIcon.MessageIcon.Warning,
+                8000,
+            )
+
     def _wire_service(self) -> None:
         svc = self._service
         # All handlers are marshaled to the GUI thread via self.gui: service
@@ -1315,12 +1349,47 @@ class MainWindow(QMainWindow):
             self.dashboard.set_sip_registration("unregistered")
         self._update_action_texts()
 
+    def _cleanup(self) -> None:
+        """Tear down native resources before Qt destroys the widgets.
+
+        Called from ``aboutToQuit`` (the safe, pre-destruction point) and from
+        the explicit quit path. Stopping the SIP stack here — rather than during
+        widget teardown — is what prevents the shutdown crash: previously the
+        pjsua2 threads/objects were still live when the main window was
+        destroyed, and an exception raised in that half-torn-down state
+        segfaulted PyQt's default error printer while it cleared the exception.
+        """
+        try:
+            if self._service.running:
+                self._service.stop()
+        except Exception as exc:  # noqa: BLE001 - teardown must not raise into Qt/sip
+            self.append_log_line(f"[SIP] stop failed during shutdown: {exc}")
+        tray = self._tray
+        if tray is not None:
+            try:
+                menu = tray.contextMenu()
+                if menu is not None and menu.isVisible():
+                    menu.close()
+            except Exception:  # noqa: BLE001 - never let teardown raise into sip
+                pass
+
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
-        if self._tray is not None and not self._force_quit:
-            event.ignore()
-            self.hide()
-            return
-        event.accept()
+        # The window-close button / Cmd+W minimizes to the tray (ignore + hide).
+        # An application quit (Cmd+Q, or the Quit menu action) must terminate; we
+        # detect it via _force_quit / closingDown and tear down instead.
+        try:
+            if (
+                self._tray is not None
+                and not self._force_quit
+                and not QApplication.closingDown()
+            ):
+                event.ignore()
+                self.hide()
+                return
+            self._cleanup()
+            event.accept()
+        except Exception:  # noqa: BLE001 - a teardown exception must never escape into sip
+            event.accept()
 
 
 # ---------------------------------------------------------------------------
@@ -1377,11 +1446,59 @@ def maybe_auto_start_sip(
     return True
 
 
+class _SignalWaiter(threading.Thread):
+    """Consume Ctrl+C / ``kill`` via sigwait, then quit the Qt loop cleanly.
+
+    ``build_app`` blocks SIGINT/SIGTERM in every thread *before* spawning any
+    background thread, so this waiter is the one thread that can receive them.
+    Without it, a terminal's Ctrl+C can be picked up by a pjsua2 native worker
+    thread where Python's main-thread-only signal handling either silently drops
+    the signal ("no response") or trips at the wrong moment (the shutdown
+    segfault). The quit is queued onto the main thread's event loop, so teardown
+    follows the exact same path as a normal app exit, including stopping the SIP
+    stack via ``aboutToQuit`` before any widget is destroyed.
+    """
+
+    def __init__(self, app: QApplication) -> None:
+        super().__init__(name="teleflow-sigwait", daemon=True)
+        self._app = app
+
+    def run(self) -> None:
+        try:
+            signal.pthread_sigmask(
+                signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+            )
+        except (AttributeError, OSError, ValueError):
+            return  # no mask support (e.g. Windows): nothing to consume here
+        try:
+            signal.sigwait({signal.SIGINT, signal.SIGTERM})
+        except (ValueError, OSError, RuntimeError):
+            return
+        QMetaObject.invokeMethod(
+            self._app, "quit", Qt.ConnectionType.QueuedConnection
+        )
+
+
 def build_app(
     config_path: Path | None = None,
     audio_backend: AudioBackend | None = None,
     sip_backend: SipBackend | None = None,
 ) -> QApplication:
+    # Force SIGINT/SIGTERM to stay *blocked* in every thread. A terminal's
+    # Ctrl+C sends a SIGINT to the process group; the kernel may pick any thread,
+    # and when that is a pjsua2 native worker (media/ev_thread) the signal is
+    # either silently dropped or trips Python's main-thread-only handler
+    # machinery at the wrong moment — both used to make Ctrl+C do nothing or
+    # crash the app. Blocking here means every thread created later (pjsua2's
+    # workers, Qt's, the RPC server, TTS/hook threads) inherits the blocked
+    # mask, leaving the _SignalWaiter thread as the only consumer via sigwait.
+    try:
+        signal.pthread_sigmask(
+            signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+        )
+    except (AttributeError, OSError, ValueError):
+        pass
+
     app = QApplication([])
     app.setWindowIcon(_load_icon())
     store = ConfigStore(config_path)
@@ -1399,6 +1516,33 @@ def build_app(
     service = SipCoreService(sip_backend, store, tts=tts)
     # tts.logger is wired to the unified logger below, after it exists.
     window = MainWindow(manager, service, store)
+
+    # Route the macOS Apple "Quit" (Cmd+Q) into the same teardown as the tray
+    # Quit action. By default closeEvent hides to the tray, which leaves the SIP
+    # stack and its native threads running until a force-kill. Marking the window
+    # force-quit on the application-level Close event makes closeEvent accept and
+    # run _cleanup via aboutToQuit.
+    class _AppQuitFilter(QObject):
+        def __init__(self, window: "MainWindow") -> None:
+            super().__init__()
+            self._window = window
+
+        def eventFilter(self, obj: object, event: QEvent) -> bool:  # type: ignore[override]
+            if obj is app and event.type() == QEvent.Type.Close:
+                self._window._force_quit = True
+            return False
+
+    app.installEventFilter(_AppQuitFilter(window))
+    app.aboutToQuit.connect(window._cleanup)
+
+    # A terminal's Ctrl+C (SIGINT) and `kill` (SIGTERM) are consumed by a
+    # dedicated waiter thread (see _SignalWaiter) rather than raising
+    # KeyboardInterrupt inside the Qt event loop: an uncaught exception there
+    # used to segfault while PyQt cleared the exception that pinned freed
+    # Qt/pjsua2 objects during interpreter shutdown. The signal-mask block at the
+    # top of build_app keeps these signals out of every other thread (including
+    # the pjsua2 workers), so sigwait below is the one deterministic consumer.
+    _SignalWaiter(app).start()
 
     # Unified log API: one EventLogger writes EVERY line to the log file and to
     # the UI panel (via the UI-only sink), so both always record the same
@@ -1448,6 +1592,17 @@ def build_app(
     # against pjsua2's worker thread (see MainWindow.rpc_scheduler).
     rpc = RpcServer(service, store, log=logger.log_line, scheduler=window.rpc_scheduler)
     rpc.start()
+    # A busy RPC port no longer crashes the app (RpcServer walks to a free one,
+    # or disables RPC). Either way, tell the user via a tray warning so a
+    # duplicate instance / leftover listener isn't silent. Deferred to the GUI
+    # thread so it shows once the event loop is running.
+    conflict = rpc.port_conflict
+    if conflict is not None:
+        requested, selected = conflict
+        if selected is None:
+            window.gui(lambda: window._notify_rpc_port_unavailable(requested))
+        else:
+            window.gui(lambda: window._notify_rpc_port_conflict(requested, selected))
 
     if settings.autostart:
         set_autostart(True)

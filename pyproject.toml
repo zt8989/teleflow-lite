@@ -11,6 +11,14 @@ dependencies = [
     "PyQt6",
     # Phone-report TTS (feature teleflow-phone-report): synthesizes report speech.
     "edge-tts",
+    # Vendored pjsua2 native module (pjproject 2.17). It is a *native* extension, so it is
+    # platform/Python-specific and only required on the platform it was built for. It is
+    # declared here by name and mapped to the locally-built wheel via [tool.uv.sources]
+    # (a relative path resolved against this project root — unlike a PEP 508 `file://`
+    # direct reference, which must be absolute). The marker below limits installation to
+    # the build platform; on other platforms pjsua2 is silently skipped (the test suite
+    # and FakeSipBackend only need it for the real SIP transport, never for tests/CI).
+    "pjsua2 ; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version == '3.14'",
 ]
 
 # ffmpeg is an *external binary* required by the phone-report feature to transcode
@@ -18,8 +26,26 @@ dependencies = [
 # package: install it via Homebrew (`brew install ffmpeg`) or any package manager,
 # make it available on PATH, or set `ffmpeg_path` in TeleFlow settings. The app
 # locates it automatically (PATH) or via that explicit setting.
-[project.optional-dependencies]
-dev = ["pytest", "mypy"]
+# Dev-only tools live in a uv dependency-group (not a published extra) so that
+# `uv sync` installs them automatically and `uv run <tool>` finds them. `wheel` and
+# `setuptools` are included because scripts/build_pjsua2_wheel.py (and the pjsua2 source
+# build in docs/build-pjsua2.md) need them at build time.
+[dependency-groups]
+dev = ["pytest", "mypy", "wheel", "setuptools"]
+
+# Dependency management is done with uv (`uv sync` / `uv run` / `uv lock`); `uv.lock` is
+# committed for reproducible installs. `pjsua2` is vendored as a local wheel (see above and
+# docs/build-pjsua2.md), so it is a first-class dependency and is reinstalled by
+# `uv sync` / `uv run` — those commands are safe for this project.
+[tool.uv]
+
+# Map the `pjsua2` dependency name to the locally-built wheel. `path` is resolved relative
+# to this project root, so the project stays portable across machines (no absolute path) and
+# the wheel is reinstalled by `uv sync` / `uv run`. scripts/build_pjsua2_wheel.py rewrites this
+# line (and the dependency marker above) to the exact wheel it produces, so the path matches
+# whichever platform was built.
+[tool.uv.sources]
+pjsua2 = { path = "dist/pjsua2-2.17-cp314-cp314-macosx_11_0_arm64.whl" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/teleflow"]

@@ -137,6 +137,23 @@ def test_close_without_tray_quits(tmp_path) -> None:
     window.close()
 
 
+def test_force_quit_stops_running_service(tmp_path) -> None:
+    # Regression guard for the shutdown crash: when the app is force-quit (Cmd+Q
+    # / Quit menu, _force_quit set) closeEvent must tear down the live SIP stack
+    # and accept the close instead of letting an exception escape into Qt's
+    # teardown (which used to segfault while clearing the exception).
+    app, window, service, _, _ = _make_window(tmp_path)
+    service.start()
+    assert service.running
+    window._tray = None
+    window._force_quit = True
+    event = _CloseEvent()
+    window.closeEvent(event)
+    assert event.accepted is True
+    assert service.running is False
+    window.close()
+
+
 def test_start_minimized_hides_window(tmp_path) -> None:
     app = QApplication.instance() or QApplication([])
     store = ConfigStore(tmp_path / "config.json")

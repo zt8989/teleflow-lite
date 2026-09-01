@@ -23,3 +23,6 @@ packaging/macos/dmgroot/
 
 # Git worktree isolation directory
 .worktrees/
+
+# Vendored, machine-specific prebuilt wheels live in dist/ (built by scripts/build_pjsua2_wheel.py).
+# dist/ is already ignored above; wheel files are not committed, the build script is.
