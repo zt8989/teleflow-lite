@@ -1,7 +1,11 @@
 # 打包（macOS DMG）
 
 TeleFlow 通过 PyInstaller 冻结为独立的 `TeleFlow.app`，再封装进 DMG。
-Windows EXE 暂不构建（本机为 macOS，无 Windows 构建环境）。
+
+> **Windows**：这里只谈 PyInstaller 冻结（EXE）打包，与依赖安装是两回事。pjsua2 的依赖在
+> Windows 上已同 macOS一样以 vendored wheel 形式经 `uv sync` 安装（从源码用 MSYS2/MinGW-w64
+> UCRT 编出，见 `docs/build-pjsua2.md` §7）；但 **Windows EXE 的 PyInstaller 冻结尚未搭建**，
+> 目前只构建 macOS DMG。
 
 ## 构建 macOS DMG
 

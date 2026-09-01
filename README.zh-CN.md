@@ -13,8 +13,11 @@ TeleFlow 是一个本地 **SIP 用户代理（UA）** 桌面程序（PyQt6）。
 
 ```bash
 # 依赖由 uv 管理（https://github.com/astral-sh/uv），uv.lock 固定版本
-uv sync                        # 装好 PyQt6、pjsua2（vendored wheel）与开发工具
-# pjsua2 已以本地 wheel 形式 vendored（见 docs/build-pjsua2.md），干净检出无需单独编原生模块
+uv sync                        # 装好 PyQt6、edge-tts 与开发工具
+# pjsua2（原生 SIP 传输层）是 vendored 的本地 wheel（见 docs/build-pjsua2.md），作为**可选 extra**
+# 提供：在本机编出 wheel 后，用 `uv sync --extra pjsua2` 安装它。把它设为可选 extra，是为了让
+# 干净的 `uv sync` 在 wheel 还不存在时也能在各平台顺利装好其它依赖。Windows 用 MSYS2/MinGW-w64
+# UCRT 编出 wheel（docs §7）后，`uv sync --extra pjsua2` 即安装。
 uv run python -m teleflow.app  # 启动 GUI
 ```
 
@@ -207,13 +210,14 @@ TeleFlow 可以在通话生命周期的关键时刻执行 **你配置的本地�
 ## 开发与测试
 
 ```bash
-uv sync                      # 装好运行时 + 开发依赖（PyQt6、pjsua2 wheel、pytest、mypy）
+uv sync                      # 装好运行时 + 开发依赖（PyQt6、edge-tts、pytest、mypy）
+uv sync --extra pjsua2        # 额外安装 vendored 的 pjsua2 原生 wheel（先构建）
 uv run pytest               # 全量单测（含 FakeSipBackend 脚本化网关）
 uv run mypy src/teleflow    # 类型检查
 ```
 
 - 测试通过 `pythonpath=["src"]` 解析包，并将 SIP/音频后端替换为假实现，无需显示器或原生库（CI 用 `QT_QPA_PLATFORM=offscreen`）。
-- 依赖统一用 **uv** 管理：`pjsua2` 已以本地 wheel 形式 vendored（`dist/`，见 `docs/build-pjsua2.md`），是普通依赖，因此 `uv sync` / `uv run` 会自动安装它——干净检出无需单独编原生模块（仅当更换 Python 版本或架构时才需重编 wheel）。
+- 依赖统一用 **uv** 管理：`pjsua2` 已以本地 wheel 形式 vendored（`dist/`，见 `docs/build-pjsua2.md`），并作为**可选 extra** 提供——`uv sync` 装好运行时/开发依赖，`uv sync --extra pjsua2` 在 wheel 存在时安装原生模块（构建脚本会自动执行）。这样干净的 `uv sync` 在 wheel 尚未编出时于各平台都能顺利执行。Windows 走同一套 vendored wheel 流程：用 MSYS2/MinGW-w64 UCRT 从源码编 pjsua2（`docs/build-pjsua2.md` §7），再 `uv sync --extra pjsua2`。
 - 功能开发建议在独立 git worktree 中进行，并把该功能的 `.scratch/<slug>` issue 一并带入 worktree（保持 `master` 工作树干净），见 `.scratch/` 下的 issue 跟踪约定（`docs/agents/issue-tracker.md`）。
 
 ## UI 原型

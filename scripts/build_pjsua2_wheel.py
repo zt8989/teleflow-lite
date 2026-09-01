@@ -2,15 +2,16 @@
 """Build a vendored pjsua2 wheel from the pjsua2 already installed in this project's .venv.
 
 Prereq: pjsua2 must first be built into .venv (see docs/build-pjsua2.md). This script only
-packages the existing pjsua2.py + _pjsua2*.so into a wheel declared via [tool.uv.sources] so
-it survives `uv sync` / `uv run` (which would otherwise recreate .venv and drop a hand-built,
-unmanaged module).
+packages the existing pjsua2.py + _pjsua2*.so into a wheel that survives `uv sync` / `uv run`
+(which would otherwise recreate .venv and drop a hand-built, unmanaged module).
 
-pjsua2 is a *native* extension, so the wheel is inherently platform/Python-specific. This
-script therefore auto-detects the running platform and Python and bakes the correct wheel tag
-in, then rewrites the [tool.uv.sources] path (and the dependency marker) in pyproject.toml to
-point at the freshly built wheel. That keeps pyproject.toml correct on every platform without a
-hand-edit: build pjsua2, run this script, and `uv lock` picks up the new local wheel.
+pjsua2 is a *native* extension, so the wheel is inherently platform/Python-specific. pyproject.toml
+therefore resolves pjsua2 **by name** from the `dist/` wheel store via `[tool.uv] find-links` —
+it contains NO platform-specific filename. uv scans `dist/`, picks the wheel whose tags match
+the current host, and the dependency marker (see pyproject.toml) gates installation to that
+platform. This script just drops the freshly built wheel into `dist/` (replacing any previous
+one) and installs it with `uv sync --extra pjsua2`. The committed pyproject.toml works on every
+platform unchanged.
 
 Run it with the project venv python, e.g.:
     .venv/bin/python scripts/build_pjsua2_wheel.py        # macOS / Linux
@@ -19,7 +20,6 @@ Run it with the project venv python, e.g.:
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -73,8 +73,9 @@ def detect_tag(venv_py: Path):
         else:
             plat = f"manylinux_2_17_{m}"
     elif sys_platform == "win32":
-        # Wheel tag is lowercased; the marker value keeps the real casing (e.g. AMD64).
-        plat = f"win_{m}"
+        # Wheel platform tag is lowercased (win_amd64); the PEP 508 marker keeps the
+        # real `platform_machine` casing (e.g. AMD64) so `python_version`/marker match.
+        plat = f"win_{m.lower()}"
     else:
         plat = f"{sys_platform}_{m}"
 
@@ -100,7 +101,9 @@ def main() -> None:
             "'wheel' via the dev group), then re-run this script."
         )
 
-    sp = Path(venv_query(venv_py, "import site; print(site.getsitepackages()[0])"))
+    # Use sysconfig (not site.getsitepackages()[0]): in a uv-managed venv the latter can
+    # list the venv root as element 0, so it is not reliably the site-packages directory.
+    sp = Path(venv_query(venv_py, "import sysconfig; print(sysconfig.get_path('purelib'))"))
     py_mod = sp / "pjsua2.py"
     so_mods = list(sp.glob("_pjsua2*.so")) + list(sp.glob("_pjsua2*.pyd"))
     if not py_mod.is_file() or not so_mods:
@@ -144,31 +147,16 @@ def main() -> None:
         )
 
     wheel_path = out_dir / wheel_name
-
-    # Point pyproject.toml's [tool.uv.sources] + dependency marker at the new wheel.
-    pyproject = ROOT / "pyproject.toml"
-    text = pyproject.read_text()
-    path_pat = re.compile(r'(pjsua2 = \{ path = ")[^"]+(" \})')
-    if not path_pat.search(text):
-        sys.exit(
-            "error: could not find the [tool.uv.sources] pjsua2 path line in pyproject.toml"
-        )
-    marker = (
-        f"sys_platform == '{sys_platform}' and platform_machine == '{machine}' "
-        f"and python_version == '{pyver}'"
-    )
-    new_path = f"dist/{wheel_name}"
-    new_text = path_pat.sub(rf"\1{new_path}\2", text)
-    dep_pat = re.compile(r'("pjsua2 ; )[^"]+(",)')
-    new_text = dep_pat.sub(lambda m: f"{m.group(1)}{marker}{m.group(2)}", new_text)
-    if new_text != text:
-        pyproject.write_text(new_text)
-        print(f"updated pyproject.toml: path -> {new_path}; marker -> {marker}")
-    else:
-        print("pyproject.toml already matches this platform (unchanged)")
-
     print(f"Built wheel: {wheel_path}")
-    print("Next: run 'uv lock' to refresh uv.lock, then 'uv sync'.")
+    # Install the freshly built wheel via uv so it is locked and `uv run` sees it. uv resolves
+    # pjsua2 by name from `dist/` ([tool.uv] find-links), so no pyproject.toml edit is needed.
+    try:
+        subprocess.run(["uv", "sync", "--extra", "pjsua2"], check=True, cwd=ROOT)
+        print("Installed pjsua2 into the venv via `uv sync --extra pjsua2`.")
+    except subprocess.CalledProcessError:
+        print(
+            "Wheel built, but `uv sync --extra pjsua2` failed. Run it manually to install pjsua2."
+        )
 
 
 if __name__ == "__main__":

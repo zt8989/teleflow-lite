@@ -19,9 +19,11 @@ example, a virtual sound card in production mode, headphones in debug mode).
 
 ```bash
 # Dependencies are managed with uv (https://github.com/astral-sh/uv); `uv.lock` pins them.
-uv sync                        # install PyQt6, pjsua2 (vendored wheel) and dev tools
-# pjsua2 is vendored as a local wheel (see docs/build-pjsua2.md) — no separate native
-# build needed for a clean checkout unless you change Python version / architecture.
+uv sync                        # install PyQt6, edge-tts and dev tools
+# pjsua2 (the native SIP transport) is a vendored wheel (docs/build-pjsua2.md) shipped as an
+# OPTIONAL extra: build it for your platform, then `uv sync --extra pjsua2` installs it. Keeping
+# it optional lets a plain `uv sync` succeed on every platform before the wheel exists. Windows
+# is built with MSYS2/MinGW-w64 UCRT (docs/build-pjsua2.md §7).
 uv run python -m teleflow.app  # launch the GUI
 ```
 
@@ -282,7 +284,8 @@ they run **non-interactively**. Two points to note:
 ## Development and testing
 
 ```bash
-uv sync                      # install runtime + dev deps (PyQt6, pjsua2 wheel, pytest, mypy)
+uv sync                      # install runtime + dev deps (PyQt6, edge-tts, pytest, mypy)
+uv sync --extra pjsua2        # also install the vendored native pjsua2 wheel (build it first)
 uv run pytest               # full suite (incl. the scripted FakeSipBackend gateway)
 uv run mypy src/teleflow    # type check
 ```
@@ -291,9 +294,11 @@ uv run mypy src/teleflow    # type check
   fake implementations, needing no display or native library (CI uses
   `QT_QPA_PLATFORM=offscreen`).
 - Dependencies are managed with **uv**. `pjsua2` is vendored as a local wheel
-  (`dist/`, see `docs/build-pjsua2.md`) and is a normal dependency, so
-  `uv sync` / `uv run` install it automatically — no separate native build is needed for a
-  clean checkout (rebuild the wheel only when you change the Python version or architecture).
+  (`dist/`, see `docs/build-pjsua2.md`) and is an **optional extra** — `uv sync` installs the
+  runtime/dev deps, and `uv sync --extra pjsua2` installs the native module once its wheel
+  exists (the build script runs that for you). This keeps a plain `uv sync` green on every
+  platform before the wheel is built. Windows uses the same vendored-wheel flow: build pjsua2
+  from source with MSYS2/MinGW-w64 UCRT (`docs/build-pjsua2.md` §7), then `uv sync --extra pjsua2`.
 - Feature work should happen in a separate git worktree, bringing that feature's
   `.scratch/<slug>` issues along into the worktree (keeping the `master` working tree
   clean); see the issue-tracking convention under `.scratch/`

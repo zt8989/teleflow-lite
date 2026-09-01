@@ -797,9 +797,9 @@ wheels = [
 [[package]]
 name = "pjsua2"
 version = "2.17"
-source = { path = "dist/pjsua2-2.17-cp314-cp314-macosx_11_0_arm64.whl" }
+source = { registry = "dist" }
 wheels = [
-    { filename = "pjsua2-2.17-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:840288e85a44bcc79c42b949e3b7140d969c09e9ba46e1c8f46b51fb0c8fd4dd" },
+    { path = "pjsua2-2.17-cp314-cp314-win_amd64.whl" },
 ]
 
 [[package]]
@@ -1052,8 +1052,12 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "edge-tts" },
-    { name = "pjsua2", marker = "python_full_version == '3.14.*' and platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "pyqt6" },
+]
+
+[package.optional-dependencies]
+pjsua2 = [
+    { name = "pjsua2", marker = "(python_full_version == '3.14.*' and platform_machine == 'arm64' and sys_platform == 'darwin') or (python_full_version == '3.14.*' and platform_machine == 'AMD64' and sys_platform == 'win32')" },
 ]
 
 [package.dev-dependencies]
@@ -1067,9 +1071,10 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "edge-tts" },
-    { name = "pjsua2", marker = "python_full_version == '3.14.*' and platform_machine == 'arm64' and sys_platform == 'darwin'", path = "dist/pjsua2-2.17-cp314-cp314-macosx_11_0_arm64.whl" },
+    { name = "pjsua2", marker = "(python_full_version == '3.14.*' and platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'pjsua2') or (python_full_version == '3.14.*' and platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'pjsua2')" },
     { name = "pyqt6" },
 ]
+provides-extras = ["pjsua2"]
 
 [package.metadata.requires-dev]
 dev = [
