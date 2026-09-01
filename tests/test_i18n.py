@@ -22,6 +22,10 @@ def fresh_i18n(monkeypatch):
     # regardless of the host OS UI language (env unset + Windows/macOS UI lang
     # forced to non-Chinese so the POSIX fallback resolves to English).
     monkeypatch.setattr(locale, "getdefaultlocale", lambda: ("en_US", "UTF-8"))
+    # _detect_posix_locale() consults locale.getlocale() *before* getdefaultlocale,
+    # and on a Chinese-region host getlocale() reflects that region (zh_CN). Pin it
+    # too so "auto" resolves to English regardless of the host's actual locale.
+    monkeypatch.setattr(locale, "getlocale", lambda: ("en_US", "UTF-8"))
     monkeypatch.setattr(i18n, "_detect_windows_ui_language", lambda: "en")
     monkeypatch.setattr(i18n, "_detect_darwin_language", lambda: "")
     for var in ("LANGUAGE", "LC_ALL", "LANG"):
