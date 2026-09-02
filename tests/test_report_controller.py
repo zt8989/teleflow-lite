@@ -83,6 +83,67 @@ def test_report_connected_then_eof_hangs_up(tmp_path: Path) -> None:
     assert svc.report_in_progress is False
 
 
+def test_start_report_picks_up_ffmpeg_path_change_without_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Settings-dialog edit must take effect on the next report.
+
+    The service lazily builds its TTS backend once and used to cache it
+    forever — so fixing ffmpeg_path in Settings still left new-text reports
+    failing with FfmpegNotFound until an app restart. The backend must be
+    rebuilt when TTS-relevant settings change.
+    """
+    built: list[str] = []
+
+    class _StubEdgeTts:
+        def __init__(self, ffmpeg_path: str = "", retry_attempts: int = 3, logger=None):
+            built.append(ffmpeg_path)
+
+        def synthesize(self, text: str, voice: str) -> Path:
+            return Path("/tmp/stub.mp3")
+
+        def transcode(self, mp3_path: Path, wav_path: Path) -> Path:
+            wav_path.write_bytes(b"RIFF")
+            return wav_path
+
+    monkeypatch.setattr("teleflow.tts.EdgeTtsBackend", _StubEdgeTts)
+    svc, backend, store = _service(tmp_path)  # no tts injected: service builds its own
+    settings = store.load()
+    settings.ffmpeg_path = str(tmp_path / "ffmpeg-a")
+    store.save(settings)
+    svc.start()
+
+    svc.start_report("第一条")
+    assert built == [str(tmp_path / "ffmpeg-a")]
+
+    # Unchanged settings: the same backend is reused (no rebuild churn).
+    svc.reset_report()
+    svc.start_report("第二条")
+    assert built == [str(tmp_path / "ffmpeg-a")]
+
+    # ffmpeg_path fixed in Settings: next report uses a backend built from it.
+    svc.reset_report()
+    settings = store.load()
+    settings.ffmpeg_path = str(tmp_path / "ffmpeg-b")
+    store.save(settings)
+    svc.start_report("第三条")
+    assert built == [str(tmp_path / "ffmpeg-a"), str(tmp_path / "ffmpeg-b")]
+
+
+def test_injected_tts_backend_survives_settings_change(tmp_path: Path) -> None:
+    """Test-injected backends are never replaced by the rebuild logic."""
+    tts = FakeTtsBackend()
+    svc, backend, store = _service(tmp_path, tts=tts)
+    svc.start()
+    svc.start_report("第一条")
+    settings = store.load()
+    settings.ffmpeg_path = str(tmp_path / "ffmpeg-b")
+    store.save(settings)
+    svc.reset_report()
+    svc.start_report("第二条")
+    assert tts.synthesized == [("第一条", "zh-CN-XiaoxiaoNeural"), ("第二条", "zh-CN-XiaoxiaoNeural")]
+
+
 def test_start_report_with_audio_path_skips_tts(tmp_path: Path) -> None:
     tts = FakeTtsBackend()
     svc, backend, _ = _service(tmp_path, tts=tts)

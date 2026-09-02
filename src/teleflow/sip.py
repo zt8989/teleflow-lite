@@ -228,6 +228,20 @@ def resolve_report_target(settings: Settings) -> str | None:
     return f"sip:{extension}@{gateway_host}:{port}"
 
 
+def _tts_settings_key(settings: Settings) -> tuple[str, int, int]:
+    """The TTS-relevant settings a built backend bakes in.
+
+    ``SipCoreService._tts_backend`` compares this fingerprint to decide whether
+    the cached backend can be reused or must be rebuilt, so Settings edits
+    (e.g. a fixed ffmpeg_path) apply without an app restart.
+    """
+    return (
+        settings.ffmpeg_path.strip(),
+        settings.tts_retry_attempts,
+        settings.tts_cache_ttl_seconds,
+    )
+
+
 class FakeSipBackend:
     """Scripted SIP transport for tests/headless runs.
 
@@ -385,6 +399,10 @@ class SipCoreService:
         self._backend = backend
         self._store = store
         self._tts = tts
+        # Injected backends (tests) are never replaced by the rebuild logic in
+        # ``_tts_backend``; only self-built ones track their settings fingerprint.
+        self._tts_injected = tts is not None
+        self._tts_key: tuple[str, int, int] | None = None
         self._conversion_queue: ConversionQueue | SyncConversionQueue | None = conversion_queue
         self._state = CallState.IDLE
         self._contact: str | None = None
@@ -455,7 +473,7 @@ class SipCoreService:
         :class:`SyncConversionQueue` is used instead to stay deterministic.
         """
         if self._conversion_queue is None:
-            backend = self._tts or self._default_tts(self._store.load())
+            backend = self._tts_backend(self._store.load())
             if isinstance(backend, CachingTtsBackend):
                 self._conversion_queue = ConversionQueue(
                     backend, marshal=self._tts_marshal, logger=self._log_line
@@ -615,7 +633,7 @@ class SipCoreService:
         if audio_path:
             self._log_line(f"[REPORT] 使用外部音频: {audio_path}")
             return Path(audio_path)
-        tts = self._tts or self._default_tts(settings)
+        tts = self._tts_backend(settings)
         voice_name = voice or settings.tts_voice
         cleaned = clean_markdown(text)
         # Unified conversion path: every TtsBackend implements synthesize_to_wav
@@ -624,12 +642,28 @@ class SipCoreService:
         # ad-hoc playback, so caching/TTL is applied consistently.
         return tts.synthesize_to_wav(cleaned, voice_name, prefix=prefix)
 
-    def _default_tts(self, settings) -> TtsBackend:
-        # Imported lazily so the real backend (edge-tts) is only constructed when
-        # actually needed; tests inject a FakeTtsBackend instead. Wrapped in a
-        # cache so IVR replays of the same welcome/menu text reuse the wav.
+    def _tts_backend(self, settings: Settings) -> TtsBackend:
+        """The service's TTS backend, rebuilt when TTS-relevant settings change.
+
+        Keeps the lazy build-and-reuse behaviour (CachingTtsBackend spares
+        edge-tts/ffmpeg cycles on identical text), but drops the cached backend
+        — and the conversion queue built around it — when ffmpeg_path / retry /
+        TTL settings change, so a Settings-dialog edit takes effect on the next
+        report or IVR prompt without an app restart. Externally injected test
+        backends are returned as-is, never replaced.
+        """
+        key = _tts_settings_key(settings)
+        if self._tts is not None and (self._tts_injected or self._tts_key == key):
+            return self._tts
         from teleflow.tts import EdgeTtsBackend
 
+        old_queue = self._conversion_queue
+        self._conversion_queue = None
+        if old_queue is not None:
+            # SyncConversionQueue (tests) has no executor to stop.
+            shutdown = getattr(old_queue, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
         self._tts = CachingTtsBackend(
             EdgeTtsBackend(
                 ffmpeg_path=settings.ffmpeg_path,
@@ -639,6 +673,7 @@ class SipCoreService:
             logger=self._log_line,
             cache_ttl_seconds=settings.tts_cache_ttl_seconds,
         )
+        self._tts_key = key
         return self._tts
 
     def _on_report_connected(self, call_id: str) -> None:
