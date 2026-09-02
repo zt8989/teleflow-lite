@@ -52,6 +52,33 @@ def test_place_call_and_place_report_call_do_not_raise(tmp_path) -> None:
         backend.stop()
 
 
+def test_stop_from_foreign_thread_does_not_abort(tmp_path) -> None:
+    """Regression: the UI stops the SIP service on a worker thread so
+    libDestroy's ~0.5s teardown doesn't freeze the GUI. An unregistered
+    foreign thread used to abort inside pj_thread_this ("Calling pjlib from
+    unknown/external thread") on the first pj_log of pjsua_destroy2 — before
+    this fix the whole process died with SIGABRT, taking pytest with it."""
+    import threading
+
+    store = ConfigStore(tmp_path / "c.json")
+    backend = Pjsua2Backend(store)
+    backend.start(5092, lambda name, data: None)
+    result: dict[str, BaseException | None] = {"exc": None}
+
+    def worker() -> None:
+        try:
+            backend.stop()
+        except BaseException as exc:  # noqa: BLE001 - capture, never propagate
+            result["exc"] = exc
+
+    t = threading.Thread(target=worker, name="sip-stop")
+    t.start()
+    t.join(timeout=10)
+    assert not t.is_alive()
+    assert result["exc"] is None
+    assert backend.running is False
+
+
 def test_new_call_op_requests_audio_only(tmp_path) -> None:
     """Regression: pjsua2's default call setting adds a T.140 ``m=text`` SDP
     line, which the NewRockTech ATA rejects with 415 (phone never rings).

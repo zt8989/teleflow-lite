@@ -295,10 +295,19 @@ def test_toggle_sip_persists_auto_connect_flag(tmp_path) -> None:
     assert service.running
     assert store.load().sip_auto_connect is True
 
-    window._toggle_sip()  # stop
+    window._toggle_sip()  # stop (async: libDestroy runs off the GUI thread)
+    _drain_async_stop(window)
     assert not service.running
     assert store.load().sip_auto_connect is False
     window.close()
+
+
+def _drain_async_stop(window) -> None:
+    """Wait out the async SIP-stop worker and its queued GUI follow-up."""
+    stop_thread = window._stop_thread
+    if stop_thread is not None:
+        stop_thread.join(timeout=5.0)
+    QApplication.processEvents()
 
 
 # --- launch-time auto-connect (maybe_auto_start_sip) ---

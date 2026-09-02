@@ -607,6 +607,16 @@ class Pjsua2Backend:
 
     def stop(self) -> None:  # pragma: no cover
         if self._lib_created:
+            # stop() can be called from a non-main thread (async stop from
+            # the UI, so libDestroy's ~0.5s doesn't freeze the GUI). pjlib
+            # requires every calling thread to be registered, otherwise the
+            # first pj_log inside pjsua_destroy2 hits "Calling pjlib from
+            # unknown/external thread" and aborts (SIGABRT in pj_thread_this).
+            # Registering an already-registered thread is a harmless no-op.
+            try:
+                self._ep.libRegisterThread("sip-stop")
+            except Exception:  # noqa: BLE001 - libCreate'd thread set may vary
+                pass
             try:
                 self._ep.libDestroy()
             except Exception:

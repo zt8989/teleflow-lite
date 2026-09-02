@@ -981,6 +981,8 @@ class MainWindow(QMainWindow):
         self._force_quit = False
         self._tray: QSystemTrayIcon | None = None
         self._tray_sip: QAction | None = None
+        # In-flight async SIP stop (see _stop_sip_async); None when idle.
+        self._stop_thread: threading.Thread | None = None
         self._settings_dialog: SettingsDialog | None = None
         self._logger: EventLogger | None = None
         # Worker->GUI handoff for the async test-report path (_test_report).
@@ -1324,17 +1326,54 @@ class MainWindow(QMainWindow):
 
     def _toggle_sip(self) -> None:
         if self._service.running:
-            self._service.stop()
-        else:
-            try:
-                self._service.start()
-            except Exception as exc:  # noqa: BLE001 - surface startup failures
-                self.append_log_line(f"[SIP] start failed: {exc}")
-                self._sync_sip_button()
-                return
+            self._stop_sip_async()
+            return
+        try:
+            self._service.start()
+        except Exception as exc:  # noqa: BLE001 - surface startup failures
+            self.append_log_line(f"[SIP] start failed: {exc}")
+            self._sync_sip_button()
+            return
         # Remember the service state so the next launch restores it: started =>
         # auto-connect on launch, stopped => stay stopped ("记录上次状态").
         self._save_auto_connect()
+        self._sync_sip_button()
+
+    def _stop_sip_async(self) -> None:
+        """Stop the SIP stack on a worker thread instead of the GUI thread.
+
+        ``Pjsua2Backend.stop()`` -> ``libDestroy()`` tears down transports,
+        joins the pjsua2 worker threads and closes the sound device — several
+        hundred ms during which the Qt event loop must not block (the whole UI
+        used to freeze for a beat on every stop). The UI refreshes itself via
+        the ``EVENT_SIP_STOPPED`` handler once teardown finishes.
+        """
+        if self._stop_thread is not None and self._stop_thread.is_alive():
+            return  # a stop is already in flight; ignore re-clicks
+        self._act_toggle_sip.setEnabled(False)
+
+        def worker() -> None:
+            try:
+                self._service.stop()
+            except Exception as exc:  # noqa: BLE001 - log, never kill the thread
+                msg = f"[SIP] stop failed: {exc}"
+                self.gui(lambda: self.append_log_line(msg))
+            finally:
+                self.gui(self._stop_sip_done)
+
+        self._stop_thread = threading.Thread(
+            target=worker, name="sip-stop", daemon=True
+        )
+        self._stop_thread.start()
+
+    def _stop_sip_done(self) -> None:
+        self._stop_thread = None
+        # Persist the now-stopped state even during app teardown (no widgets
+        # touched below the closingDown guard).
+        self._save_auto_connect()
+        if QApplication.closingDown():
+            return
+        self._act_toggle_sip.setEnabled(True)
         self._sync_sip_button()
 
     def _save_auto_connect(self) -> None:
@@ -1360,6 +1399,11 @@ class MainWindow(QMainWindow):
         segfaulted PyQt's default error printer while it cleared the exception.
         """
         try:
+            # An async stop may still be tearing the stack down; wait for it
+            # rather than racing a second libDestroy() on the same endpoint.
+            stop_thread = self._stop_thread
+            if stop_thread is not None and stop_thread.is_alive():
+                stop_thread.join(timeout=5.0)
             if self._service.running:
                 self._service.stop()
         except Exception as exc:  # noqa: BLE001 - teardown must not raise into Qt/sip
