@@ -84,7 +84,6 @@ from teleflow.sip import (
 )
 from teleflow.i18n import register_on_change, set_language, tr
 from teleflow.rpc import RpcServer
-from teleflow.tts import CachingTtsBackend, EdgeTtsBackend
 
 # Maps the built-in TTS voice display names (config.BUILTIN_TTS_VOICES) to i18n
 # keys so the voice dropdown labels follow the UI language.
@@ -1552,15 +1551,11 @@ def build_app(
     audio_backend = audio_backend or _default_audio_backend()
     sip_backend = sip_backend or _default_sip_backend()
     manager = AudioDeviceManager(audio_backend, store)
-    tts = CachingTtsBackend(
-        EdgeTtsBackend(
-            ffmpeg_path=settings.ffmpeg_path,
-            retry_attempts=settings.tts_retry_attempts,
-        ),
-        cache_ttl_seconds=settings.tts_cache_ttl_seconds,
-    )
-    service = SipCoreService(sip_backend, store, tts=tts)
-    # tts.logger is wired to the unified logger below, after it exists.
+    # TTS backend is built lazily by SipCoreService._tts_backend on first use,
+    # with a settings fingerprint so Settings-dialog edits (e.g. ffmpeg_path)
+    # rebuild it automatically — no pre-build injection here.
+    service = SipCoreService(sip_backend, store)
+    # tts.logger is wired automatically via _tts_backend's logger=self._log_line.
     window = MainWindow(manager, service, store)
 
     # Route the macOS Apple "Quit" (Cmd+Q) into the same teardown as the tray
@@ -1609,7 +1604,6 @@ def build_app(
     # after every report). gui() schedules it on the Qt main thread,
     # non-blocking for the callback thread.
     service._defer = window.gui
-    tts.logger = logger.log_line
 
     # Re-route a live call when the user switches the playback/capture device.
     def _on_device_selected(_playback: str, _capture: str) -> None:

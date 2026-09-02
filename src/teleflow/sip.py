@@ -777,7 +777,7 @@ class SipCoreService:
 
     def _maybe_start_ivr(self, call_id: str) -> None:
         settings = self._store.load()
-        if not settings.ivr_enabled or self._tts is None:
+        if not settings.ivr_enabled:
             return
         # Mark the call one-way for the announcement: the backend suppresses the
         # mic bridge (like a report call) so the menu can't echo. The bridge is
@@ -935,8 +935,6 @@ class SipCoreService:
         """
         if not (self._ivr_active and call_id == self._ivr_call_id):
             raise NoActiveCallError(f"no active IVR call for call_id={call_id!r}")
-        if self._tts is None:
-            raise NoActiveCallError("ivr tts not initialized")
         settings = self._store.load()
         prompts = self._ivr_digit_prompts(settings)
         self._ivr_digit_fired = False
