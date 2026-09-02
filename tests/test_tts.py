@@ -102,6 +102,16 @@ def test_locate_ffmpeg_falls_back_to_path(monkeypatch: pytest.MonkeyPatch) -> No
     assert locate_ffmpeg("") == sys.executable
 
 
+def test_locate_ffmpeg_treats_whitespace_path_as_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A whitespace-only ffmpeg_path means "not configured": fall back to PATH
+    # instead of silently skipping the lookup (matches _log_ffmpeg_readiness's
+    # reason message, which claims PATH was searched).
+    monkeypatch.setattr(shutil, "which", lambda _name: sys.executable)
+    assert locate_ffmpeg("   ") == sys.executable
+
+
 def test_locate_ffmpeg_returns_none_when_nothing_found(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

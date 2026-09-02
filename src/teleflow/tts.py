@@ -104,7 +104,7 @@ def locate_ffmpeg(ffmpeg_path: str = "") -> str | None:
     decide whether that is fatal (``EdgeTtsBackend``) or just log-worthy
     (the SIP service's startup readiness check).
     """
-    candidate = ffmpeg_path or (shutil.which("ffmpeg") or "")
+    candidate = ffmpeg_path.strip() or (shutil.which("ffmpeg") or "")
     if candidate and os.path.isfile(candidate):
         return candidate
     return None
