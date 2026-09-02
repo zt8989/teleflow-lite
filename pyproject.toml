@@ -35,7 +35,7 @@ pjsua2 = ["pjsua2 ; (sys_platform == 'darwin' and platform_machine == 'arm64' an
 # `setuptools` are included because scripts/build_pjsua2_wheel.py (and the pjsua2 source
 # build in docs/build-pjsua2.md) need them at build time.
 [dependency-groups]
-dev = ["pytest", "mypy", "wheel", "setuptools"]
+dev = ["pytest", "mypy", "wheel", "setuptools", "pyinstaller"]
 
 # Dependency management is done with uv (`uv sync` / `uv run` / `uv lock`); `uv.lock` is
 # committed for reproducible installs. `pjsua2` is vendored as a local wheel in `dist/` (see
