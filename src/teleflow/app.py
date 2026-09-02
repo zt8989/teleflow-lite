@@ -57,7 +57,7 @@ from teleflow.audio import (
     PortAudioBackend,
 )
 from teleflow.autostart import set_autostart
-from teleflow.config import BUILTIN_TTS_VOICES, ConfigStore, Settings
+from teleflow.config import BUILTIN_TTS_VOICES, ConfigStore, ResolvedConfig, Settings
 from teleflow.logging import EventLogger, LogLevel, attach
 from teleflow.hooks import SubprocessHookRunner, attach_hooks
 from teleflow.pjsua2_backend import Pjsua2Backend
@@ -976,7 +976,7 @@ class MainWindow(QMainWindow):
         self._store = store
         # Apply the persisted (or auto) language before building any widget so
         # every tr() during construction resolves against the right locale.
-        set_language(store.load().language)
+        set_language(ResolvedConfig(store.load()).language_resolved)
         self._force_quit = False
         self._tray: QSystemTrayIcon | None = None
         self._tray_sip: QAction | None = None

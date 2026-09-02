@@ -159,6 +159,82 @@ BUILTIN_TTS_VOICES: list[tuple[str, str]] = [
 ]
 
 
+class ResolvedConfig:
+    """Wraps a ``Settings`` snapshot with computed / derived properties.
+
+    Raw field access delegates to the underlying ``Settings`` via
+    ``__getattr__``, so ``config.sip_host`` is the same as
+    ``config._settings.sip_host``.  Computed properties (``ffmpeg_bin``,
+    ``language_resolved``, ``report_target``) resolve empty / magic values
+    to their runtime form so consumers never need to call standalone
+    helper functions themselves.
+    """
+
+    _settings: Settings
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    # -- raw field delegation ------------------------------------------------
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._settings, name)
+
+    # Typed delegates for fields accessed by mypy-sensitive callers.
+    @property
+    def ffmpeg_path(self) -> str:
+        return self._settings.ffmpeg_path
+
+    @property
+    def tts_retry_attempts(self) -> int:
+        return self._settings.tts_retry_attempts
+
+    @property
+    def tts_cache_ttl_seconds(self) -> int:
+        return self._settings.tts_cache_ttl_seconds
+
+    # -- computed properties -------------------------------------------------
+
+    @property
+    def ffmpeg_bin(self) -> str | None:
+        """Resolved ffmpeg binary path, or ``None`` when unavailable.
+
+        Empty ``ffmpeg_path`` falls back to a PATH lookup; a configured
+        but missing path returns ``None``.
+        """
+        from teleflow.tts import locate_ffmpeg
+
+        return locate_ffmpeg(self._settings.ffmpeg_path)
+
+    @property
+    def language_resolved(self) -> str:
+        """``"auto"`` → system language; anything else returned as-is."""
+        from teleflow.i18n import _resolve
+
+        return _resolve(self._settings.language)
+
+    @property
+    def report_target(self) -> str | None:
+        """SIP URI to dial for a phone report, or ``None`` when undialable.
+
+        Only ``report_extension`` is required. When ``report_host`` is set
+        the call goes to that desk phone directly; otherwise it routes
+        through the configured gateway.
+        """
+        ext = self._settings.report_extension.strip()
+        if not ext:
+            return None
+        if self._settings.report_host.strip():
+            host = self._settings.report_host.strip()
+            port = self._settings.report_port or 5060
+            return f"sip:{ext}@{host}:{port}"
+        gw = self._settings.sip_host.strip()
+        if not gw:
+            return None
+        port = self._settings.sip_server_port or 5060
+        return f"sip:{ext}@{gw}:{port}"
+
+
 class ConfigStore:
     """Loads and saves a ``Settings`` record as JSON.
 

@@ -7,9 +7,13 @@ partial or unknown keys merge cleanly against the defaults.
 """
 
 import json
+import shutil
+import sys
 from pathlib import Path
 
-from teleflow.config import ConfigStore, Settings
+import pytest
+
+from teleflow.config import ConfigStore, ResolvedConfig, Settings
 
 
 def test_load_returns_defaults_when_file_missing(tmp_path: Path) -> None:
@@ -80,6 +84,81 @@ def test_old_file_without_new_fields_uses_defaults(tmp_path: Path) -> None:
     assert loaded.sip_port == "5090"  # explicit old port carries over (str)
     assert loaded.playback_device_id == "x"
     assert loaded.sip_user == ""  # sip_number no longer auto-defaults
+
+
+# ---- ResolvedConfig tests ----
+
+
+def test_resolved_config_ffmpeg_bin_returns_none_when_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda _name: "")
+    cfg = ResolvedConfig(Settings(ffmpeg_path=""))
+    assert cfg.ffmpeg_bin is None
+
+
+def test_resolved_config_ffmpeg_bin_returns_configured_existing_path(
+    tmp_path: Path,
+) -> None:
+    ffmpeg = tmp_path / "ffmpeg"
+    ffmpeg.write_text("")
+    cfg = ResolvedConfig(Settings(ffmpeg_path=str(ffmpeg)))
+    assert cfg.ffmpeg_bin == str(ffmpeg)
+
+
+def test_resolved_config_ffmpeg_bin_returns_none_for_missing_configured_path(
+    tmp_path: Path,
+) -> None:
+    cfg = ResolvedConfig(Settings(ffmpeg_path=str(tmp_path / "nope")))
+    assert cfg.ffmpeg_bin is None
+
+
+def test_resolved_config_ffmpeg_bin_falls_back_to_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda _name: sys.executable)
+    cfg = ResolvedConfig(Settings(ffmpeg_path=""))
+    assert cfg.ffmpeg_bin == sys.executable
+
+
+def test_resolved_config_ffmpeg_bin_whitespace_treated_as_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda _name: sys.executable)
+    cfg = ResolvedConfig(Settings(ffmpeg_path="   "))
+    assert cfg.ffmpeg_bin == sys.executable
+
+
+def test_resolved_config_language_auto_resolves() -> None:
+    cfg = ResolvedConfig(Settings(language="auto"))
+    assert cfg.language_resolved != "auto"
+
+
+def test_resolved_config_language_pinned() -> None:
+    cfg = ResolvedConfig(Settings(language="zh_CN"))
+    assert cfg.language_resolved == "zh_CN"
+
+
+def test_resolved_config_report_target_with_extension(tmp_path: Path) -> None:
+    store = ConfigStore(tmp_path / "config.json")
+    settings = store.load()
+    settings.report_host = "192.168.1.116"
+    settings.report_extension = "8000"
+    store.save(settings)
+    cfg = ResolvedConfig(store.load())
+    assert cfg.report_target == "sip:8000@192.168.1.116:5060"
+
+
+def test_resolved_config_report_target_none_when_no_extension(tmp_path: Path) -> None:
+    cfg = ResolvedConfig(Settings(report_extension=""))
+    assert cfg.report_target is None
+
+
+def test_resolved_config_delegates_raw_fields() -> None:
+    cfg = ResolvedConfig(Settings(sip_host="10.0.0.1", rpc_port=9999))
+    assert cfg.sip_host == "10.0.0.1"
+    assert cfg.rpc_port == 9999
+    assert cfg.ffmpeg_path == ""
 
 
 def test_migration_maps_gateway_fields_to_client_credentials(tmp_path: Path) -> None:

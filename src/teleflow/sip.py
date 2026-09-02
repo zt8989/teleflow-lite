@@ -16,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
-from teleflow.config import ConfigStore, Settings
+from teleflow.config import ConfigStore, ResolvedConfig, Settings
 from teleflow.tts import (
     CachingTtsBackend,
     ConversionQueue,
@@ -24,7 +24,6 @@ from teleflow.tts import (
     TtsBackend,
     TtsError,
     clean_markdown,
-    locate_ffmpeg,
 )
 
 # Domain events emitted to subscribers.
@@ -228,7 +227,7 @@ def resolve_report_target(settings: Settings) -> str | None:
     return f"sip:{extension}@{gateway_host}:{port}"
 
 
-def _tts_settings_key(settings: Settings) -> tuple[str, int, int]:
+def _tts_settings_key(config: ResolvedConfig) -> tuple[str, int, int]:
     """The TTS-relevant settings a built backend bakes in.
 
     ``SipCoreService._tts_backend`` compares this fingerprint to decide whether
@@ -236,9 +235,9 @@ def _tts_settings_key(settings: Settings) -> tuple[str, int, int]:
     (e.g. a fixed ffmpeg_path) apply without an app restart.
     """
     return (
-        settings.ffmpeg_path.strip(),
-        settings.tts_retry_attempts,
-        settings.tts_cache_ttl_seconds,
+        config.ffmpeg_path.strip(),
+        config.tts_retry_attempts,
+        config.tts_cache_ttl_seconds,
     )
 
 
@@ -473,7 +472,7 @@ class SipCoreService:
         :class:`SyncConversionQueue` is used instead to stay deterministic.
         """
         if self._conversion_queue is None:
-            backend = self._tts_backend(self._store.load())
+            backend = self._tts_backend(ResolvedConfig(self._store.load()))
             if isinstance(backend, CachingTtsBackend):
                 self._conversion_queue = ConversionQueue(
                     backend, marshal=self._tts_marshal, logger=self._log_line
@@ -515,7 +514,7 @@ class SipCoreService:
 
     def start(self) -> None:
         settings = self._store.load()
-        self._log_ffmpeg_readiness(settings)
+        self._log_ffmpeg_readiness(ResolvedConfig(settings))
         # Auto-detect a free UDP transport port unless the user configured a
         # specific one; a configured-but-occupied port falls back to the next
         # free port, announcing the conflict so the UI can warn the user.
@@ -529,7 +528,7 @@ class SipCoreService:
         self._running = True
         self._emit(EVENT_SIP_STARTED)
 
-    def _log_ffmpeg_readiness(self, settings: Settings) -> None:
+    def _log_ffmpeg_readiness(self, config: ResolvedConfig) -> None:
         """Announce at startup whether TTS transcoding can work at all.
 
         A GUI-launched .app only gets the system's minimal PATH, so an ffmpeg
@@ -538,12 +537,12 @@ class SipCoreService:
         that environment problem in the log immediately, including the process
         PATH (the key diagnostic for that root cause).
         """
-        ffmpeg = locate_ffmpeg(settings.ffmpeg_path)
+        ffmpeg = config.ffmpeg_bin
         if ffmpeg is not None:
             self._log_line(f"[TTS] ffmpeg 就绪: {ffmpeg}")
             return
-        if settings.ffmpeg_path.strip():
-            reason = f"ffmpeg_path 已配置为 {settings.ffmpeg_path} 但文件不存在"
+        if config.ffmpeg_path.strip():
+            reason = f"ffmpeg_path 已配置为 {config.ffmpeg_path} 但文件不存在"
         else:
             reason = "未配置 ffmpeg_path, 且 PATH 中没有 ffmpeg"
         self._log_line(
@@ -588,7 +587,7 @@ class SipCoreService:
         if not self._running:
             self._fail_report("sip_not_running")
             raise RuntimeError("SIP service is not running")
-        default_target = resolve_report_target(settings)
+        default_target = ResolvedConfig(settings).report_target
         resolved_target = target or default_target
         if not resolved_target:
             self._fail_report("no_target")
@@ -633,7 +632,7 @@ class SipCoreService:
         if audio_path:
             self._log_line(f"[REPORT] 使用外部音频: {audio_path}")
             return Path(audio_path)
-        tts = self._tts_backend(settings)
+        tts = self._tts_backend(ResolvedConfig(settings))
         voice_name = voice or settings.tts_voice
         cleaned = clean_markdown(text)
         # Unified conversion path: every TtsBackend implements synthesize_to_wav
@@ -642,7 +641,7 @@ class SipCoreService:
         # ad-hoc playback, so caching/TTL is applied consistently.
         return tts.synthesize_to_wav(cleaned, voice_name, prefix=prefix)
 
-    def _tts_backend(self, settings: Settings) -> TtsBackend:
+    def _tts_backend(self, config: ResolvedConfig) -> TtsBackend:
         """The service's TTS backend, rebuilt when TTS-relevant settings change.
 
         Keeps the lazy build-and-reuse behaviour (CachingTtsBackend spares
@@ -652,7 +651,7 @@ class SipCoreService:
         report or IVR prompt without an app restart. Externally injected test
         backends are returned as-is, never replaced.
         """
-        key = _tts_settings_key(settings)
+        key = _tts_settings_key(config)
         if self._tts is not None and (self._tts_injected or self._tts_key == key):
             return self._tts
         from teleflow.tts import EdgeTtsBackend
@@ -666,12 +665,12 @@ class SipCoreService:
                 shutdown()
         self._tts = CachingTtsBackend(
             EdgeTtsBackend(
-                ffmpeg_path=settings.ffmpeg_path,
-                retry_attempts=settings.tts_retry_attempts,
+                ffmpeg_path=config.ffmpeg_path,
+                retry_attempts=config.tts_retry_attempts,
                 logger=self._log_line,
             ),
             logger=self._log_line,
-            cache_ttl_seconds=settings.tts_cache_ttl_seconds,
+            cache_ttl_seconds=config.tts_cache_ttl_seconds,
         )
         self._tts_key = key
         return self._tts
