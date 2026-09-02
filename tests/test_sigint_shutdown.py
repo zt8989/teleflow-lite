@@ -43,9 +43,20 @@ try:
 except (ImportError, OSError):  # pragma: no cover - environment dependent
     _HAVE_PTY = False
 
+# This test drives the real app (build_app().exec()), which constructs the
+# AudioDeviceManager and enumerates real audio devices via pjsua2 / PortAudio at
+# startup. pjsua2 is an OPTIONAL extra (see pyproject.toml), so the test can only
+# run where the native lib is installed; otherwise the app would crash on startup.
+try:
+    import pjsua2  # noqa: F401
+
+    _HAVE_PJSUA2 = True
+except ImportError:  # pragma: no cover - environment dependent
+    _HAVE_PJSUA2 = False
+
 pytestmark = pytest.mark.skipif(
-    not (_HAVE_GUI and _HAVE_PTY),
-    reason="PyQt6 or pty not available",
+    not (_HAVE_GUI and _HAVE_PTY and _HAVE_PJSUA2),
+    reason="PyQt6, pty, or pjsua2 (optional extra) not available",
 )
 
 
