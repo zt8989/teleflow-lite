@@ -9,6 +9,7 @@ into domain events the UI subscribes to; it performs no socket I/O itself.
 
 from __future__ import annotations
 
+import os
 import socket
 import uuid
 from enum import Enum
@@ -23,6 +24,7 @@ from teleflow.tts import (
     TtsBackend,
     TtsError,
     clean_markdown,
+    locate_ffmpeg,
 )
 
 # Domain events emitted to subscribers.
@@ -495,6 +497,7 @@ class SipCoreService:
 
     def start(self) -> None:
         settings = self._store.load()
+        self._log_ffmpeg_readiness(settings)
         # Auto-detect a free UDP transport port unless the user configured a
         # specific one; a configured-but-occupied port falls back to the next
         # free port, announcing the conflict so the UI can warn the user.
@@ -507,6 +510,28 @@ class SipCoreService:
         self._backend.start(port, self._dispatch)
         self._running = True
         self._emit(EVENT_SIP_STARTED)
+
+    def _log_ffmpeg_readiness(self, settings: Settings) -> None:
+        """Announce at startup whether TTS transcoding can work at all.
+
+        A GUI-launched .app only gets the system's minimal PATH, so an ffmpeg
+        installed under e.g. /opt/homebrew/bin is invisible until the first
+        *new* text synthesis fails with FfmpegNotFound. Probing here surfaces
+        that environment problem in the log immediately, including the process
+        PATH (the key diagnostic for that root cause).
+        """
+        ffmpeg = locate_ffmpeg(settings.ffmpeg_path)
+        if ffmpeg is not None:
+            self._log_line(f"[TTS] ffmpeg 就绪: {ffmpeg}")
+            return
+        if settings.ffmpeg_path.strip():
+            reason = f"ffmpeg_path 已配置为 {settings.ffmpeg_path} 但文件不存在"
+        else:
+            reason = "未配置 ffmpeg_path, 且 PATH 中没有 ffmpeg"
+        self._log_line(
+            f"[TTS] 找不到 ffmpeg: {reason}; 新文本合成会失败(缓存音频不受影响); "
+            f"当前进程 PATH={os.environ.get('PATH', '')}"
+        )
 
     def stop(self) -> None:
         self._backend.stop()

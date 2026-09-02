@@ -22,6 +22,7 @@ from teleflow.tts import (
     SyncConversionQueue,
     TtsError,
     clean_markdown,
+    locate_ffmpeg,
 )
 
 
@@ -79,6 +80,33 @@ def test_edge_tts_backend_raises_when_ffmpeg_missing(monkeypatch) -> None:
     backend = EdgeTtsBackend(ffmpeg_path="", cache_dir=Path("/tmp/teleflow-tts-test"))
     with pytest.raises(FfmpegNotFound):
         backend._ffmpeg_bin()
+
+
+def test_locate_ffmpeg_returns_configured_existing_path(tmp_path: Path) -> None:
+    ffmpeg = tmp_path / "ffmpeg"
+    ffmpeg.write_text("")
+    assert locate_ffmpeg(str(ffmpeg)) == str(ffmpeg)
+
+
+def test_locate_ffmpeg_configured_missing_path_wins_over_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A configured-but-missing path is reported as not found even when a
+    # ffmpeg exists on PATH: the user asked for that specific binary.
+    monkeypatch.setattr(shutil, "which", lambda _name: sys.executable)
+    assert locate_ffmpeg(str(tmp_path / "nope")) is None
+
+
+def test_locate_ffmpeg_falls_back_to_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(shutil, "which", lambda _name: sys.executable)
+    assert locate_ffmpeg("") == sys.executable
+
+
+def test_locate_ffmpeg_returns_none_when_nothing_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda _name: "")
+    assert locate_ffmpeg("") is None
 
 
 def test_edge_tts_backend_transcode_failure_raises(tmp_path: Path) -> None:

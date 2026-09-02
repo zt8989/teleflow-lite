@@ -97,6 +97,19 @@ class TtsBackend(Protocol):
         ...
 
 
+def locate_ffmpeg(ffmpeg_path: str = "") -> str | None:
+    """Resolve the ffmpeg binary: configured path first, else PATH.
+
+    Returns ``None`` when neither resolves to an existing file — callers
+    decide whether that is fatal (``EdgeTtsBackend``) or just log-worthy
+    (the SIP service's startup readiness check).
+    """
+    candidate = ffmpeg_path or (shutil.which("ffmpeg") or "")
+    if candidate and os.path.isfile(candidate):
+        return candidate
+    return None
+
+
 class EdgeTtsBackend:
     """Real backend: edge-tts for speech, external ffmpeg for transcode.
 
@@ -120,16 +133,16 @@ class EdgeTtsBackend:
         self.logger = logger
 
     def _ffmpeg_bin(self) -> str:
-        """Resolve the ffmpeg binary: configured path first, else PATH.
+        """Resolve the ffmpeg binary via :func:`locate_ffmpeg`.
 
-        Raises ``FfmpegNotFound`` when neither exists — never silently proceed.
+        Raises ``FfmpegNotFound`` when it can't be found — never silently proceed.
         """
-        candidate = self._ffmpeg_path or (shutil.which("ffmpeg") or "")
-        if not candidate or not os.path.isfile(candidate):
+        bin_ = locate_ffmpeg(self._ffmpeg_path)
+        if bin_ is None:
             raise FfmpegNotFound(
                 "ffmpeg not found (set ffmpeg_path in settings or install ffmpeg on PATH)"
             )
-        return candidate
+        return bin_
 
     def synthesize(self, text: str, voice: str) -> Path:
         """Render ``text`` with ``voice`` to an mp3, retrying transient edge-tts

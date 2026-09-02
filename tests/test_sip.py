@@ -90,6 +90,36 @@ def test_media_error_is_forwarded(tmp_path) -> None:
     assert errors == ["RTP timeout"]
 
 
+def test_start_logs_ffmpeg_missing_when_configured_path_absent(tmp_path) -> None:
+    store = ConfigStore(tmp_path / "config.json")
+    settings = store.load()
+    settings.ffmpeg_path = str(tmp_path / "missing-ffmpeg")
+    store.save(settings)
+    svc = SipCoreService(FakeSipBackend(), store)
+    lines: list[str] = []
+    svc._log = lines.append
+    svc.start()
+    joined = "\n".join(lines)
+    assert "找不到 ffmpeg" in joined
+    assert str(tmp_path / "missing-ffmpeg") in joined
+    assert "PATH" in joined
+
+
+def test_start_logs_ffmpeg_ready_when_configured_path_exists(tmp_path) -> None:
+    ffmpeg = tmp_path / "ffmpeg"
+    ffmpeg.write_text("")
+    store = ConfigStore(tmp_path / "config.json")
+    settings = store.load()
+    settings.ffmpeg_path = str(ffmpeg)
+    store.save(settings)
+    svc = SipCoreService(FakeSipBackend(), store)
+    lines: list[str] = []
+    svc._log = lines.append
+    svc.start()
+    assert any("ffmpeg 就绪" in line and str(ffmpeg) in line for line in lines)
+    assert not any("找不到 ffmpeg" in line for line in lines)
+
+
 def test_service_starts_on_configured_port(tmp_path, monkeypatch) -> None:
     store = ConfigStore(tmp_path / "config.json")
     settings = store.load()
