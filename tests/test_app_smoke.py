@@ -310,6 +310,30 @@ def _drain_async_stop(window) -> None:
     QApplication.processEvents()
 
 
+def test_toggle_sip_start_updates_registration_status(tmp_path) -> None:
+    """Starting the SIP service should immediately show 'registering' in the
+    gateway-registration dashboard card (not leave the stale 'unregistered'
+    from the previous stop)."""
+    app, window, service, _, _ = _make_window(tmp_path)
+    dash = window.dashboard
+    reg_label = dash._reg_stat.findChild(QLabel, "stat_value")
+    assert reg_label is not None
+
+    # Initial state is unregistered.
+    assert "未注册" in reg_label.text()
+
+    # Start the SIP service — registration should show as in-progress.
+    window._toggle_sip()
+    assert service.running
+    assert "注册中" in reg_label.text()
+
+    # After the (fake) backend reports registration, it should update to
+    # the fully-registered state.
+    service._backend.receive_register("sip:2001@provider.example.com")
+    assert "已注册" in reg_label.text()
+    window.close()
+
+
 # --- launch-time auto-connect (maybe_auto_start_sip) ---
 
 

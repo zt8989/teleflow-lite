@@ -110,6 +110,7 @@
   "tray.rpc_port_unavailable": "本地控制端口 {requested} 已被占用，且无可用的备用端口，本地控制接口未启动",
 
   "reg.registered": "已注册",
+  "reg.registering": "注册中",
   "reg.unregistered": "未注册",
   "reg.failed": "注册失败",
   "reg.failed_with_code": "注册失败 ({code})",

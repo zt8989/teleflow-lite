@@ -110,6 +110,7 @@
   "tray.rpc_port_unavailable": "Local control port {requested} was occupied and no fallback port is free; the local control interface did not start",
 
   "reg.registered": "Registered",
+  "reg.registering": "Registering",
   "reg.unregistered": "Unregistered",
   "reg.failed": "Registration failed",
   "reg.failed_with_code": "Registration failed ({code})",

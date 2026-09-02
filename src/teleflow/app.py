@@ -1384,7 +1384,9 @@ class MainWindow(QMainWindow):
     def _sync_sip_button(self) -> None:
         running = self._service.running
         self.dashboard.set_sip_running(running)
-        if not running:
+        if running:
+            self.dashboard.set_sip_registration("registering")
+        else:
             self.dashboard.set_sip_registration("unregistered")
         self._update_action_texts()
 
