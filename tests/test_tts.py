@@ -5,6 +5,7 @@ the transcode failure path, and the fake backend. The real edge-tts synthesis
 requires network and is intentionally not asserted in CI (native/network-only).
 """
 
+import os
 import shutil
 import sys
 import time
@@ -77,6 +78,7 @@ def test_edge_tts_backend_uses_configured_ffmpeg_path(tmp_path: Path) -> None:
 
 def test_edge_tts_backend_raises_when_ffmpeg_missing(monkeypatch) -> None:
     monkeypatch.setattr(shutil, "which", lambda _name: "")
+    monkeypatch.setattr("teleflow.tts.sys.platform", "linux")
     backend = EdgeTtsBackend(ffmpeg_path="", cache_dir=Path("/tmp/teleflow-tts-test"))
     with pytest.raises(FfmpegNotFound):
         backend._ffmpeg_bin()
@@ -116,6 +118,31 @@ def test_locate_ffmpeg_returns_none_when_nothing_found(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(shutil, "which", lambda _name: "")
+    monkeypatch.setattr("teleflow.tts.sys.platform", "linux")
+    assert locate_ffmpeg("") is None
+
+
+def test_locate_ffmpeg_probes_homebrew_on_macos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # On macOS, when PATH misses ffmpeg, Homebrew paths are probed directly
+    # so the user doesn't have to set ffmpeg_path manually.
+    monkeypatch.setattr(shutil, "which", lambda _name: "")
+    monkeypatch.setattr("teleflow.tts.sys.platform", "darwin")
+    _real_isfile = os.path.isfile
+
+    def _isfile(path: str) -> bool:
+        return path == "/opt/homebrew/bin/ffmpeg" or _real_isfile(path)
+
+    monkeypatch.setattr("teleflow.tts.os.path.isfile", _isfile)
+    assert locate_ffmpeg("") == "/opt/homebrew/bin/ffmpeg"
+
+
+def test_locate_ffmpeg_skips_homebrew_on_non_macos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda _name: "")
+    monkeypatch.setattr("teleflow.tts.sys.platform", "linux")
     assert locate_ffmpeg("") is None
 
 

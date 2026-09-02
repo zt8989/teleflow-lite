@@ -93,6 +93,7 @@ def test_resolved_config_ffmpeg_bin_returns_none_when_not_found(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(shutil, "which", lambda _name: "")
+    monkeypatch.setattr("teleflow.tts.sys.platform", "linux")
     cfg = ResolvedConfig(Settings(ffmpeg_path=""))
     assert cfg.ffmpeg_bin is None
 

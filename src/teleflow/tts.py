@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -98,15 +99,29 @@ class TtsBackend(Protocol):
 
 
 def locate_ffmpeg(ffmpeg_path: str = "") -> str | None:
-    """Resolve the ffmpeg binary: configured path first, else PATH.
+    """Resolve the ffmpeg binary: configured path first, then PATH, then
+    common Homebrew locations on macOS.
 
-    Returns ``None`` when neither resolves to an existing file — callers
-    decide whether that is fatal (``EdgeTtsBackend``) or just log-worthy
-    (the SIP service's startup readiness check).
+    Returns ``None`` when none resolve to an existing file — callers decide
+    whether that is fatal (``EdgeTtsBackend``) or just log-worthy (the SIP
+    service's startup readiness check).
     """
-    candidate = ffmpeg_path.strip() or (shutil.which("ffmpeg") or "")
+    stripped = ffmpeg_path.strip()
+    if stripped:
+        # User configured a specific path — honour it exactly; do NOT fall
+        # back to PATH or Homebrew when it's missing.
+        return stripped if os.path.isfile(stripped) else None
+    candidate = shutil.which("ffmpeg") or ""
     if candidate and os.path.isfile(candidate):
         return candidate
+    # PATH missed — on macOS the Finder/Dock-launched .app only inherits the
+    # system's minimal PATH (/usr/bin:/bin:…), so Homebrew-installed ffmpeg
+    # under /opt/homebrew/bin (Apple Silicon) or /usr/local/bin (Intel) is
+    # invisible. Probe those directly so Settings remain optional.
+    if sys.platform == "darwin":
+        for brew in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+            if os.path.isfile(brew):
+                return brew
     return None
 
 
