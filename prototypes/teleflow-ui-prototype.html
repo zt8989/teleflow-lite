@@ -160,6 +160,17 @@
   .dlgPanel.hidden{display:none}
   .dlgFoot{margin-top:14px;display:flex;justify-content:flex-end;gap:10px}
 
+  /* IVR digit grid (QGridLayout) */
+  .ivrtbl{width:100%;border-collapse:collapse;margin:6px 0 4px;font-size:12px}
+  .ivrtbl th,.ivrtbl td{padding:3px 4px;vertical-align:middle;text-align:left}
+  .ivrtbl th{color:#333;font-weight:600;border-bottom:1px solid var(--line)}
+  .ivrtbl td input[type=text]{padding:5px 8px;font-size:12px}
+  .ivrtbl td.cb,.ivrtbl th.cb{text-align:center}
+  .req{color:#b00020;font-weight:600}
+
+  /* scrollable panel (mirrors QScrollArea in the real SettingsDialog) */
+  .scrollPanel{max-height:380px;overflow-y:auto;overflow-x:hidden}
+
   .hidden{display:none !important}
   @media (max-width:720px){.statgrid{grid-template-columns:repeat(2,1fr)}}
 </style>
@@ -194,7 +205,7 @@
 <!-- settings, opened from the tray menu -->
 <div class="modal hidden" id="settingsModal">
   <div class="modalCard">
-    <div class="modalHead"><span>设置 / SIP 账号</span>
+    <div class="modalHead"><span>设置</span>
       <button class="btn" onclick="closeSettings()">关闭</button></div>
     <div id="settingsBody"></div>
   </div>
@@ -314,10 +325,15 @@ function toggleSip(){
 
 /* settings dialog: switch left-menu -> right panel */
 function showPanel(name){
-  ["sip","acct","hook","rpc","log"].forEach(n=>{
+  ["acct","hook","ivr","rpc","log"].forEach(n=>{
     const p=document.getElementById("p-"+n); if(p) p.classList.toggle("hidden", n!==name);
     const m=document.getElementById("m-"+n); if(m) m.classList.toggle("active", n===name);
   });
+}
+/* TTS voice: show the free-text voice-ID field only while '自定义…' is selected */
+function ttsVoiceChanged(sel){
+  const custom=document.getElementById("ttsVoiceCustom"); if(!custom) return;
+  custom.classList.toggle("hidden", sel.value.indexOf("custom:")!==0);
 }
 function resetToken(){
   state.rpcToken = "tok_"+Math.random().toString(36).slice(2,18);
@@ -375,53 +391,89 @@ const DEV_PANE = `<div class="card">
 const LOG_PANE = `<div class="card"><h3>实时日志（SIP / 媒体 / 设备）</h3>
   <div class="log" id="logbox">${fmtLog()}</div>${DEMO}</div>`;
 
-/* settings panel — SIP client account + phone-report RPC + hooks.
-   Multi-page (macOS System Settings style) matching the real dialog. */
+/* settings panel — mirrors the real SettingsDialog (5 pages, macOS System
+   Settings style): SIP 账号 / 钩子命令 / 呼入 IVR / 电话汇报 / 日志与启动. */
+const TTS_VOICES = [
+  ["晓晓（女）","zh-CN-XiaoxiaoNeural"], ["云希（男）","zh-CN-YunxiNeural"],
+  ["云扬（男·新闻）","zh-CN-YunyangNeural"], ["晓伊（女·川渝）","zh-CN-XiaoyiNeural"],
+  ["云健（男）","zh-CN-YunjianNeural"], ["晓辰（女）","zh-CN-XiaochenNeural"],
+  ["云霞（女）","zh-CN-YunxiaNeural"], ["云野（男）","zh-CN-YunyeNeural"],
+  ["Aria（en-US 女）","en-US-AriaNeural"], ["Guy（en-US 男）","en-US-GuyNeural"],
+];
+const IVR_ROWS = "1234567890".split("").map(d=>{
+  const sample = d==="1" ? "已收到，正在执行一号操作" : "";
+  return `<tr>
+    <td>${d}</td>
+    <td><input type="text" value="${sample}" placeholder="播报词（留空跳过）"></td>
+    <td><input type="text" placeholder="命令（留空不执行）"></td>
+    <td class="cb"><input type="checkbox" title="按下该键后退出菜单并切换为双向桥接"${d==="0"?" checked":""}></td>
+  </tr>`;}).join("");
+
 const SETTINGS_PANE = `<div class="dlgLayout">
   <div class="dlgMenu">
     <button id="m-acct" class="active" onclick="showPanel('acct')">SIP 账号</button>
     <button id="m-hook" onclick="showPanel('hook')">钩子命令</button>
+    <button id="m-ivr" onclick="showPanel('ivr')">呼入 IVR</button>
     <button id="m-rpc" onclick="showPanel('rpc')">电话汇报 (RPC)</button>
     <button id="m-log" onclick="showPanel('log')">日志与启动</button>
   </div>
   <div style="flex:1;min-width:0">
     <div class="dlgPanel" id="p-acct">
-      <label class="fld"><span>网关地址（域名或 IP，留空则不注册）</span><input type="text" id="sipHost" value="${state.gatewayHost}" placeholder="例如 192.168.1.189"></label>
-      <div class="row">
-        <label class="fld"><span>网关端口</span><input type="number" id="sipServerPort" value="${state.gatewayPort}"></label>
-        <label class="fld"><span>分机号（SIP 账号 / AOR）</span><input type="text" id="sipUser" value="${state.user}" placeholder="例如 1002"></label>
-        <label class="fld"><span>SIP 密码</span><input type="password" id="sipPassword" value="${state.password}" placeholder="认证密码"></label>
-      </div>
+      <label class="fld"><span>网关地址（域名或 IP，留空则不注册）</span><input type="text" id="sipHost" value="${state.gatewayHost}" placeholder="例如 192.168.1.189 或 sip.example.com"></label>
+      <label class="fld"><span>网关端口</span><input type="number" id="sipServerPort" value="${state.gatewayPort}"></label>
+      <label class="fld"><span>分机号（SIP 账号 / AOR，例如 1002）</span><input type="text" id="sipUser" value="${state.user}" placeholder="例如 1002"></label>
+      <label class="fld"><span>SIP 密码</span><input type="password" id="sipPassword" value="${state.password}" placeholder="认证密码"></label>
+      <p class="hint">提示：此为电话汇报的默认路由（走网关）。汇报页只填分机号即可，仅当配置了"座机地址"时才改走该地址。</p>
+      <label class="fld"><span>SIP 端口（选填，留空=自动检测）</span><input type="text" id="sipPort" placeholder="例如 5062"></label>
+      <label class="fld" style="display:flex;align-items:center;gap:8px"><input type="checkbox" checked> 启动时自动连接网关</label>
     </div>
     <div class="dlgPanel hidden" id="p-hook">
       <p class="hint" style="margin:0 0 12px">通话生命周期的本地命令，可用 <code>{call_id}</code> 表示来电 ID；留空则不执行。命令以非阻塞方式在后台线程执行，失败仅记入实时日志，不会中断通话。</p>
       <label class="fld"><span>摘机命令（自动接通时执行）</span><input type="text" id="offHookCmd" value="${state.offHookCmd}" placeholder="例如 /usr/local/bin/on-answer.sh {call_id}"></label>
-      <label class="fld"><span>挂机命令（通话结束时执行）</span><input type="text" id="onHookCmd" value="${state.onHookCmd}" placeholder="例如 /usr/local/bin/on-hangup.sh {call_id}"></label>
+      <label class="fld"><span>挂机命令（通话结束时执行；IVR 下额外可用 {last_digit} 表示首个按键）</span><input type="text" id="onHookCmd" value="${state.onHookCmd}" placeholder="例如 /usr/local/bin/on-hangup.sh {call_id} {last_digit}"></label>
     </div>
-    <div class="dlgPanel hidden" id="p-rpc">
+    <div class="dlgPanel hidden" id="p-ivr">
+      <label class="fld" style="display:flex;align-items:center;gap:8px"><input type="checkbox" checked> 启用呼入 IVR（接通后播报菜单并监听按键）</label>
+      <label class="fld"><span>欢迎语（接通后先播，留空则不播）</span><input type="text" placeholder="例如 您好，请按数字键选择"></label>
+      <p class="hint">每个数字键（1-9-0）的播报词与命令：播报词留空则该键不播报，命令留空则该键被按下时不执行。播报期间通话为单向（防回音，与汇报一致）；勾选某键为"桥接键"后，按下该键将退出菜单并切换为双向桥接（AI 侧可插话/打断），默认 0 键。</p>
+      <table class="ivrtbl">
+        <tr><th>键</th><th>播报词</th><th>命令</th><th class="cb">桥接↔双向</th></tr>
+        ${IVR_ROWS}
+      </table>
+    </div>
+    <div class="dlgPanel hidden" id="p-rpc"><div class="scrollPanel">
       <label class="fld" style="display:flex;align-items:center;gap:8px"><input type="checkbox" checked> 启用电话汇报 RPC（本地控制通道）</label>
       <label class="fld"><span>RPC 监听端口</span><input type="number" value="8731"></label>
-      <label class="fld"><span>RPC Token（Bearer；留空自动生成并保存）</span>
+      <label class="fld"><span>RPC Token（Bearer，隐藏显示；留空自动生成）</span>
         <div class="row" style="align-items:center;gap:8px">
           <input type="text" id="rpcToken" value="${state.rpcToken}" readonly placeholder="自动生成">
           <button class="btn" onclick="resetToken()">重置 Token</button>
         </div></label>
-      <label class="fld"><span>座机地址（域名或 IP，对外打电话）</span><input type="text" id="reportHost" value="${state.reportHost}" placeholder="例如 192.168.1.116"></label>
+      <label class="fld"><span class="req">分机号（必填，对外拨打的号码）</span><input type="text" id="reportExt" value="${state.reportExt}" placeholder="例如 8000"></label>
+      <label class="fld"><span>座机地址（选填；留空则默认走网关）</span><input type="text" id="reportHost" value="${state.reportHost}" placeholder="例如 192.168.1.116"></label>
+      <label class="fld"><span>座机端口（默认 5060）</span><input type="number" id="reportPort" value="${state.reportPort}"></label>
+      <label class="fld"><span>主叫显示名</span><input type="text" value="TeleFlow" placeholder="主叫显示名（默认 TeleFlow）"></label>
+      <label class="fld"><span>TTS 音色</span>
+        <select onchange="ttsVoiceChanged(this)">
+          ${TTS_VOICES.map(([n,v])=>`<option value="${v}"${v==="zh-CN-XiaoxiaoNeural"?" selected":""}>${n} — ${v}</option>`).join("")}
+          <option value="custom:">自定义…</option>
+        </select></label>
+      <label class="fld hidden" id="ttsVoiceCustom"><span>自定义音色 ID</span><input type="text" placeholder="自定义 edge-tts 音色 ID，如 zh-CN-YunyangNeural"></label>
+      <label class="fld"><span>ffmpeg 路径 (可选)</span><input type="text" placeholder="自动发现: /opt/homebrew/bin/ffmpeg"></label>
+      <label class="fld" style="display:flex;align-items:center;gap:8px"><input type="checkbox" checked> 汇报播放结束后自动挂机</label>
       <div class="row">
-        <label class="fld"><span>座机端口</span><input type="number" id="reportPort" value="${state.reportPort}"></label>
-        <label class="fld"><span>座机分机号</span><input type="text" id="reportExt" value="${state.reportExt}" placeholder="例如 8000"></label>
+        <label class="fld"><span>TTS 缓存 TTL（秒，0=每次重新合成）</span><input type="number" value="604800"></label>
+        <label class="fld"><span>TTS 合成失败重试次数</span><input type="number" value="3"></label>
       </div>
-      <label class="fld"><span>主叫显示名</span><input type="text" value="TeleFlow" placeholder="默认 TeleFlow"></label>
-      <label class="fld"><span>TTS 音色</span><input type="text" value="zh-CN-XiaoxiaoNeural" placeholder="例如 zh-CN-XiaoxiaoNeural"></label>
-      <label class="fld"><span>ffmpeg 路径（可选）</span><input type="text" placeholder="自动发现: /opt/homebrew/bin/ffmpeg"></label>
       <p class="hint">外部 hook（如 WorkBuddy Stop hook）POST 文本到 <code>/v1/report</code> 即可让本机拨打座机并播放。ffmpeg 留空时从 PATH 自动查找。</p>
-    </div>
+    </div></div>
     <div class="dlgPanel hidden" id="p-log">
       <div class="row">
         <label class="fld"><span>日志级别</span><select id="logLevel"><option>DEBUG</option><option selected>INFO</option><option>WARNING</option><option>ERROR</option></select></label>
-        <label class="fld"><span>开机自启</span><select id="autostart"><option>关</option><option>开</option></select></label>
-        <label class="fld"><span>最小化启动</span><select id="startMin"><option>关</option><option>开</option></select></label>
+        <label class="fld"><span>语言</span><select><option selected>跟随系统</option><option>English</option><option>中文</option></select></label>
       </div>
+      <label class="fld" style="display:flex;align-items:center;gap:8px"><input type="checkbox"> 开机自启</label>
+      <label class="fld" style="display:flex;align-items:center;gap:8px"><input type="checkbox"> 最小化启动</label>
     </div>
   </div>
 </div>
@@ -526,6 +578,7 @@ function saveSettings(){
   if(g("sipServerPort")) state.gatewayPort=+g("sipServerPort").value||5060;
   if(g("sipUser")) state.user=g("sipUser").value.trim();
   if(g("sipPassword")) state.password=g("sipPassword").value;
+  if(g("sipPort")) state.port=+g("sipPort").value||state.port;
   if(g("offHookCmd")) state.offHookCmd=g("offHookCmd").value;
   if(g("onHookCmd")) state.onHookCmd=g("onHookCmd").value;
   if(g("reportHost")) state.reportHost=g("reportHost").value.trim();
