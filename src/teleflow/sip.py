@@ -241,6 +241,69 @@ def _tts_settings_key(config: ResolvedConfig) -> tuple[str, int, int]:
     )
 
 
+def _extract_sip_user(raw: str) -> str:
+    """Extract the user part from a SIP URI or bare number.
+
+    ``sip:10011@host:5060;transport=UDP`` -> ``10011``;
+    ``<sip:10011@host>`` -> ``10011``; ``10011`` -> ``10011``; empty -> ``""``.
+    """
+    text = str(raw or "").strip().strip("\"'<> ")
+    if not text:
+        return ""
+    # Remove leading sip: even when wrapped like <sip:...> or ' <sip:...>'
+    # (the outer strip above already removed <>, but sip: may still remain).
+    low = text.lower()
+    if low.startswith("sip:"):
+        text = text[4:].strip().strip("\"'<> ")
+    elif text.startswith("<") and "sip:" in low:
+        # Fallback for '<sip:...' without outer strip catching due to leading "'"
+        idx = low.find("sip:")
+        if idx != -1:
+            text = text[idx + 4 :].strip().strip("\"'<> ")
+    if "@" in text:
+        user, _, _ = text.partition("@")
+        user = user.strip().strip("\"'<> ")
+        if user.lower().startswith("sip:"):
+            user = user[4:].strip().strip("\"'<> ")
+        return user
+    for sep in (";", "?", ">", "<"):
+        if sep in text:
+            text = text.split(sep)[0]
+    text = text.strip().strip("\"'<> ")
+    if text.lower().startswith("sip:"):
+        text = text[4:].strip().strip("\"'<> ")
+    return text
+
+
+def _suffix_digit_from_target(target_raw: str | None, base_user: str) -> str | None:
+    """Map a dialed target like ``10011`` (base ``1001`` -> suffix ``1``) to
+    its single-digit IVR key, or ``None`` if it is not a suffix-routable call.
+
+    Only the single extra digit beyond ``base_user`` is considered routable,
+    so e.g. sip_user=1001 时 ``10011`` (``1001``+``1``) -> ``1``, ``10010``
+    -> ``0``; 同理 1002->10021/10020 等，base 取自配置而非写死。
+    ``1001`` 本身、非前缀号或多位后缀回退到 ``None``（走基座号的常规播报菜单）。
+    """
+    if not target_raw or not base_user:
+        return None
+    user = _extract_sip_user(target_raw)
+    if not user or user == base_user:
+        return None
+    if not user.startswith(base_user):
+        return None
+    suffix = user[len(base_user) :]
+    if not suffix:
+        return None
+    # Single trailing digit is the normal case (1001 -> 10011 / 10010).
+    if len(suffix) == 1 and suffix in "0123456789":
+        return suffix
+    # Multi-char suffix (should not happen for this product) -> first digit.
+    for ch in suffix:
+        if ch in "0123456789":
+            return ch
+    return None
+
+
 class FakeSipBackend:
     """Scripted SIP transport for tests/headless runs.
 
@@ -293,8 +356,11 @@ class FakeSipBackend:
     def receive_register_failed(self, code: int = 0, reason: str = "") -> None:
         self._fire("register_failed", code=code, reason=reason)
 
-    def receive_invite(self, call_id: str) -> None:
-        self._fire("invite", call_id=call_id)
+    def receive_invite(self, call_id: str, target: str | None = None) -> None:
+        if target is not None:
+            self._fire("invite", call_id=call_id, target=target)
+        else:
+            self._fire("invite", call_id=call_id)
 
     def receive_bye(self, call_id: str) -> None:
         self._fire("bye", call_id=call_id)
@@ -784,6 +850,53 @@ class SipCoreService:
         self._backend.mark_ivr(call_id)
         self._ivr_begin(call_id, self._ivr_prompts(settings), settings.tts_voice)
 
+    # --- Suffix-direct routing for shared registration (如 sip_user=1001 时 1001 -> 10011/10010) ---
+    def _suffix_digit_for_target(self, target: object) -> str | None:
+        if target is None:
+            return None
+        base = self._store.load().sip_user.strip()
+        return _suffix_digit_from_target(str(target), base)
+
+    def _should_use_suffix_route(self, digit: str) -> bool:
+        """后缀直达是否可用：仅当该按键的 ``ivr_digit_text`` 有文字时直达，
+        否则回退到 sip_user 的常规数字播报菜单（满足“没有文字就回退”的补充需求）。"""
+        settings = self._store.load()
+        if not settings.ivr_enabled:
+            return False
+        text = settings.ivr_digit_text.get(digit, "").strip()
+        if not text:
+            return False
+        return True
+
+    def _handle_suffix_route(self, call_id: str, digit: str) -> None:
+        """Suffix-direct dispatch: e.g. registered ``sip_user=1001`` + dialed
+        ``10011`` -> suffix ``1`` (天气), ``10010`` -> ``0`` (coding); same
+        rule applies for 1002->10021/10020, 1003->10031/10030, etc. Reuses the
+        existing ``ivr_digit_hook[digit]`` without playing welcome/menu.
+
+        The call is still marked one-way like a normal IVR menu so there is no
+        echo; the synthetic DTMF then reuses ``_on_dtmf`` so exit-digit bridging
+        (``0`` -> two-way) and ``EVENT_IVR_DIGIT`` stay unified. If the digit
+        has no text we never get here — the caller falls back to the regular
+        sip_user broadcast menu instead.
+        """
+        self._backend.mark_ivr(call_id)
+        # Minimal IVR bookkeeping so the synthetic DTMF passes the guard in
+        # _on_dtmf, but keep the playback queue empty (no welcome/menu synthesized).
+        self._ivr_active = True
+        self._ivr_call_id = call_id
+        self._ivr_queue = []
+        self._ivr_slots = []
+        self._ivr_next = 0
+        self._ivr_total = 0
+        self._ivr_playing = False
+        self._ivr_listening = True
+        self._ivr_digit_fired = False
+        self._last_digit = ""
+        self._ivr_started = False
+        self._log_line(f"[IVR] 后缀直达: call={call_id} 目标后缀={digit} -> 直达按键 {digit}")
+        self._on_dtmf(call_id, digit)
+
     def _ivr_begin(self, call_id: str, prompts: list[str], voice: str) -> None:
         """Kick off the IVR menu: convert every prompt in parallel (via the
         conversion queue) and play them in order as each completes.
@@ -1067,7 +1180,27 @@ class SipCoreService:
             self._state = CallState.CONNECTED
             self._active_call_id = call_id
             self._emit(EVENT_CALL_CONNECTED, call_id=call_id)
-            self._maybe_start_ivr(call_id)
+            # Shared-registration suffix routing (如 sip_user=1001 时 1001 -> 10011/10010，
+            # 同理 1002 -> 10021/10020)：if dialed target carries an extra digit
+            # beyond the configured sip_user and that digit has text, dispatch
+            # directly without playing the base welcome/menu; otherwise fall back
+            # to the normal broadcast menu.
+            target = data.get("target") or data.get("to") or data.get("to_uri")
+            self._log_line(f"[IVR] INVITE call={call_id} target={target!r}")
+            digit = self._suffix_digit_for_target(target) if target is not None else None
+            self._log_line(f"[IVR] 后缀解析 base={self._store.load().sip_user.strip()!r} target={target!r} -> digit={digit!r}")
+            if digit is not None and self._should_use_suffix_route(digit):
+                self._log_line(f"[IVR] 后缀直达判定成功 digit={digit} -> 直达")
+                self._handle_suffix_route(call_id, digit)
+            else:
+                if digit is not None:
+                    base = self._store.load().sip_user.strip() or "默认"
+                    self._log_line(
+                        f"[IVR] 后缀 {digit} 无文字配置，回退到 {base} 播报模式 (call {call_id})"
+                    )
+                else:
+                    self._log_line(f"[IVR] 无后缀，回退到常规播报 (call {call_id})")
+                self._maybe_start_ivr(call_id)
         elif name in ("bye", "cancel"):
             self._state = CallState.ENDED
             self._emit(

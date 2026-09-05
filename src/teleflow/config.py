@@ -66,8 +66,8 @@ class Settings:
     #   sip_password     — auth password.
     sip_host: str = ""
     sip_server_port: int = 5060
-    sip_user: str = ""  # AOR / auth username
-    sip_password: str = ""  # auth password
+    sip_user: str = ""  # AOR / auth username (primary, e.g. 1001)
+    sip_password: str = ""  # auth password (shared by all derived AORs)
     playback_device_id: str = ""
     capture_device_id: str = ""
     autostart: bool = False
@@ -233,6 +233,22 @@ class ResolvedConfig:
             return None
         port = self._settings.sip_server_port or 5060
         return f"sip:{ext}@{gw}:{port}"
+
+    @property
+    def sip_all_users(self) -> list[str]:
+        """All SIP AORs to register.
+
+        Only the primary ``sip_user`` (e.g. 1001/1002/1003) is registered.
+        Derived numbers like 10010/10011 are *not* registered as separate
+        accounts — they are virtual suffixes handled locally via the single
+        primary registration (the gateway/registrar must alias/forward them to
+        the primary's Contact, preserving the original To/R-URI for suffix
+        routing). Attempting to REGISTER derived numbers would fail with 403
+        when those users are not provisioned on the registrar, as seen in
+        the logs.
+        """
+        base = self._settings.sip_user.strip()
+        return [base] if base else []
 
 
 class ConfigStore:

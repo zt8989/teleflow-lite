@@ -180,9 +180,44 @@ Function .GetExePath
   Push $0
 FunctionEnd
 
+; ─── Helpers ──────────────────────────────────────────────────────────────────
+
+; Kill any running TeleFlow.exe so files are not locked during install/uninstall.
+; Uses taskkill (built-in since Windows XP). Return value in $0 is ignored —
+; taskkill returns non-zero when no process was found, which is fine.
+Function KillTeleFlow
+  DetailPrint "关闭正在运行的 TeleFlow 进程..."
+  ExecWait 'taskkill /F /IM "${APP_EXE}" /T' $0
+  Sleep 1200
+  ; Graceful WM_CLOSE fallback for tray-only instances where the window title
+  ; may still be present after taskkill race.
+  FindWindow $0 "" "TeleFlow"
+  ${If} $0 != 0
+    SendMessage $0 ${WM_CLOSE} 0 0
+    Sleep 800
+    ExecWait 'taskkill /F /IM "${APP_EXE}" /T' $0
+    Sleep 500
+  ${EndIf}
+FunctionEnd
+
+Function un.KillTeleFlow
+  DetailPrint "关闭正在运行的 TeleFlow 进程..."
+  ExecWait 'taskkill /F /IM "${APP_EXE}" /T' $0
+  Sleep 1200
+  FindWindow $0 "" "TeleFlow"
+  ${If} $0 != 0
+    SendMessage $0 ${WM_CLOSE} 0 0
+    Sleep 800
+    ExecWait 'taskkill /F /IM "${APP_EXE}" /T' $0
+    Sleep 500
+  ${EndIf}
+FunctionEnd
+
 ; ─── Installer Sections ──────────────────────────────────────────────────────
 
 Section "Install" SEC_INSTALL
+  Call KillTeleFlow
+
   SetOutPath "$INSTDIR"
   Setoverwrite on
 
@@ -243,30 +278,59 @@ Section "Install" SEC_INSTALL
   ${EndIf}
 SectionEnd
 
-; ─── Uninstaller Section ─────────────────────────────────────────────────────
+; ─── Uninstaller init ────────────────────────────────────────────────────────
 
-Section "Uninstall"
-  ; Remove files (everything in $INSTDIR)
-  RMDir /r "$INSTDIR"
-
-  ; Remove Start Menu shortcuts
-  RMDir /r "$SMPROGRAMS\${APP_NAME}"
-
-  ; Remove desktop shortcut
-  Delete "$DESKTOP\${APP_NAME}.lnk"
-
-  ; Detect scope from registry to know which root to clean
+Function un.onInit
+  ; Set shell context for shortcut removal based on original install scope.
+  ; Check HKLM first (all-users), fall back to current user.
   ClearErrors
   ReadRegStr $0 HKLM "${APP_REG_KEY}" "Scope"
   ${IfNot} ${Errors}
-    DeleteRegKey HKLM "${APP_UNINST_KEY}"
-    DeleteRegKey HKLM "${APP_REG_KEY}"
+    StrCpy $InstScope "all"
+    SetShellVarContext all
   ${Else}
-    ClearErrors
-    ReadRegStr $0 HKCU "${APP_REG_KEY}" "Scope"
-    ${IfNot} ${Errors}
-      DeleteRegKey HKCU "${APP_UNINST_KEY}"
-      DeleteRegKey HKCU "${APP_REG_KEY}"
-    ${EndIf}
+    StrCpy $InstScope "user"
+    SetShellVarContext current
   ${EndIf}
+FunctionEnd
+
+; ─── Uninstaller Section ─────────────────────────────────────────────────────
+
+Section "Uninstall"
+  Call un.KillTeleFlow
+
+  ; Clean autostart Run entry (future-proof; Windows autostart may use this key)
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APP_NAME}"
+  DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "${APP_NAME}"
+
+  ; Remove files — use /REBOOTOK so a locked file is scheduled for deletion on reboot
+  ; (uninstall.exe itself runs from $INSTDIR, so the directory cannot be fully
+  ; removed until the process exits; NSIS handles copy-to-TEMP, but files locked
+  ; by a still-running TeleFlow.exe would otherwise remain).
+  RMDir /r /REBOOTOK "$INSTDIR"
+  ; Extra attempt for the main exe if RMDir was partial
+  IfFileExists "$INSTDIR\${APP_EXE}" 0 +2
+    Delete /REBOOTOK "$INSTDIR\${APP_EXE}"
+  IfFileExists "$INSTDIR" 0 +2
+    RMDir /REBOOTOK "$INSTDIR"
+
+  ; Remove Start Menu shortcuts (try both contexts to guarantee cleanup)
+  SetShellVarContext all
+  RMDir /r "$SMPROGRAMS\${APP_NAME}"
+  Delete "$SMPROGRAMS\${APP_NAME}.lnk"
+  SetShellVarContext current
+  RMDir /r "$SMPROGRAMS\${APP_NAME}"
+  Delete "$SMPROGRAMS\${APP_NAME}.lnk"
+
+  ; Remove desktop shortcuts (both contexts)
+  SetShellVarContext all
+  Delete "$DESKTOP\${APP_NAME}.lnk"
+  SetShellVarContext current
+  Delete "$DESKTOP\${APP_NAME}.lnk"
+
+  ; Remove registry keys — try both hives regardless of detected scope to avoid leftovers
+  DeleteRegKey HKLM "${APP_UNINST_KEY}"
+  DeleteRegKey HKLM "${APP_REG_KEY}"
+  DeleteRegKey HKCU "${APP_UNINST_KEY}"
+  DeleteRegKey HKCU "${APP_REG_KEY}"
 SectionEnd

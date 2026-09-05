@@ -263,7 +263,27 @@ def _make_classes(pj: Any, backend: "Pjsua2Backend") -> tuple[type, type]:
             # backend.answer(call_id) so the same code path serves the fake
             # and the real backend.
             if backend._handler is not None:
-                backend._handler("invite", {"call_id": call_id})
+                # Extract the dialed number (To / localUri) so the service can
+                # do suffix-based routing (e.g. sip_user=1001 时 1001 -> 10011/10010,
+                # 同理 1002/1003 等，基座号取配置而非写死). Best-effort: any
+                # failure falls back to a plain invite with no target.
+                target: str | None = None
+                try:
+                    info = call.getInfo()
+                    # pjsua2 CallInfo.localUri looks like "sip:10011@host:port"
+                    # (the called number) while remoteUri is the caller.
+                    for attr in ("localUri", "localContact", "callIdString"):
+                        raw = getattr(info, attr, "") or ""
+                        if raw:
+                            # Reuse sip.py helper via local import to avoid cycle.
+                            target = str(raw)
+                            break
+                except Exception:  # noqa: BLE001 - never break call setup
+                    target = None
+                data: dict[str, object] = {"call_id": call_id}
+                if target:
+                    data["target"] = target
+                backend._handler("invite", data)
 
         def onRegState(self, prm: Any) -> None:  # noqa: ARG002 - prm unused
             # Report client-registration outcomes to the SIP core so it can
@@ -489,7 +509,8 @@ class Pjsua2Backend:
         self._store = store
         self._handler: Callable[[str, dict], None] | None = None
         self._transport: Any = None
-        self._account: Any = None
+        self._account: Any | None = None
+        self._accounts: list[Any] = []  # kept for compat, but only primary is used
         self._bridge: MediaBridge | None = None
         self._calls: dict[str, Any] = {}
         # Report players must outlive playback; pjsua2's conference bridge only
@@ -581,27 +602,51 @@ class Pjsua2Backend:
                 except Exception:  # noqa: BLE001 - absent codecs are fine
                     pass
 
-        acc_cfg = self._pj.AccountConfig()
+        from teleflow.config import ResolvedConfig
+
         settings = self._store.load()
-        # Local account URI (the AOR). Anchor the host to the configured
-        # gateway when present so the identity matches the server's realm;
-        # otherwise fall back to a local peer identity (direct IP calling).
+        resolved = ResolvedConfig(settings)
+        users = resolved.sip_all_users
+        # Fallback to legacy single user if derived list is empty (e.g. no
+        # sip_user configured yet) – keeps headless/tests booting.
+        if not users:
+            users = [settings.sip_user or "teleflow"]
         host = settings.sip_host or "localhost"
-        acc_cfg.idUri = f"sip:{settings.sip_user or 'teleflow'}@{host}"
-        # Register to the configured gateway as a client, with digest auth.
-        if settings.sip_host:
-            acc_cfg.regConfig.registrarUri = _registrar_uri(
-                settings.sip_host, settings.sip_server_port
-            )
-            acc_cfg.regConfig.register = True
-            if settings.sip_user:
-                cred = self._pj.AuthCredInfo(
-                    "digest", "*", settings.sip_user, 0, settings.sip_password
-                )
-                acc_cfg.sipConfig.authCreds.append(cred)
         assert self._account_cls is not None
-        self._account = self._account_cls()
-        self._account.create(acc_cfg)
+        # Only the primary sip_user is REGISTERed. Derived suffix numbers
+        # (e.g. 10010/10011 from 1001) are virtual — they are NOT separate
+        # REGISTERs (which would 403 when not provisioned) but are handled
+        # locally as suffix routing on the single primary's incoming INVITE
+        # (To/R-URI preserved by the gateway alias/forward or direct IP dial).
+        # Making the primary the default account ensures an INVITE whose R-URI
+        # is 10010/10011 still arrives at this account when sent to the same
+        # transport, even though only 1001 is registered.
+        self._accounts = []
+        for idx, user in enumerate(users):
+            acc_cfg = self._pj.AccountConfig()
+            acc_cfg.idUri = f"sip:{user}@{host}"
+            # isDefault ensures unmatched R-URIs (derived suffixes) are still
+            # delivered to the primary when the gateway preserves the original
+            # To (common for suffix aliasing without separate REGISTER).
+            try:
+                acc_cfg.isDefault = idx == 0
+            except AttributeError:
+                pass
+            if settings.sip_host:
+                acc_cfg.regConfig.registrarUri = _registrar_uri(
+                    settings.sip_host, settings.sip_server_port
+                )
+                acc_cfg.regConfig.register = True
+                if user:
+                    cred = self._pj.AuthCredInfo(
+                        "digest", "*", user, 0, settings.sip_password
+                    )
+                    acc_cfg.sipConfig.authCreds.append(cred)
+            acc = self._account_cls()
+            acc.create(acc_cfg)
+            self._accounts.append(acc)
+        # Keep _account as primary for outbound call helpers (place_call etc.)
+        self._account = self._accounts[0] if self._accounts else None
         self.port = port
         self.running = True
 
