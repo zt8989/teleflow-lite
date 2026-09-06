@@ -503,6 +503,10 @@ class SipCoreService:
         # True once the first IVR menu item has actually started playing. Guards
         # the media-active retry so each item plays exactly once.
         self._ivr_started = False
+        # Suffix-direct pending wav for media-not-yet-active retry (call_id -> wav).
+        self._suffix_pending: dict[str, str] = {}
+        # Suffix-direct DTMF deferred until the announcement finishes (call_id -> digit).
+        self._suffix_pending_dtmf: dict[str, str] = {}
         # Currently-connected inbound call id (set on INVITE, cleared on BYE).
         # Used to validate that ad-hoc playback/replay targets a live call.
         self._active_call_id: str | None = None
@@ -879,7 +883,16 @@ class SipCoreService:
         (``0`` -> two-way) and ``EVENT_IVR_DIGIT`` stay unified. If the digit
         has no text we never get here — the caller falls back to the regular
         sip_user broadcast menu instead.
+
+        新增：直达时先播报该按键的 ``ivr_digit_text[digit]`` 作为接通确认，
+        播报完成后再触发按键钩子/桥接（解决 10010 直接静默进录音的问题）。
+        流程：INVITE -> 标记 one-way -> 异步合成文案 -> one-way 播放 ->
+        ``playback_done`` -> ``_on_dtmf``（桥接/录音），media 未 ACTIVE 时在
+        ``call_media_active`` 重试。
         """
+        settings = self._store.load()
+        digit_text = settings.ivr_digit_text.get(digit, "").strip()
+        voice = settings.tts_voice
         self._backend.mark_ivr(call_id)
         # Minimal IVR bookkeeping so the synthetic DTMF passes the guard in
         # _on_dtmf, but keep the playback queue empty (no welcome/menu synthesized).
@@ -895,7 +908,53 @@ class SipCoreService:
         self._last_digit = ""
         self._ivr_started = False
         self._log_line(f"[IVR] 后缀直达: call={call_id} 目标后缀={digit} -> 直达按键 {digit}")
-        self._on_dtmf(call_id, digit)
+        if not digit_text:
+            # 无文案时直接触发（回退路径，理论上不会进入 suffix 直达）
+            self._on_dtmf(call_id, digit)
+            return
+        # 有文案：先播报，播报结束后再触发 DTMF/桥接
+        self._suffix_pending_dtmf[call_id] = digit
+        try:
+
+            def _on_suffix_wav(wav, error=None, order=None):
+                if error is not None:
+                    self._log_line(f"[IVR] 后缀播报合成失败 digit={digit}: {error}")
+                    pending = self._suffix_pending_dtmf.pop(call_id, None)
+                    if pending is not None and self._active_call_id == call_id:
+                        self._log_line(f"[IVR] 合成失败回退，直接触发按键 {pending}")
+                        self._on_dtmf(call_id, pending)
+                    return
+                if wav is None:
+                    pending = self._suffix_pending_dtmf.pop(call_id, None)
+                    if pending is not None and self._active_call_id == call_id:
+                        self._on_dtmf(call_id, pending)
+                    return
+                wav_str = str(wav)
+                if self._active_call_id != call_id:
+                    self._suffix_pending_dtmf.pop(call_id, None)
+                    self._suffix_pending.pop(call_id, None)
+                    return
+                # 标记正在播放，playback_done 会据此触发 DTMF
+                self._log_line(f"[IVR] 后缀播报开始播放: digit={digit} text={digit_text!r} (等待播报完成再桥接)")
+                self._ivr_playing = True
+                ok = self._backend.play_file_to_call(call_id, wav_str, hangup_on_eof=False)
+                if ok:
+                    self._suffix_pending.pop(call_id, None)
+                    # Fake 后端会同步触发 playback_done，进而触发 _on_dtmf；
+                    # 真实 pjsua2 会在文件播完后异步触发。
+                else:
+                    self._log_line(f"[IVR] 后缀播报媒体未就绪，等待 media_active 重试: digit={digit}")
+                    self._suffix_pending[call_id] = wav_str
+                    self._ivr_playing = False
+
+            self.conversion_queue.submit(
+                digit_text, voice, prefix="ivr", order=digit, on_done=_on_suffix_wav
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log_line(f"[IVR] 后缀播报提交失败 digit={digit}: {exc}")
+            pending = self._suffix_pending_dtmf.pop(call_id, None)
+            if pending is not None:
+                self._on_dtmf(call_id, pending)
 
     def _ivr_begin(self, call_id: str, prompts: list[str], voice: str) -> None:
         """Kick off the IVR menu: convert every prompt in parallel (via the
@@ -981,12 +1040,36 @@ class SipCoreService:
         self._ivr_started = True
 
     def _on_ivr_playback_done(self, call_id: str) -> None:
+        # Suffix-direct announcement finished -> now fire the deferred DTMF (播报完成再桥接/录音)
+        if call_id in self._suffix_pending_dtmf:
+            digit = self._suffix_pending_dtmf.pop(call_id)
+            self._ivr_playing = False
+            self._suffix_pending.pop(call_id, None)
+            self._log_line(f"[IVR] 后缀播报完成，触发按键 {digit} (call {call_id})")
+            self._on_dtmf(call_id, digit)
+            return
         if not self._ivr_active or call_id != self._ivr_call_id:
             return
         self._ivr_playing = False
         self._ivr_play_next()
 
     def _on_call_media_active(self, call_id: str) -> None:
+        # Suffix-direct pending retry (one-way announcement that failed because
+        # media wasn't ACTIVE at answer time). Retry regardless of IVR active
+        # state — the announcement must still play before the deferred DTMF.
+        pending = self._suffix_pending.get(call_id)
+        if pending is not None and self._active_call_id == call_id:
+            # 标记播放中，成功后等待 playback_done 再触发 DTMF
+            self._log_line(f"[IVR] 后缀播报重试，开始播放: call={call_id}")
+            self._ivr_playing = True
+            ok = self._backend.play_file_to_call(call_id, pending, hangup_on_eof=False)
+            if ok:
+                self._suffix_pending.pop(call_id, None)
+            else:
+                self._ivr_playing = False
+            # Suffix 与常规菜单互斥：若为 suffix 则后续常规菜单无需再处理
+            if call_id in self._suffix_pending_dtmf:
+                return
         # The real backend signals this once an inbound call's audio media is
         # up. IVR playback may have been attempted (and failed) at answer time;
         # retry now. Only triggers once — once anything has started playing the
@@ -1122,6 +1205,8 @@ class SipCoreService:
         self._ivr_digit_fired = False
         self._last_digit = ""
         self._ivr_started = False
+        self._suffix_pending.clear()
+        self._suffix_pending_dtmf.clear()
 
     def reroute(self) -> None:
         """Re-apply the current device selection to a live call (mid-call switch).

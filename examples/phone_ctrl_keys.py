@@ -60,6 +60,67 @@ else:
     print("[phone_ctrl_keys] 仅支持 Windows / macOS", file=sys.stderr)
     raise SystemExit(3)
 
+# 挂机前自动追加的括号说明（语音转写免责提示，用自己的话表达）
+DISCLAIMER_TEXT = "（说明：以上内容由语音自动转写生成，可能出现同音或近音词的识别偏差，请结合上下文酌情参考）"
+
+
+def _type_text(text: str) -> bool:
+    """向当前焦点窗口键入文本（用于挂机前追加括号说明）。
+
+    优先用 pynput 直接键入，失败则回退到剪贴板粘贴（Win: powershell Set-Clipboard + Ctrl+V / macOS: pbcopy + Cmd+V）。
+    返回是否成功。
+    """
+    # 路径1: pynput 直接键入（支持中文）
+    try:
+        from pynput.keyboard import Controller
+
+        kb = Controller()
+        kb.type(text)
+        return True
+    except Exception:
+        pass
+    # 路径2: 剪贴板粘贴回退
+    try:
+        import subprocess
+
+        if sys.platform == "win32":
+            # 用 powershell 设置剪贴板，避免中文编码问题
+            subprocess.run(
+                ["powershell", "-command", f"Set-Clipboard -Value @'\n{text}\n'@"],  # here-string 避免转义
+                check=False,
+                capture_output=True,
+            )
+            time.sleep(0.15)
+            # Ctrl+V 粘贴
+            VK_CONTROL, VK_V = 0x11, 0x56
+            user32.keybd_event(VK_CONTROL, 0, 0, 0)  # type: ignore[name-defined]
+            user32.keybd_event(VK_V, 0, 0, 0)  # type: ignore[name-defined]
+            user32.keybd_event(VK_V, 0, 2, 0)  # type: ignore[name-defined]
+            user32.keybd_event(VK_CONTROL, 0, 2, 0)  # type: ignore[name-defined]
+            return True
+        elif sys.platform == "darwin":
+            subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=False)
+            time.sleep(0.15)
+            # Cmd+V 需走 pynput 或 AppleScript，已在路径1失败，尝试 AppleScript
+            subprocess.run(
+                ["osascript", "-e", 'tell application "System Events" to keystroke "v" using command down'],
+                check=False,
+            )
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _type_disclaimer() -> None:
+    """在按 Enter 前键入括号免责说明。"""
+    ok = _type_text(DISCLAIMER_TEXT)
+    if ok:
+        print(f"[{time.strftime('%H:%M:%S')}] >>> 已追加括号说明: {DISCLAIMER_TEXT}", flush=True)
+        time.sleep(0.2)
+    else:
+        print(f"[{time.strftime('%H:%M:%S')}] [WARN] 追加括号说明失败", file=sys.stderr)
+
 
 def _global_keys(mod: str | None, key: str) -> None:
     """Last-resort fallback when the windowed / native key send fails.
@@ -275,6 +336,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         _send_connect()
         time.sleep(1)
+        # 按 Enter 前自动追加括号说明（语音转写免责提示）
+        _type_disclaimer()
         _send_enter()
     return 0
 

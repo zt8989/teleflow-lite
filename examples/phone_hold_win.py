@@ -71,6 +71,49 @@ KEYEVENTF_KEYUP = 0x0002
 
 HOLD_MARK = Path(tempfile.gettempdir()) / "teleflow_hold.lock"
 
+# 挂机按 Enter 前自动追加的括号说明（语音转写免责提示，用自己的话表达）
+DISCLAIMER_TEXT = "（说明：以上内容由语音自动转写生成，可能出现同音或近音词的识别偏差，请结合上下文酌情参考）"
+
+
+def _type_text(text: str) -> bool:
+    """向当前焦点窗口键入文本（用于挂机前追加括号说明）。"""
+    try:
+        from pynput.keyboard import Controller
+
+        kb = Controller()
+        kb.type(text)
+        return True
+    except Exception:
+        pass
+    try:
+        import subprocess
+
+        # 回退：剪贴板 + Ctrl+V（仅 Windows）
+        subprocess.run(
+            ["powershell", "-command", f"Set-Clipboard -Value @'\n{text}\n'@"],
+            check=False,
+            capture_output=True,
+        )
+        time.sleep(0.15)
+        VK_V = 0x56
+        user32.keybd_event(VK_CONTROL, 0, 0, 0)
+        user32.keybd_event(VK_V, 0, 0, 0)
+        user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
+        user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+        return True
+    except Exception:
+        pass
+    return False
+
+
+def _type_disclaimer() -> None:
+    ok = _type_text(DISCLAIMER_TEXT)
+    if ok:
+        print(f"[{time.strftime('%H:%M:%S')}] >>> 已追加括号说明: {DISCLAIMER_TEXT}", flush=True)
+        time.sleep(0.2)
+    else:
+        print(f"[{time.strftime('%H:%M:%S')}] [WARN] 追加括号说明失败", file=sys.stderr)
+
 
 def _hold() -> None:
     """按下并保持 Ctrl+Win（DOWN）。"""
@@ -107,10 +150,11 @@ def _release(enter_delay: float = 1.0) -> None:
         print(f"[{time.strftime('%H:%M:%S')}] >>> Ctrl+Win 已释放 (release)", flush=True)
     else:
         print(f"[{time.strftime('%H:%M:%S')}] >>> Ctrl+Win 释放（无先前 hold 记录，仍发送 UP 兜底）", flush=True)
-    # 不切 WorkBuddy 窗口，直接全局发 Enter
+    # 按 Enter 前先追加括号说明，再发 Enter
     if enter_delay <= 0:
         print(f"[{time.strftime('%H:%M:%S')}] >>> 跳过 Enter (enter_delay={enter_delay})", flush=True)
         return
+    _type_disclaimer()
     time.sleep(enter_delay)
     user32.keybd_event(VK_RETURN, 0, 0, 0)
     user32.keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0)
