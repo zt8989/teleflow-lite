@@ -184,12 +184,12 @@ def _release_cancel() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Windows-only: 按 0 hold Ctrl+Win，挂断 release 并回车（不切 WorkBuddy 窗口）"
+        description="Windows-only: 按 0 hold Ctrl+Win，挂断 release 并回车/取消（星=*、井=#）"
     )
     parser.add_argument(
         "action",
-        choices=["hold", "release"],
-        help="hold=按 0 后按住 Ctrl+Win；release=挂断时释放并按 Enter（仅 last_digit==0）",
+        choices=["hold", "release", "cancel"],
+        help="hold=按 0 后按住 Ctrl+Win；release=挂断时释放并按 Enter/ESC；cancel=星/井按住中直接取消(释放+ESC)",
     )
     parser.add_argument("--call-id", default="", help="可选 call_id，仅用于日志")
     parser.add_argument(
@@ -212,6 +212,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.action == "hold":
         _hold()
+    elif args.action == "cancel":
+        # 星/井（* / #）录音中直接取消：释放按住的 Ctrl+Win 并 ESC
+        print(f"[{time.strftime('%H:%M:%S')}] 取消: 星/井直接 ESC", flush=True)
+        _release_cancel()
     elif args.action == "release":
         # 星=*、景=井# 的取消：录音中按 */# 表示丢弃，直接 ESC，不发 Enter/免责说明
         if args.last_digit in ("#", "*"):
