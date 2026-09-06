@@ -1140,21 +1140,24 @@ class SipCoreService:
         self._ivr_begin(call_id, prompts, settings.tts_voice)
 
     def _on_dtmf(self, call_id: str, digit: str) -> None:
+        # 星/井（* / #，语音常误为“景”/锌合金）取消：在 web coding 按 0 桥接后 IVR 已退出
+        # （_ivr_active=False），但仍需允许按 #/* 覆盖 last_digit 供挂机发 ESC。
+        if digit in ("#", "*") and call_id == self._active_call_id:
+            # 若当前仍在 IVR 菜单内且未触发首键，同步标记首键已触发以避免后续数字覆盖取消
+            if self._ivr_active and call_id == self._ivr_call_id and not self._ivr_digit_fired:
+                self._ivr_digit_fired = True
+                self._ivr_listening = False
+            self._last_digit = digit
+            self._log_line(f"[IVR] 收到取消按键 {digit} (call {call_id}) - 标记丢弃录音")
+            if self._ivr_queue or self._ivr_playing:
+                self._ivr_queue = []
+                self._ivr_playing = False
+                self._backend.stop_playback(call_id)
+            self._emit(EVENT_IVR_DIGIT, call_id=call_id, digit=digit)
+            return
         if not self._ivr_active or call_id != self._ivr_call_id:
             return
         if self._ivr_digit_fired:
-            # 录音过程中按 #/* 表示丢弃该段录音（web coding 场景，“星”=*、“景”=井号# 的语音误识别）：
-            # 允许在首个按键已触发后仍用 #/* 覆盖 last_digit，供挂机钩子判断发送 ESC 而非 Enter。
-            if digit in ("#", "*"):
-                self._last_digit = digit
-                self._log_line(f"[IVR] 收到取消按键 {digit} (call {call_id}) - 标记丢弃录音")
-                if self._ivr_queue or self._ivr_playing:
-                    self._ivr_queue = []
-                    self._ivr_playing = False
-                    self._backend.stop_playback(call_id)
-                # 可配置的星/井钩子（如 settings 中为 * 或 # 配置了 hook）仍需触发
-                self._emit(EVENT_IVR_DIGIT, call_id=call_id, digit=digit)
-                return
             return
         self._ivr_digit_fired = True
         self._ivr_listening = False
