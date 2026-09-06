@@ -827,7 +827,7 @@ class SipCoreService:
     # the on-hook hook.
     # ------------------------------------------------------------------
     def _ivr_prompts(self, settings: Settings) -> list[str]:
-        """Welcome (if any) then each non-empty digit menu prompt in 1~9~0 order,
+        """Welcome (if any) then each non-empty digit menu prompt in 1~9~0*# order,
         rendered as "{text} 请按{digit}"."""
         prompts: list[str] = []
         if settings.ivr_welcome.strip():
@@ -837,10 +837,11 @@ class SipCoreService:
 
     def _ivr_digit_prompts(self, settings: Settings) -> list[str]:
         prompts: list[str] = []
-        for digit in "1234567890":
+        for digit in "1234567890*#":
             text = settings.ivr_digit_text.get(digit, "").strip()
             if not text:
                 continue
+            # 星( * ) / 井( #，语音常误为“景”) 保持与数字一致的 “请按X” 格式
             prompts.append(f"{text} 请按{digit}")
         return prompts
 
@@ -1142,6 +1143,18 @@ class SipCoreService:
         if not self._ivr_active or call_id != self._ivr_call_id:
             return
         if self._ivr_digit_fired:
+            # 录音过程中按 #/* 表示丢弃该段录音（web coding 场景，“星”=*、“景”=井号# 的语音误识别）：
+            # 允许在首个按键已触发后仍用 #/* 覆盖 last_digit，供挂机钩子判断发送 ESC 而非 Enter。
+            if digit in ("#", "*"):
+                self._last_digit = digit
+                self._log_line(f"[IVR] 收到取消按键 {digit} (call {call_id}) - 标记丢弃录音")
+                if self._ivr_queue or self._ivr_playing:
+                    self._ivr_queue = []
+                    self._ivr_playing = False
+                    self._backend.stop_playback(call_id)
+                # 可配置的星/井钩子（如 settings 中为 * 或 # 配置了 hook）仍需触发
+                self._emit(EVENT_IVR_DIGIT, call_id=call_id, digit=digit)
+                return
             return
         self._ivr_digit_fired = True
         self._ivr_listening = False

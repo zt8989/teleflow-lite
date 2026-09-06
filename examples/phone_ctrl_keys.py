@@ -125,13 +125,16 @@ def _type_disclaimer() -> None:
 def _global_keys(mod: str | None, key: str) -> None:
     """Last-resort fallback when the windowed / native key send fails.
 
-    ``mod`` is "cmd" (macOS) or "ctrl" (Windows); ``key`` is "d" / "enter".
+    ``mod`` is "cmd" (macOS) or "ctrl" (Windows); ``key`` is "d" / "enter" / "esc".
     """
     try:
         from pynput.keyboard import Controller, Key
 
         kb = Controller()
-        if mod == "cmd":
+        if key == "esc":
+            kb.press(Key.esc)
+            kb.release(Key.esc)
+        elif mod == "cmd":
             with kb.pressed(Key.cmd):
                 kb.press(key)
                 kb.release(key)
@@ -142,7 +145,7 @@ def _global_keys(mod: str | None, key: str) -> None:
         else:
             kb.press(Key.enter)
             kb.release(Key.enter)
-        print(f"[{time.strftime('%H:%M:%S')}] >>> [兜底] 全局发送键", flush=True)
+        print(f"[{time.strftime('%H:%M:%S')}] >>> [兜底] 全局发送键 {key}", flush=True)
     except Exception as exc:  # noqa: BLE001 - never crash the hook
         print(f"[{time.strftime('%H:%M:%S')}] [WARN] 全局兜底失败: {exc}", file=sys.stderr)
 
@@ -236,14 +239,25 @@ if sys.platform == "win32":
         else:
             _global_keys(None, "enter")
 
+    def _send_esc() -> None:
+        """发送 ESC（用于按 # 取消录音时丢弃）。"""
+        hwnd = _find_workbuddy_hwnd()
+        if hwnd:
+            _force_foreground(hwnd)
+            time.sleep(0.15)
+            _tap_key(0x1B)  # VK_ESCAPE
+            print(f"[{time.strftime('%H:%M:%S')}] >>> ESC 已定向发送到 WorkBuddy 窗口", flush=True)
+        else:
+            _global_keys(None, "esc")
+
 elif sys.platform == "darwin":
     def _darwin_send(mod: str | None, key: str) -> bool:
         """Send a key combo on macOS. Returns True if a native path succeeded.
 
-        ``mod`` is "cmd" (Command) or None; ``key`` is "d" / "enter".
+        ``mod`` is "cmd" (Command) or None; ``key`` is "d" / "enter" / "esc".
         Tries Quartz (pyobjc) first, then AppleScript ``System Events``.
         """
-        vk = {"d": 0x02, "enter": 0x24}.get(key)  # kVK_ANSI_D / kVK_Return
+        vk = {"d": 0x02, "enter": 0x24, "esc": 0x35}.get(key)  # kVK_ANSI_D / kVK_Return / kVK_Escape
         if vk is None:
             return False
         try:
@@ -263,6 +277,8 @@ elif sys.platform == "darwin":
 
             if mod == "cmd":
                 script = 'tell application "System Events" to keystroke "d" using command down'
+            elif key == "esc":
+                script = 'tell application "System Events" to key code 53'
             else:
                 script = 'tell application "System Events" to keystroke return'
             subprocess.run(["osascript", "-e", script], check=True)
@@ -299,15 +315,23 @@ elif sys.platform == "darwin":
         else:
             _global_keys(None, "enter")
 
+    def _send_esc() -> None:
+        """发送 ESC（用于按 #/* 取消录音时丢弃，星=*、井=#）。"""
+        _darwin_activate()
+        if _darwin_send(None, "esc"):
+            print(f"[{time.strftime('%H:%M:%S')}] >>> ESC 已发送（macOS）", flush=True)
+        else:
+            _global_keys(None, "esc")
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="向 WorkBuddy 发送 Ctrl+D(Cmd+D on macOS) / Enter（配合 TeleFlow 通话钩子）"
+        description="向 WorkBuddy 发送 Ctrl+D(Cmd+D on macOS) / Enter/ESC（配合 TeleFlow 通话钩子，星=*、井=#）"
     )
     parser.add_argument(
         "action",
-        choices=["connect", "hangup"],
-        help="connect=摘机(start recording); hangup=挂机(stop recording + confirm)",
+        choices=["connect", "hangup", "cancel"],
+        help="connect=摘机(start recording); hangup=挂机(stop recording + confirm); cancel=星/井取消(ESC)",
     )
     parser.add_argument("--call-id", default="", help="可选的 call_id，仅用于日志")
     parser.add_argument(
@@ -321,9 +345,26 @@ def main(argv: list[str] | None = None) -> int:
     tag = f" call_id={args.call_id}" if args.call_id else ""
     print(f"[{time.strftime('%H:%M:%S')}] 动作 {args.action}{tag}", flush=True)
 
-    if args.action == "connect":
+    if args.action == "cancel":
+        # 星/井（* / #，锌合金=星和井的语音误识别）直接 ESC 丢弃
+        print(f"[{time.strftime('%H:%M:%S')}] 取消: 星/井触发 ESC", flush=True)
+        _send_esc()
+        return 0
+    elif args.action == "connect":
         _send_connect()
     elif args.action == "hangup":
+        # 挂机时 last_digit 的含义（“星”=*，“景”=井号# 为语音误识别，锌合金=星和井）：
+        #  - "#"/"*"：录音中按 #/* 表示丢弃该段，直接 ESC，不发 Enter/免责说明
+        #  - "0"：Vibe Coding 正常结束，Ctrl+D -> 括号说明 -> Enter
+        if args.last_digit in ("#", "*"):
+            print(
+                f"[{time.strftime('%H:%M:%S')}] 挂机: last_digit={args.last_digit!r} 取消标记，直接 ESC",
+                flush=True,
+            )
+            _send_connect()
+            time.sleep(0.5)
+            _send_esc()
+            return 0
         # Vibe Coding 会话只由按 0 发起（digit hook "connect"）；挂机时只有
         # last_digit == "0" 才需要发停止键，其它情况（按过 1/2 或没按键）
         # 直接跳过，避免误发 Cmd+D+Enter。

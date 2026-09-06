@@ -576,7 +576,7 @@ class SettingsDialog(QDialog):
         self.ivr_digit_text_edits: dict[str, QLineEdit] = {}
         self.ivr_digit_hook_edits: dict[str, QLineEdit] = {}
         self.ivr_exit_checkboxes: dict[str, QCheckBox] = {}
-        for row, digit in enumerate("1234567890", start=1):
+        for row, digit in enumerate("1234567890*#", start=1):
             digit_grid.addWidget(QLabel(digit), row, 0)
             text_edit = QLineEdit()
             text_edit.setPlaceholderText(tr("settings.ivr.text.ph"))

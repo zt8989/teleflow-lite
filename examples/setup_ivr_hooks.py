@@ -70,11 +70,16 @@ digit_hook = {
     "0": q(VENV_PY) + " " + q(CTRL_KEYS) + " connect" + CALL_ID_ARG,
     "1": q(VENV_PY) + " " + q(WEATHER) + CALL_ID_ARG,
     "2": "",
+    # 锌合金 = 星和井（* / #，语音常误为“锌合金”/“景”）：按 * 或 # 丢弃该段录音，直接 ESC
+    "*": q(VENV_PY) + " " + q(CTRL_KEYS) + " cancel" + CALL_ID_ARG,
+    "#": q(VENV_PY) + " " + q(CTRL_KEYS) + " cancel" + CALL_ID_ARG,
 }
 digit_text = {
     "0": "开始 Vibe Coding",
     "1": "查询宁波天气",
     "2": "查询待办事",
+    "*": "取消录音",
+    "#": "取消录音",
 }
 
 store = ConfigStore()
@@ -90,6 +95,6 @@ print("[setup_ivr_hooks] 已应用 IVR hook 配置：")
 print("  ivr_exit_digit :", repr(settings.ivr_exit_digit))
 print("  off_hook_cmd :", repr(off_hook_cmd))
 print("  on_hook_cmd  :", on_hook_cmd)
-for key in ("0", "1", "2"):
-    print(f"  digit[{key}] text :", repr(digit_text[key]))
-    print(f"  digit[{key}] hook :", repr(digit_hook[key]))
+for key in ("0", "1", "2", "*", "#"):
+    print(f"  digit[{key}] text :", repr(digit_text.get(key, "")))
+    print(f"  digit[{key}] hook :", repr(digit_hook.get(key, "")))

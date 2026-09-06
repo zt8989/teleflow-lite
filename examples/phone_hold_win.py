@@ -161,6 +161,27 @@ def _release(enter_delay: float = 1.0) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] >>> Enter 已发送 (delay={enter_delay}s)", flush=True)
 
 
+def _release_cancel() -> None:
+    """抬起 Ctrl+Win 后发送 ESC（用于 * / # 取消录音，星=*、景=井#）。"""
+    was_held = HOLD_MARK.exists()
+    user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+    time.sleep(0.02)
+    user32.keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0)
+    try:
+        HOLD_MARK.unlink(missing_ok=True)
+    except Exception:
+        pass
+    if was_held:
+        print(f"[{time.strftime('%H:%M:%S')}] >>> Ctrl+Win 已释放 (cancel)", flush=True)
+    else:
+        print(f"[{time.strftime('%H:%M:%S')}] >>> Ctrl+Win 释放（取消兜底）", flush=True)
+    VK_ESCAPE = 0x1B
+    time.sleep(0.15)
+    user32.keybd_event(VK_ESCAPE, 0, 0, 0)
+    user32.keybd_event(VK_ESCAPE, 0, KEYEVENTF_KEYUP, 0)
+    print(f"[{time.strftime('%H:%M:%S')}] >>> ESC 已发送（取消录音）", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Windows-only: 按 0 hold Ctrl+Win，挂断 release 并回车（不切 WorkBuddy 窗口）"
@@ -192,6 +213,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.action == "hold":
         _hold()
     elif args.action == "release":
+        # 星=*、景=井# 的取消：录音中按 */# 表示丢弃，直接 ESC，不发 Enter/免责说明
+        if args.last_digit in ("#", "*"):
+            print(
+                f"[{time.strftime('%H:%M:%S')}] 释放: last_digit={args.last_digit!r} 取消标记，直接 ESC",
+                flush=True,
+            )
+            _release_cancel()
+            return 0
         if args.last_digit != "0":
             print(
                 f"[{time.strftime('%H:%M:%S')}] 释放: last_digit={args.last_digit!r} != 0，跳过",

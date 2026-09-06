@@ -93,8 +93,8 @@ class Settings:
     # Inbound IVR (feature teleflow-call-ivr): after auto-answer, play a welcome
     # message then a per-digit-key menu, listen for the first DTMF key to fire
     # that key's command, and pass the last key to the on-hook command. Keys are
-    # the digit chars "1".."9","0" (1234567890 = all number keys, not an
-    # extension). _text maps a digit to its announcement; _hook maps a digit to
+    # the digit chars "1".."9","0","*","#" (1234567890*# = all telephone keys).
+    # _text maps a digit to its announcement; _hook maps a digit to
     # the command run when that digit is pressed (empty => skip).
     ivr_enabled: bool = True
     ivr_welcome: str = ""
