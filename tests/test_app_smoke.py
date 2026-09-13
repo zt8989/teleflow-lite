@@ -226,6 +226,8 @@ def test_settings_dialog_exposes_all_remaining_fields(tmp_path) -> None:
     app, window, service, manager, _ = _make_window(tmp_path)
     dialog = SettingsDialog(manager, window)
     dialog.sip_port.setText("5062")
+    dialog.sip_bind_address.setText("192.168.2.100")
+    dialog.sip_auto_start.setChecked(True)
     dialog.sip_auto_connect.setChecked(False)
     dialog.report_hangup_on_eof.setChecked(False)
     dialog.tts_cache_ttl_seconds.setValue(3600)
@@ -234,6 +236,8 @@ def test_settings_dialog_exposes_all_remaining_fields(tmp_path) -> None:
 
     reloaded = ConfigStore(tmp_path / "config.json").load()
     assert reloaded.sip_port == "5062"
+    assert reloaded.sip_bind_address == "192.168.2.100"
+    assert reloaded.sip_auto_start is True
     assert reloaded.sip_auto_connect is False
     assert reloaded.report_hangup_on_eof is False
     assert reloaded.tts_cache_ttl_seconds == 3600
@@ -247,8 +251,8 @@ def test_settings_language_selector_persists_and_switches_live(tmp_path) -> None
     from teleflow.i18n import get_language
 
     app, window, _, manager, _ = _make_window(tmp_path)
-    # Fixture starts us in zh_CN; the toggle action reads Chinese.
-    assert window._act_toggle_sip.text() == "启动 SIP 服务"
+    # Fixture starts us in zh_CN; the shared actions read Chinese.
+    assert window._act_start_sip.text() == "启动 SIP 服务"
 
     dialog = SettingsDialog(manager, window)
     idx = dialog._language_combo.findData("en")
@@ -258,8 +262,9 @@ def test_settings_language_selector_persists_and_switches_live(tmp_path) -> None
 
     reloaded = ConfigStore(tmp_path / "config.json").load()
     assert reloaded.language == "en"
-    # Live switch: the shared action now reads English.
-    assert window._act_toggle_sip.text() == "Start SIP Service"
+    # Live switch: the shared actions now read English.
+    assert window._act_start_sip.text() == "Start SIP Service"
+    assert window._act_start_all.text() == "Start All"
     assert get_language() == "en"
     window.close()
 
@@ -273,32 +278,102 @@ def test_dashboard_menu_uses_same_actions_as_tray(tmp_path) -> None:
     menu = dash._menu_btn.menu()
     assert menu is not None
     actions = menu.actions()
-    assert [a.text() for a in actions] == [
+    # Separators also show up in actions(); filter them to compare labels.
+    assert [a.text() for a in actions if not a.isSeparator()] == [
+        "一键启动",
         "启动 SIP 服务",
+        "启动连接网关",
+        "停止 SIP 服务",
         "显示窗口",
         "设置",
         "测试汇报",
         "退出",
     ]
     # Same QAction instances as the tray menu -> labels/state stay in sync.
-    assert actions[0] is window._act_toggle_sip
-    assert actions[4] is window._act_quit
+    assert actions[0] is window._act_start_all
+    assert window._tray.contextMenu() is not None
+    tray_actions = window._tray.contextMenu().actions()
+    assert [a.text() for a in tray_actions if not a.isSeparator()] == [
+        "一键启动",
+        "启动 SIP 服务",
+        "启动连接网关",
+        "停止 SIP 服务",
+        "显示窗口",
+        "设置",
+        "测试汇报",
+        "退出",
+    ]
+    assert tray_actions[0] is window._act_start_all
     window.close()
 
 
-def test_toggle_sip_persists_auto_connect_flag(tmp_path) -> None:
+def test_menu_actions_track_service_state(tmp_path) -> None:
+    """The three starts and the stop enable/disable as the service moves
+    between stopped, listen-only, and registered."""
     app, window, service, _, store = _make_window(tmp_path)
-    store.load().sip_auto_connect = False
-    store.save(store.load())
+    settings = store.load()
+    settings.sip_host = "192.168.2.100"
+    settings.sip_user = "1001"
+    store.save(settings)
 
-    window._toggle_sip()  # start
+    # Stopped: the starts are available, the stop is not.
+    assert not service.running
+    assert window._act_start_all.isEnabled()
+    assert window._act_start_sip.isEnabled()
+    assert window._act_connect_gateway.isEnabled()
+    assert not window._act_stop_sip.isEnabled()
+
+    # Listen-only start (直连模式): the stops/starts flip, and 连接网关 can
+    # still be used to register without restarting the transport.
+    window._start_sip_only()
     assert service.running
-    assert store.load().sip_auto_connect is True
+    assert not service.register_requested
+    assert not window._act_start_all.isEnabled()
+    assert not window._act_start_sip.isEnabled()
+    assert window._act_stop_sip.isEnabled()
+    assert window._act_connect_gateway.isEnabled()
 
-    window._toggle_sip()  # stop (async: libDestroy runs off the GUI thread)
+    # 连接网关 asks the backend to REGISTER on the live transport.
+    window._connect_gateway()
+    assert service._backend.connect_calls == 1
+    assert service.register_requested
+    assert window._act_connect_gateway.isEnabled()  # still pending
+
+    # Registered -> the connect action disables itself.
+    service._backend.receive_register("sip:1001@192.168.2.100")
+    assert service.is_registered
+    assert not window._act_connect_gateway.isEnabled()
+
+    # Stop re-enables the starts.
+    window._stop_sip_async()
+    _drain_async_stop(window)
+    assert not service.running
+    assert window._act_start_all.isEnabled()
+    assert window._act_start_sip.isEnabled()
+    assert not window._act_stop_sip.isEnabled()
+    window.close()
+
+
+def test_start_does_not_rewrite_launch_preferences(tmp_path) -> None:
+    """``sip_auto_start`` / ``sip_auto_connect`` are user preferences (settings
+    dialog), not a mirror of the transient running state: manual start/stop
+    must not touch them, so an explicit uncheck survives later manual starts."""
+    app, window, service, _, store = _make_window(tmp_path)
+    settings = store.load()
+    settings.sip_auto_start = False
+    settings.sip_auto_connect = False
+    store.save(settings)
+
+    window._start_all()  # start
+    assert service.running
+    assert store.load().sip_auto_connect is False
+    assert store.load().sip_auto_start is False
+
+    window._stop_sip_async()  # stop (async: libDestroy runs off the GUI thread)
     _drain_async_stop(window)
     assert not service.running
     assert store.load().sip_auto_connect is False
+    assert store.load().sip_auto_start is False
     window.close()
 
 
@@ -310,7 +385,7 @@ def _drain_async_stop(window) -> None:
     QApplication.processEvents()
 
 
-def test_toggle_sip_start_updates_registration_status(tmp_path) -> None:
+def test_one_click_start_updates_registration_status(tmp_path) -> None:
     """Starting the SIP service should immediately show 'registering' in the
     gateway-registration dashboard card (not leave the stale 'unregistered'
     from the previous stop)."""
@@ -322,8 +397,8 @@ def test_toggle_sip_start_updates_registration_status(tmp_path) -> None:
     # Initial state is unregistered.
     assert "未注册" in reg_label.text()
 
-    # Start the SIP service — registration should show as in-progress.
-    window._toggle_sip()
+    # One-click start (一键启动) — registration should show as in-progress.
+    window._start_all()
     assert service.running
     assert "注册中" in reg_label.text()
 
@@ -334,12 +409,10 @@ def test_toggle_sip_start_updates_registration_status(tmp_path) -> None:
     window.close()
 
 
-# --- launch-time auto-connect (maybe_auto_start_sip) ---
+# --- launch-time auto start / auto connect (maybe_auto_start_sip) ---
 
 
-def test_auto_start_connects_when_config_complete(
-    tmp_path, monkeypatch
-) -> None:
+def test_auto_start_connects_when_config_complete(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("teleflow.sip._udp_port_available", lambda port: True)
     store = ConfigStore(tmp_path / "config.json")
     settings = store.load()
@@ -354,10 +427,15 @@ def test_auto_start_connects_when_config_complete(
 
     assert started is True
     assert service.running
+    assert service.register_requested  # 连接网关 was asked for
     assert store.load().sip_auto_connect is True
+    assert store.load().sip_auto_start is True
 
 
-def test_auto_start_stays_stopped_on_incomplete_config(tmp_path) -> None:
+def test_auto_start_starts_listen_only_on_incomplete_config(tmp_path) -> None:
+    """An incomplete gateway config must not stop the local service: it starts
+    listen-only (so a direct-IP ATA can still reach it) and the user's flags
+    are left untouched for the next launch."""
     store = ConfigStore(tmp_path / "config.json")
     settings = store.load()
     settings.sip_host = "192.168.1.189"  # no sip_user
@@ -367,15 +445,32 @@ def test_auto_start_stays_stopped_on_incomplete_config(tmp_path) -> None:
     log = []
     started = maybe_auto_start_sip(service, store, log.append)
 
-    assert started is False
-    assert not service.running
-    assert store.load().sip_auto_connect is False
+    assert started is True
+    assert service.running
+    assert not service.register_requested
+    assert store.load().sip_auto_connect is True  # preference preserved
     assert any("gateway config incomplete" in line for line in log)
 
 
-def test_auto_start_falls_back_to_stopped_on_startup_error(
-    tmp_path, monkeypatch
-) -> None:
+def test_auto_start_listen_only_when_gateway_connect_disabled(tmp_path) -> None:
+    store = ConfigStore(tmp_path / "config.json")
+    settings = store.load()
+    settings.sip_host = "192.168.1.189"
+    settings.sip_user = "1002"
+    settings.sip_auto_start = True
+    settings.sip_auto_connect = False
+    store.save(settings)
+
+    service = SipCoreService(FakeSipBackend(), store)
+    started = maybe_auto_start_sip(service, store, lambda line: None)
+
+    assert started is True
+    assert service.running
+    assert not service.register_requested
+    assert store.load().sip_auto_connect is False
+
+
+def test_auto_start_stays_stopped_on_startup_error(tmp_path, monkeypatch) -> None:
     store = ConfigStore(tmp_path / "config.json")
     settings = store.load()
     settings.sip_host = "192.168.1.189"
@@ -384,7 +479,7 @@ def test_auto_start_falls_back_to_stopped_on_startup_error(
 
     service = SipCoreService(FakeSipBackend(), store)
 
-    def _boom() -> None:
+    def _boom(**kwargs: object) -> None:
         raise RuntimeError("no free port")
 
     monkeypatch.setattr(service, "start", _boom)
@@ -393,15 +488,17 @@ def test_auto_start_falls_back_to_stopped_on_startup_error(
 
     assert started is False
     assert not service.running
-    assert store.load().sip_auto_connect is False
-    assert any("auto-connect gateway failed" in line for line in log)
+    # A transient startup failure must not clear the user's preference.
+    assert store.load().sip_auto_connect is True
+    assert any("auto-start failed" in line for line in log)
 
 
-def test_auto_start_respects_disabled_flag(tmp_path) -> None:
+def test_auto_start_respects_disabled_flags(tmp_path) -> None:
     store = ConfigStore(tmp_path / "config.json")
     settings = store.load()
     settings.sip_host = "192.168.1.189"
     settings.sip_user = "1002"
+    settings.sip_auto_start = False
     settings.sip_auto_connect = False
     store.save(settings)
 
@@ -410,6 +507,7 @@ def test_auto_start_respects_disabled_flag(tmp_path) -> None:
 
     assert started is False
     assert not service.running
+
 
 # --- async test-report handoff (GUI slot after background synthesis) ---
 

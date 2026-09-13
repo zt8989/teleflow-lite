@@ -388,13 +388,17 @@ class DashboardWidget(QWidget):
         )
         self._set_stat_value(self._reg_stat, text)
 
-    def set_service_menu(self, actions: list[QAction]) -> None:
+    def set_service_menu(self, actions: list[QAction | None]) -> None:
         """Attach the service menu to the top button. ``actions`` are the same
         QAction instances shown in the system-tray menu, so both menus stay in
-        sync (labels, enabled state, triggers)."""
+        sync (labels, enabled state, triggers). A ``None`` entry inserts a
+        separator, letting one shared list drive both menus identically."""
         menu = QMenu(self._menu_btn)
         for action in actions:
-            menu.addAction(action)
+            if action is None:
+                menu.addSeparator()
+            else:
+                menu.addAction(action)
         self._menu_btn.setMenu(menu)
 
     def set_call_state(self, state: CallState) -> None:
@@ -536,6 +540,19 @@ class SettingsDialog(QDialog):
         port_row.addWidget(self.sip_port)
         port_row.addStretch()
         al.addLayout(port_row)
+        # 本地监听地址（选填）: 多网卡机器上必须先钉死，否则 pjsua2 可能发布到
+        # 拨号方路由不到的网卡（WSL/虚拟网卡），入呼直接变忙音。
+        bind_row = QHBoxLayout()
+        bind_row.setSpacing(6)
+        bind_row.addWidget(self._lbl("settings.bind_address"))
+        self.sip_bind_address = QLineEdit()
+        self.sip_bind_address.setPlaceholderText(tr("settings.bind_address.ph"))
+        bind_row.addWidget(self.sip_bind_address)
+        bind_row.addStretch()
+        al.addLayout(bind_row)
+        # 两个独立的启动偏好：先起本地服务（仅监听），再决定是否向网关注册。
+        self.sip_auto_start = self._chk("settings.auto_start_sip")
+        al.addWidget(self.sip_auto_start)
         self.sip_auto_connect = self._chk("settings.auto_connect")
         al.addWidget(self.sip_auto_connect)
         al.addStretch()
@@ -740,6 +757,8 @@ class SettingsDialog(QDialog):
         self.sip_user.setText(settings.sip_user)
         self.sip_password.setText(settings.sip_password)
         self.sip_port.setText(settings.sip_port)
+        self.sip_bind_address.setText(settings.sip_bind_address)
+        self.sip_auto_start.setChecked(settings.sip_auto_start)
         self.sip_auto_connect.setChecked(settings.sip_auto_connect)
         self.off_hook_cmd.setText(settings.off_hook_cmd)
         self.on_hook_cmd.setText(settings.on_hook_cmd)
@@ -779,6 +798,8 @@ class SettingsDialog(QDialog):
         settings.sip_user = self.sip_user.text().strip()
         settings.sip_password = self.sip_password.text()
         settings.sip_port = self.sip_port.text().strip()
+        settings.sip_bind_address = self.sip_bind_address.text().strip()
+        settings.sip_auto_start = self.sip_auto_start.isChecked()
         settings.sip_auto_connect = self.sip_auto_connect.isChecked()
         settings.off_hook_cmd = self.off_hook_cmd.text().strip()
         settings.on_hook_cmd = self.on_hook_cmd.text().strip()
@@ -1002,15 +1023,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.dashboard)
 
         self._build_service_actions()
-        self.dashboard.set_service_menu(
-            [
-                self._act_toggle_sip,
-                self._act_show,
-                self._act_settings,
-                self._act_report,
-                self._act_quit,
-            ]
-        )
+        self.dashboard.set_service_menu(self._service_menu_actions())
         self._setup_tray()
         self._wire_service()
         register_on_change(self._retranslate_all)
@@ -1072,9 +1085,20 @@ class MainWindow(QMainWindow):
 
     def _build_service_actions(self) -> None:
         """One set of QActions shared by the dashboard menu and the system-tray
-        menu, so both always show the same items in the same state."""
-        self._act_toggle_sip = QAction(self)
-        self._act_toggle_sip.triggered.connect(self._toggle_sip)
+        menu, so both always show the same items in the same state.
+
+        The single old start/stop toggle is split into three explicit starts
+        (一键启动 / 启动 SIP 服务 / 启动连接网关) so a direct-IP setup can listen
+        without touching a registrar, plus an explicit stop.
+        """
+        self._act_start_all = QAction(self)
+        self._act_start_all.triggered.connect(self._start_all)
+        self._act_start_sip = QAction(self)
+        self._act_start_sip.triggered.connect(self._start_sip_only)
+        self._act_connect_gateway = QAction(self)
+        self._act_connect_gateway.triggered.connect(self._connect_gateway)
+        self._act_stop_sip = QAction(self)
+        self._act_stop_sip.triggered.connect(self._stop_sip_async)
         self._act_show = QAction(self)
         self._act_show.triggered.connect(self.show_window)
         self._act_settings = QAction(self)
@@ -1085,12 +1109,39 @@ class MainWindow(QMainWindow):
         self._act_quit.triggered.connect(self.quit_app)
         self._update_action_texts()
 
+    def _service_menu_actions(self) -> list[QAction | None]:
+        """The shared menu layout (``None`` = separator) for both menus."""
+        return [
+            self._act_start_all,
+            self._act_start_sip,
+            self._act_connect_gateway,
+            None,
+            self._act_stop_sip,
+            None,
+            self._act_show,
+            self._act_settings,
+            self._act_report,
+            None,
+            self._act_quit,
+        ]
+
     def _update_action_texts(self) -> None:
-        """Re-bind the shared menu/tray action labels (toggle label tracks state)."""
+        """Re-bind the shared menu/tray action labels and enabled state.
+
+        Each entry is enabled only when it can actually do something: the three
+        starts need the service stopped (or, for 连接网关, at least not already
+        registered), the stop needs it running.
+        """
         running = self._service.running
-        self._act_toggle_sip.setText(
-            tr("action.toggle_sip.stop" if running else "action.toggle_sip.start")
-        )
+        registered = self._service.is_registered
+        self._act_start_all.setText(tr("action.start_all"))
+        self._act_start_all.setEnabled(not running)
+        self._act_start_sip.setText(tr("action.start_sip"))
+        self._act_start_sip.setEnabled(not running)
+        self._act_connect_gateway.setText(tr("action.connect_gateway"))
+        self._act_connect_gateway.setEnabled(not registered)
+        self._act_stop_sip.setText(tr("action.stop_sip"))
+        self._act_stop_sip.setEnabled(running)
         self._act_show.setText(tr("action.show"))
         self._act_settings.setText(tr("action.settings"))
         self._act_report.setText(tr("action.test_report"))
@@ -1115,13 +1166,12 @@ class MainWindow(QMainWindow):
         self._tray = QSystemTrayIcon(self)
         self._tray.setIcon(_load_tray_icon())
         menu = QMenu()
-        menu.addAction(self._act_toggle_sip)
-        menu.addAction(self._act_show)
-        menu.addAction(self._act_settings)
-        menu.addAction(self._act_report)
-        menu.addSeparator()
-        menu.addAction(self._act_quit)
-        self._tray_sip = self._act_toggle_sip
+        for action in self._service_menu_actions():
+            if action is None:
+                menu.addSeparator()
+            else:
+                menu.addAction(action)
+        self._tray_sip = self._act_stop_sip
         self._tray.setContextMenu(menu)
         self._tray.activated.connect(
             lambda reason: self.show_window()
@@ -1268,18 +1318,20 @@ class MainWindow(QMainWindow):
         # dashboard widgets there crashes Qt (Qt6Gui.dll access violation).
         svc.on(EVENT_SIP_STARTED, lambda: self.gui(self._sync_sip_button))
         svc.on(EVENT_SIP_STOPPED, lambda: self.gui(self._sync_sip_button))
+        # Registration transitions also re-bind the shared actions: 启动连接网关
+        # is enabled exactly while a REGISTER is still wanted (not registered).
         svc.on(
             EVENT_SIP_REGISTERED,
-            lambda contact: self.gui(lambda: self.dashboard.set_sip_registration("registered")),
+            lambda contact: self.gui(self._on_registered_change),
         )
         svc.on(
             EVENT_SIP_UNREGISTERED,
-            lambda: self.gui(lambda: self.dashboard.set_sip_registration("unregistered")),
+            lambda: self.gui(self._on_registered_change),
         )
         svc.on(
             EVENT_SIP_REGISTER_FAILED,
             lambda code, reason: self.gui(
-                lambda: self.dashboard.set_sip_registration("failed", code if code else None)
+                lambda: self._on_register_failed(code if code else None)
             ),
         )
         svc.on(
@@ -1323,19 +1375,45 @@ class MainWindow(QMainWindow):
         self.dashboard.set_test_report_callback(self._test_report)
         self._sync_sip_button()
 
-    def _toggle_sip(self) -> None:
+    def _start_all(self) -> None:
+        """一键启动: bring the local SIP service up and register to the gateway."""
+        self._start_service(connect=True)
+
+    def _start_sip_only(self) -> None:
+        """启动 SIP 服务: listen only — bind the transport without registering.
+
+        This is the direct-IP mode (an ATA dialling sip:<user>@<this-host>:5060)
+        and the "start first, connect later" half of the menu.
+        """
+        self._start_service(connect=False)
+
+    def _start_service(self, *, connect: bool) -> None:
         if self._service.running:
-            self._stop_sip_async()
+            if connect:
+                self._connect_gateway()
             return
         try:
-            self._service.start()
+            self._service.start(register=connect)
         except Exception as exc:  # noqa: BLE001 - surface startup failures
             self.append_log_line(f"[SIP] start failed: {exc}")
             self._sync_sip_button()
             return
-        # Remember the service state so the next launch restores it: started =>
-        # auto-connect on launch, stopped => stay stopped ("记录上次状态").
-        self._save_auto_connect()
+        # NOTE: intentionally NOT persisting ``sip_auto_connect`` /
+        # ``sip_auto_start`` here. Both are *user preferences* owned by the
+        # settings dialog; mirroring the transient running state onto them made
+        # an explicit uncheck silently revert on the next manual start.
+        self._sync_sip_button()
+
+    def _connect_gateway(self) -> None:
+        """启动连接网关: REGISTER to the gateway (starting the service first if
+        it is not up yet, so one click is enough from a cold start)."""
+        if not self._service.running:
+            self._start_service(connect=True)
+            return
+        try:
+            self._service.connect_gateway()
+        except Exception as exc:  # noqa: BLE001 - surface connect failures
+            self.append_log_line(f"[SIP] connect gateway failed: {exc}")
         self._sync_sip_button()
 
     def _stop_sip_async(self) -> None:
@@ -1349,7 +1427,9 @@ class MainWindow(QMainWindow):
         """
         if self._stop_thread is not None and self._stop_thread.is_alive():
             return  # a stop is already in flight; ignore re-clicks
-        self._act_toggle_sip.setEnabled(False)
+        if not self._service.running:
+            return
+        self._act_stop_sip.setEnabled(False)
 
         def worker() -> None:
             try:
@@ -1367,25 +1447,32 @@ class MainWindow(QMainWindow):
 
     def _stop_sip_done(self) -> None:
         self._stop_thread = None
-        # Persist the now-stopped state even during app teardown (no widgets
-        # touched below the closingDown guard).
-        self._save_auto_connect()
+        # ``sip_auto_connect`` / ``sip_auto_start`` stay pure user preferences:
+        # a manual stop does not rewrite them (see the start-path NOTE in
+        # ``_start_service``).
         if QApplication.closingDown():
             return
-        self._act_toggle_sip.setEnabled(True)
         self._sync_sip_button()
 
-    def _save_auto_connect(self) -> None:
-        settings = self._store.load()
-        settings.sip_auto_connect = self._service.running
-        self._store.save(settings)
+    def _on_registered_change(self) -> None:
+        """The gateway REGISTER state flipped (200 OK / expired unregister)."""
+        state = "registered" if self._service.is_registered else "unregistered"
+        self.dashboard.set_sip_registration(state)
+        self._update_action_texts()
+
+    def _on_register_failed(self, code: int | None) -> None:
+        self.dashboard.set_sip_registration("failed", code)
+        self._update_action_texts()
 
     def _sync_sip_button(self) -> None:
         running = self._service.running
         self.dashboard.set_sip_running(running)
-        if running:
-            self.dashboard.set_sip_registration("registering")
-        else:
+        if running and not self._service.is_registered:
+            # A listen-only session (启动 SIP 服务 / 直连) has no REGISTER in
+            # flight; only a connect-mode session shows 注册中.
+            state = "registering" if self._service.register_requested else "unregistered"
+            self.dashboard.set_sip_registration(state)
+        elif not running:
             self.dashboard.set_sip_registration("unregistered")
         self._update_action_texts()
 
@@ -1464,29 +1551,36 @@ def maybe_auto_start_sip(
     store: ConfigStore,
     log: Callable[[str], None],
 ) -> bool:
-    """Auto-connect the gateway on launch, restoring the last service state.
+    """Bring the service up on launch, honoring the two user preferences.
 
-    Starts the SIP service when the persisted ``sip_auto_connect`` flag is set
-    and the gateway config is complete (server + user). On an incomplete
-    config or a startup exception the service stays stopped and the flag is
-    persisted as False so the next launch doesn't retry the same failure.
+    ``sip_auto_connect`` (连接网关) implies ``sip_auto_start``: a REGISTER is
+    only possible once the local transport is up. So:
+
+    * connect on + gateway config complete  -> start and REGISTER
+    * connect on + config incomplete        -> start listen-only + warn
+    * connect off + start on                -> start listen-only
+    * both off                              -> leave the service stopped
+
+    Neither flag is rewritten here: they are user preferences, and clearing one
+    because of a transient failure (or an incomplete config) would silently
+    undo an explicit choice on the next launch.
 
     Returns whether the service was (asked to be) started.
     """
     settings = store.load()
-    if not settings.sip_auto_connect:
+    complete = bool(settings.sip_host and settings.sip_user)
+    connect = bool(settings.sip_auto_connect and complete)
+    if not (connect or settings.sip_auto_start):
         return False
-    if not (settings.sip_host and settings.sip_user):
-        settings.sip_auto_connect = False
-        store.save(settings)
-        log("[SIP] gateway config incomplete; not auto-connecting. Complete SIP account settings first.")
-        return False
+    if settings.sip_auto_connect and not complete:
+        log(
+            "[SIP] gateway config incomplete (need address + extension); "
+            "starting the SIP service without registering."
+        )
     try:
-        service.start()
+        service.start(register=connect)
     except Exception as exc:  # noqa: BLE001 - startup failures must not crash the app
-        settings.sip_auto_connect = False
-        store.save(settings)
-        log(f"[SIP] auto-connect gateway failed: {exc}")
+        log(f"[SIP] auto-start failed: {exc}")
         return False
     return True
 
@@ -1654,8 +1748,9 @@ def build_app(
     else:
         window.show()
 
-    # Restore the last service state: auto-connect the gateway on launch when
-    # the config is complete; a failed or incomplete auto-start stays stopped.
+    # Honor the launch preferences: auto-start the local SIP service and/or
+    # auto-connect the gateway (see maybe_auto_start_sip). Neither flag is
+    # rewritten; an incomplete gateway config degrades to listen-only.
     maybe_auto_start_sip(service, store, window.append_log_line)
 
     return app

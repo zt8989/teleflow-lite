@@ -61,7 +61,15 @@ def test_sip_client_fields_default_on_fresh_file(tmp_path: Path) -> None:
     assert settings.sip_server_port == 5060
     assert settings.sip_user == ""
     assert settings.sip_password == ""
+    assert settings.sip_auto_start is True  # auto-start local SIP on launch
     assert settings.sip_auto_connect is True  # auto-connect gateway on launch
+    assert settings.sip_bind_address == ""  # "" = derive from the gateway host
+
+
+def test_sip_bind_address_round_trips(tmp_path: Path) -> None:
+    store = ConfigStore(tmp_path / "config.json")
+    store.save(Settings(sip_bind_address="192.168.2.100"))
+    assert store.load().sip_bind_address == "192.168.2.100"
 
 
 def test_sip_auto_connect_round_trips(tmp_path: Path) -> None:
@@ -70,6 +78,51 @@ def test_sip_auto_connect_round_trips(tmp_path: Path) -> None:
     assert store.load().sip_auto_connect is False
     store.save(Settings(sip_auto_connect=True))
     assert store.load().sip_auto_connect is True
+
+
+def test_sip_auto_start_round_trips_independently(tmp_path: Path) -> None:
+    """The two launch preferences are independent: listen-only and
+    connect-on-launch can be toggled separately."""
+    store = ConfigStore(tmp_path / "config.json")
+    store.save(Settings(sip_auto_start=False, sip_auto_connect=True))
+    reloaded = store.load()
+    assert reloaded.sip_auto_start is False
+    assert reloaded.sip_auto_connect is True
+
+    store.save(Settings(sip_auto_start=True, sip_auto_connect=False))
+    reloaded = store.load()
+    assert reloaded.sip_auto_start is True
+    assert reloaded.sip_auto_connect is False
+
+
+def test_load_tolerates_utf8_bom(tmp_path: Path) -> None:
+    """PowerShell 5.1 ``Set-Content -Encoding utf8`` writes a BOM; loading must
+    not fail (which would silently fall back to defaults and let the next
+    save wipe the user's config)."""
+    path = tmp_path / "config.json"
+    path.write_bytes(
+        b"\xef\xbb\xbf" + b'{"sip_host": "1.2.3.4", "sip_user": "1001"}'
+    )
+    loaded = ConfigStore(path).load()
+    assert loaded.sip_host == "1.2.3.4"
+    assert loaded.sip_user == "1001"
+
+
+def test_corrupt_file_is_parked_not_silently_replaced(tmp_path: Path) -> None:
+    """An unparseable config must fall back to defaults for the running app,
+    but the broken file itself is preserved as config.json.corrupt-<ts> so the
+    user's data is recoverable instead of being overwritten by the next save."""
+    path = tmp_path / "config.json"
+    path.write_text('{"sip_host": "1.2.3.4", "sip_use', encoding="utf-8")  # truncated
+    store = ConfigStore(path)
+    settings = store.load()
+    assert settings.sip_host == ""  # defaults for the running app
+    parked = list(tmp_path.glob("config.json.corrupt-*"))
+    assert len(parked) == 1
+    assert "sip_host" in parked[0].read_text(encoding="utf-8")
+    # The next save starts clean instead of racing the broken file.
+    store.save(Settings(sip_host="2.3.4.5"))
+    assert store.load().sip_host == "2.3.4.5"
 
 
 def test_old_file_without_new_fields_uses_defaults(tmp_path: Path) -> None:

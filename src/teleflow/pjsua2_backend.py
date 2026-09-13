@@ -573,13 +573,28 @@ class Pjsua2Backend:
             except Exception:  # noqa: BLE001 - best-effort; downstream still bridges
                 pass
 
-    def start(self, port: int, handler: Callable[[str, dict], None]) -> None:  # pragma: no cover
+    def start(  # pragma: no cover
+        self,
+        port: int,
+        handler: Callable[[str, dict], None],
+        *,
+        register: bool = True,
+        bind_address: str = "",
+    ) -> None:
         self._handler = handler
         self._ensure_lib()
         self._apply_route()
 
         tcfg = self._pj.TransportConfig()
         tcfg.port = port
+        # Pin the local address instead of letting pjlib pick one. On a host
+        # with several adapters pjlib published an arbitrary one (the WSL
+        # vEthernet, 192.168.1.189, on the dev box), so the Contact and SDP of
+        # every answer pointed somewhere the caller could not route to — the
+        # desk phone just played fast-busy. Binding the transport here also
+        # fixes the media address, since SDP advertises this same socket.
+        if bind_address:
+            tcfg.boundAddress = bind_address
         self._transport = self._ep.transportCreate(
             self._pj.PJSIP_TRANSPORT_UDP, tcfg
         )
@@ -625,30 +640,71 @@ class Pjsua2Backend:
         for idx, user in enumerate(users):
             acc_cfg = self._pj.AccountConfig()
             acc_cfg.idUri = f"sip:{user}@{host}"
-            # isDefault ensures unmatched R-URIs (derived suffixes) are still
-            # delivered to the primary when the gateway preserves the original
-            # To (common for suffix aliasing without separate REGISTER).
-            try:
-                acc_cfg.isDefault = idx == 0
-            except AttributeError:
-                pass
+            if bind_address:
+                # Media has its own socket, and pjlib resolves *its* local
+                # address independently of the SIP transport — binding only
+                # the transport still left SDP advertising the wrong adapter
+                # (observed: Contact 192.168.2.100 but `c=IN IP4 192.168.1.189`,
+                # i.e. signalling fine and RTP sent into the void: the classic
+                # "能接通但没声音"). ``rtpConfig`` in the C API is exposed here
+                # as ``mediaConfig.transportConfig``; port 0 keeps the random
+                # port choice, only the address is pinned.
+                acc_cfg.mediaConfig.transportConfig.boundAddress = bind_address
+            # NOTE: pjsua2's AccountConfig has NO ``isDefault`` attribute —
+            # default-ness is the ``make_default`` arg of ``Account.create``.
+            # Setting it on the config silently raises AttributeError and used
+            # to be swallowed by a try/except, so unmatched inbound INVITEs
+            # (direct-IP dial without REGISTER) died with "No available
+            # account" -> 480. Passing make_default here restores the
+            # fallback: unmatched R-URIs (derived suffixes like 10010/10011,
+            # or a gateway that preserves the original To) still arrive at
+            # the primary account even when it is not registered.
             if settings.sip_host:
+                # The registrar is always configured (so a later
+                # ``connect()``/setRegistration(True) has a target), but the
+                # initial REGISTER only happens for a connect-mode start —
+                # ``register=False`` is the listen-only "启动 SIP 服务" path
+                # used for direct-IP dialling.
                 acc_cfg.regConfig.registrarUri = _registrar_uri(
                     settings.sip_host, settings.sip_server_port
                 )
-                acc_cfg.regConfig.register = True
+                # NOTE: the field is ``registerOnAdd`` (default True). Writing
+                # ``regConfig.register`` — as this code used to — is silently
+                # accepted as a *plain Python attribute* on the SWIG wrapper
+                # and never reaches pjsua2, so registration only ever happened
+                # because of the default. Set the real field explicitly, or a
+                # listen-only start would still REGISTER.
+                acc_cfg.regConfig.registerOnAdd = bool(register)
                 if user:
                     cred = self._pj.AuthCredInfo(
                         "digest", "*", user, 0, settings.sip_password
                     )
                     acc_cfg.sipConfig.authCreds.append(cred)
             acc = self._account_cls()
-            acc.create(acc_cfg)
+            acc.create(acc_cfg, idx == 0)
             self._accounts.append(acc)
         # Keep _account as primary for outbound call helpers (place_call etc.)
         self._account = self._accounts[0] if self._accounts else None
         self.port = port
         self.running = True
+
+    def connect(self) -> None:  # pragma: no cover
+        """REGISTER the already-created account(s) to the configured gateway.
+
+        Used by "启动连接网关": the transport is already up (possibly started
+        listen-only), so this only flips registration on. pjsua2 API calls made
+        from a non-pjlib thread must register that thread first (same reason as
+        ``stop``), otherwise the first internal log line aborts the process.
+        """
+        try:
+            self._ep.libRegisterThread("sip-connect")
+        except Exception:  # noqa: BLE001 - already-registered is a no-op
+            pass
+        for acc in self._accounts:
+            try:
+                acc.setRegistration(True)
+            except Exception:  # noqa: BLE001 - surface via onRegState instead
+                pass
 
     def stop(self) -> None:  # pragma: no cover
         if self._lib_created:

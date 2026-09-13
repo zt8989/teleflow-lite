@@ -34,6 +34,19 @@ def _free_udp_ports(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("teleflow.sip._udp_port_available", lambda port: True)
 
 
+@pytest.fixture(autouse=True)
+def _no_local_ip_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the bind-address derivation host-independent.
+
+    ``resolve_bind_address`` asks the OS routing table which local address
+    reaches the gateway. On a developer box that legitimately answers with a
+    real NIC while on CI it may answer nothing, so default it to "no answer"
+    (bind everything, pjlib's choice) and let the tests that care inject their
+    own probe.
+    """
+    monkeypatch.setattr("teleflow.sip._local_ip_toward", lambda host, port: None)
+
+
 def _service(tmp_path):
     store = ConfigStore(tmp_path / "config.json")
     backend = FakeSipBackend()
@@ -178,6 +191,61 @@ def test_configured_occupied_port_emits_conflict_and_falls_back(
     assert svc.running
 
 
+def test_bind_address_is_derived_from_gateway_host(tmp_path, monkeypatch) -> None:
+    """Multi-homed host: the transport must bind the address that reaches the
+    gateway, not whichever adapter pjlib would pick (that bug made inbound
+    calls ring as fast-busy)."""
+    calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        "teleflow.sip._local_ip_toward",
+        lambda host, port: calls.append((host, port)) or "192.168.2.100",
+    )
+    store = ConfigStore(tmp_path / "config.json")
+    settings = store.load()
+    settings.sip_host = "192.168.2.218"
+    store.save(settings)
+
+    backend = FakeSipBackend()
+    svc = SipCoreService(backend, store)
+    lines: list[str] = []
+    svc._log = lines.append
+
+    svc.start(register=False)
+
+    assert calls == [("192.168.2.218", 5060)]
+    assert backend.bind_address == "192.168.2.100"
+    assert any("本地监听地址 192.168.2.100" in line for line in lines)
+
+
+def test_explicit_bind_address_wins_over_derivation(tmp_path, monkeypatch) -> None:
+    def _boom(host: str, port: int) -> str:
+        raise AssertionError("explicit setting must not trigger a route probe")
+
+    monkeypatch.setattr("teleflow.sip._local_ip_toward", _boom)
+    store = ConfigStore(tmp_path / "config.json")
+    settings = store.load()
+    settings.sip_host = "192.168.2.218"
+    settings.sip_bind_address = "192.168.2.100:5099"
+    store.save(settings)
+
+    backend = FakeSipBackend()
+    svc = SipCoreService(backend, store)
+    svc.start(register=False)
+
+    # Only the address part matters; the transport port comes from sip_port.
+    assert backend.bind_address == "192.168.2.100"
+
+
+def test_bind_address_empty_without_gateway(tmp_path) -> None:
+    """No gateway configured -> nothing to derive; the transport binds wildcard
+    (correct on a single-NIC machine)."""
+    store = ConfigStore(tmp_path / "config.json")
+    backend = FakeSipBackend()
+    svc = SipCoreService(backend, store)
+    svc.start(register=False)
+    assert backend.bind_address == ""
+
+
 def test_configured_free_port_does_not_emit_conflict(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("teleflow.sip._udp_port_available", lambda port: True)
     store = ConfigStore(tmp_path / "config.json")
@@ -197,6 +265,77 @@ def test_configured_free_port_does_not_emit_conflict(tmp_path, monkeypatch) -> N
 
     assert backend.port == 5070
     assert conflicts == []
+
+
+# --- listen-only start (启动 SIP 服务) vs gateway connect (启动连接网关) ---
+
+
+def test_start_listen_only_does_not_register(tmp_path) -> None:
+    """``start(register=False)`` brings the UA up without asking the gateway to
+    REGISTER — the direct-IP mode where the ATA dials this endpoint by IP."""
+    svc, backend = _service(tmp_path)
+
+    svc.start(register=False)
+
+    assert svc.running
+    assert backend.register_requests == 0
+    assert not svc.register_requested
+    assert not svc.is_registered
+
+
+def test_default_start_registers(tmp_path) -> None:
+    svc, backend = _service(tmp_path)
+
+    svc.start()
+
+    assert backend.register_requests == 1
+    assert svc.register_requested
+
+
+def test_connect_gateway_registers_a_listening_service(tmp_path) -> None:
+    store = ConfigStore(tmp_path / "config.json")
+    settings = store.load()
+    settings.sip_host = "192.168.2.100"
+    settings.sip_user = "1001"
+    store.save(settings)
+    backend = FakeSipBackend()
+    svc = SipCoreService(backend, store)
+    registered: list[str] = []
+    svc.on(EVENT_SIP_REGISTERED, lambda contact: registered.append(contact))
+
+    svc.start(register=False)
+    assert not svc.register_requested
+
+    svc.connect_gateway()
+    assert backend.connect_calls == 1
+    assert svc.register_requested
+
+    backend.receive_register("sip:1001@192.168.2.100:5060")
+    assert registered == ["sip:1001@192.168.2.100:5060"]
+    assert svc.is_registered
+
+
+def test_connect_gateway_requires_a_running_service(tmp_path) -> None:
+    store = ConfigStore(tmp_path / "config.json")
+    settings = store.load()
+    settings.sip_host = "192.168.2.100"
+    settings.sip_user = "1001"
+    store.save(settings)
+    backend = FakeSipBackend()
+    svc = SipCoreService(backend, store)
+
+    with pytest.raises(RuntimeError, match="not running"):
+        svc.connect_gateway()
+    assert backend.connect_calls == 0
+
+
+def test_connect_gateway_requires_gateway_config(tmp_path) -> None:
+    svc, backend = _service(tmp_path)
+    svc.start(register=False)
+
+    with pytest.raises(RuntimeError, match="not configured"):
+        svc.connect_gateway()
+    assert backend.connect_calls == 0
 
 
 def test_udp_port_available_detects_occupied_and_released_port() -> None:

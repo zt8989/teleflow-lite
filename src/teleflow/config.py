@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime
 from pathlib import Path
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "teleflow" / "config.json"
@@ -59,6 +60,15 @@ class Settings:
     # non-empty value is a preferred port, honoured only when free; otherwise
     # the user is warned and a free port is picked automatically.
     sip_port: str = ""
+    # Local IPv4 the SIP transport binds to and advertises in Contact / SDP.
+    # Empty = derive it automatically (the address the OS routes ``sip_host``
+    # through; pjlib's own choice when no gateway is configured). This matters
+    # on multi-homed hosts — physical NIC + WSL vEthernet + VPN — where pjsua2
+    # otherwise publishes whichever adapter it happens to pick, and the peer
+    # then answers to an address it cannot route back to (call rings as
+    # "嘟嘟嘟" and never connects). An explicit value is also accepted as
+    # "ip" or "ip:port".
+    sip_bind_address: str = ""
     # SIP client account — TeleFlow registers to this gateway as this user.
     #   sip_host         — gateway domain or IP, e.g. "192.168.1.189".
     #   sip_server_port  — gateway SIP port (default 5060).
@@ -72,10 +82,19 @@ class Settings:
     capture_device_id: str = ""
     autostart: bool = False
     start_minimized: bool = False
-    # Whether the app auto-connects to the gateway on launch (starts the SIP
-    # service). Persisted on every manual start/stop so the next launch
-    # restores the last service state; auto-launch falls back to stopped when
-    # the config is incomplete or startup fails.
+    # Two independent launch-time preferences:
+    #   sip_auto_start   — bring the *local* SIP service up on launch (bind the
+    #                      transport and listen for inbound INVITEs). This is all
+    #                      a direct-IP setup (ATA dials sip:<user>@<my-ip>:5060)
+    #                      needs; no registrar involved.
+    #   sip_auto_connect — additionally REGISTER to the configured gateway
+    #                      (registrar). Implies sip_auto_start: registering is
+    #                      only possible once the local service is up.
+    # Both are pure user preferences owned by the settings dialog; a manual
+    # start/stop never rewrites them. Auto-launch degrades gracefully (start
+    # without registering when the gateway config is incomplete) instead of
+    # clearing them, so an explicit choice survives the next launch.
+    sip_auto_start: bool = True
     sip_auto_connect: bool = True
     log_level: str = "INFO"
     # UI language (ticket teleflow-i18n): "auto" resolves to the system language
@@ -266,10 +285,20 @@ class ConfigStore:
         if not self.path.exists():
             return Settings()
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            # ``utf-8-sig`` tolerates a UTF-8 BOM (e.g. hand-edits from
+            # PowerShell 5.1 ``Set-Content -Encoding utf8``, which always
+            # writes one); plain ``utf-8`` would raise on the BOM and — worse
+            # — the silent-defaults fallback below would then let the NEXT
+            # save persist defaults over the user's whole config.
+            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
         except (json.JSONDecodeError, OSError):
+            # Never let a corrupt file be silently replaced by defaults: park
+            # it aside (config.json.corrupt-<ts>) so the user's data can be
+            # recovered, then fall back to defaults.
+            self._park_corrupt_file()
             return Settings()
         if not isinstance(raw, dict):
+            self._park_corrupt_file()
             return Settings()
         known = {k: v for k, v in raw.items() if k in Settings.field_names()}
         # ``sip_port`` became optional ("" = auto-detect, ticket 01 of
@@ -317,6 +346,24 @@ class ConfigStore:
                     known["sip_password"] = raw[legacy]
                     break
         return Settings(**known)
+
+    def _park_corrupt_file(self) -> None:
+        """Move an unparseable config aside instead of leaving it in place.
+
+        Every caller that falls back to ``Settings()`` may later persist those
+        defaults via :meth:`save`, which would silently destroy the user's
+        data. Renaming the broken file to ``config.json.corrupt-<timestamp>``
+        keeps it recoverable while letting the next save start clean.
+        """
+        try:
+            if not self.path.exists():
+                return
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            parked = self.path.with_name(f"{self.path.name}.corrupt-{stamp}")
+            self.path.replace(parked)
+        except OSError:
+            # Best effort only — never block the load path on backup failure.
+            pass
 
     def save(self, settings: Settings) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

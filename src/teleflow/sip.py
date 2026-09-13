@@ -84,8 +84,30 @@ class SipBackend(Protocol):
     """Low-level SIP transport. Reports raw events to the handler the service
     registers, and answers/hangs up/places calls on demand."""
 
-    def start(self, port: int, handler: Callable[[str, dict], None]) -> None: ...
+    def start(
+        self,
+        port: int,
+        handler: Callable[[str, dict], None],
+        *,
+        register: bool = True,
+        bind_address: str = "",
+    ) -> None:
+        """Bind the transport and listen.
+
+        ``register=True`` additionally REGISTERs the account to the configured
+        gateway (registrar); ``register=False`` brings the local UA up without
+        touching the registrar — enough to receive direct-IP INVITEs. A later
+        :meth:`connect` can register without restarting the transport.
+
+        ``bind_address`` pins the local IPv4 to bind and advertise (see
+        :func:`resolve_bind_address`); "" lets the transport layer choose.
+        """
+        ...
+
     def stop(self) -> None: ...
+    def connect(self) -> None:
+        """REGISTER the (already started) account to the configured gateway."""
+        ...
     def answer(self, call_id: str) -> None: ...
     def hangup(self, call_id: str) -> None: ...
     def place_call(self, target: str) -> None: ...
@@ -199,6 +221,67 @@ def resolve_sip_port(
         if probe(candidate):
             return candidate, requested
     raise RuntimeError(f"没有可用的本地 UDP 端口 (扫描范围 {start}-{start + scan - 1})")
+
+
+def _local_ip_toward(host: str, port: int) -> str | None:
+    """The local IPv4 the OS would use to reach ``host:port``.
+
+    A UDP ``connect()`` sends nothing; it only asks the routing table which
+    source address applies, so this is a pure lookup. The answer is always one
+    of *this* machine's addresses, which is what makes it safe to bind to.
+    """
+    if not host:
+        return None
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(0.5)
+            sock.connect((host, port or 5060))
+            return str(sock.getsockname()[0])
+    except OSError:
+        return None
+
+
+def resolve_bind_address(
+    settings: Settings,
+    *,
+    probe: Callable[[str, int], str | None] | None = None,
+) -> str:
+    """Decide which local IPv4 the SIP transport binds and advertises.
+
+    Multi-homed Windows hosts are the reason this exists. With a physical NIC,
+    a WSL ``vEthernet`` adapter and a VPN all up, pjsua2 published
+    ``192.168.1.189`` (the WSL adapter) on a machine the desk phone reached at
+    ``192.168.2.100`` — so every inbound INVITE was answered with a Contact and
+    SDP pointing at an address the caller could not route to. The phone played
+    its "嘟嘟嘟" fast-busy and the call never connected, even though the
+    signalling port was open and reachable.
+
+    ``sip_bind_address`` wins when set (``"ip"`` or ``"ip:port"``; the port is
+    ignored — the transport port comes from :func:`resolve_sip_port`). Otherwise
+    the address is derived from ``sip_host``: in both a direct-IP setup (the ATA
+    dials this host) and the FreeSWITCH-on-this-host setup, the registrar
+    address is the very address the peer uses to reach us, so binding there is
+    exactly right. Returns ``""`` when nothing can be derived — pjlib then picks
+    for itself, which is fine on a single-NIC machine.
+    """
+    if probe is None:
+        probe = _local_ip_toward
+    explicit = settings.sip_bind_address.strip()
+    if explicit:
+        # Tolerate "ip:port" and bracketed forms; the transport port is decided
+        # separately, so only the address part is meaningful here. The port is
+        # stripped only when it really is numeric — otherwise an IPv6 literal
+        # would lose its last group.
+        host = explicit
+        if ":" in explicit:
+            head, _, tail = explicit.rpartition(":")
+            if tail.strip().isdigit():
+                host = head
+        return host.strip().strip("[]").strip()
+    gateway = settings.sip_host.strip()
+    if not gateway:
+        return ""
+    return probe(gateway, settings.sip_server_port or 5060) or ""
 
 
 def resolve_report_target(settings: Settings) -> str | None:
@@ -318,7 +401,16 @@ class FakeSipBackend:
     def __init__(self) -> None:
         self._handler: Callable[[str, dict], None] | None = None
         self.port: int | None = None
+        # Local IPv4 the transport was told to bind/advertise ("" = let the
+        # transport pick, e.g. a single-NIC host). Recorded so tests can assert
+        # the multi-homing fix reaches the backend.
+        self.bind_address = ""
         self.running = False
+        # True when start() was asked to REGISTER (一键启动 / 自动连接网关),
+        # False for a listen-only start (启动 SIP 服务 / 直连模式). Also bumped
+        # by every connect() so tests can assert a later "连接网关" happened.
+        self.register_requests = 0
+        self.connect_calls = 0
         self.answered: list[str] = []
         self.hung_up: list[str] = []
         self.placed: list[str] = []
@@ -331,13 +423,29 @@ class FakeSipBackend:
         self.ivr_unmarked: list[str] = []
         self.device_change_callbacks: list[Callable[[], None]] = []
 
-    def start(self, port: int, handler: Callable[[str, dict], None]) -> None:
+    def start(
+        self,
+        port: int,
+        handler: Callable[[str, dict], None],
+        *,
+        register: bool = True,
+        bind_address: str = "",
+    ) -> None:
         self._handler = handler
         self.port = port
+        self.bind_address = bind_address
         self.running = True
+        if register:
+            self.register_requests += 1
 
     def stop(self) -> None:
         self.running = False
+
+    def connect(self) -> None:
+        # The scripted peer has nothing to REGISTER *to*; record the request so
+        # tests can assert the service asked for it. The REGISTER outcome is
+        # driven explicitly by the test via ``receive_register``.
+        self.connect_calls += 1
 
     def _fire(self, name: str, **data: object) -> None:
         assert self._handler is not None, "backend used before start()"
@@ -472,6 +580,10 @@ class SipCoreService:
         self._state = CallState.IDLE
         self._contact: str | None = None
         self._registered = False
+        # True once the current session has *asked* the gateway to REGISTER
+        # (start(register=True) or connect_gateway); drives the "注册中" vs
+        # "未注册" wording in the dashboard for a listen-only session.
+        self._register_requested = False
         self._running = False
         self._subscribers: dict[str, list[Callable[..., None]]] = {}
         # Phone-report state (feature teleflow-phone-report).
@@ -570,6 +682,17 @@ class SipCoreService:
         return self._running
 
     @property
+    def register_requested(self) -> bool:
+        """Whether this session asked the gateway to REGISTER (vs listen-only)."""
+        return self._register_requested
+
+    @property
+    def gateway_configured(self) -> bool:
+        """Whether enough gateway account settings exist to attempt a REGISTER."""
+        settings = self._store.load()
+        return bool(settings.sip_host and settings.sip_user)
+
+    @property
     def report_state(self) -> ReportState:
         return self._report_state
 
@@ -582,7 +705,14 @@ class SipCoreService:
         """The currently-connected inbound call id, or "" when no call is up."""
         return self._active_call_id or ""
 
-    def start(self) -> None:
+    def start(self, *, register: bool = True) -> None:
+        """Bring the local UA up.
+
+        ``register=True`` (default, 一键启动) also REGISTERs to the configured
+        gateway; ``register=False`` (启动 SIP 服务 / 直连) only binds the
+        transport and listens, so an ATA can dial this endpoint by IP without
+        any registrar. Use :meth:`connect_gateway` to register afterwards.
+        """
         settings = self._store.load()
         self._log_ffmpeg_readiness(ResolvedConfig(settings))
         # Auto-detect a free UDP transport port unless the user configured a
@@ -594,9 +724,43 @@ class SipCoreService:
             self._emit(EVENT_SIP_PORT_CONFLICT, requested=requested, selected=port)
         elif requested is None:
             self._log_line(f"[SIP] 自动选择本地端口 {port}")
-        self._backend.start(port, self._dispatch)
+        # Pin the advertised local address on multi-homed hosts; without this
+        # pjsua2 may publish an adapter the peer cannot reach (see
+        # resolve_bind_address) and inbound calls die as fast-busy.
+        bind_address = resolve_bind_address(settings)
+        if bind_address:
+            self._log_line(f"[SIP] 本地监听地址 {bind_address}")
+        else:
+            self._log_line("[SIP] 未指定本地监听地址，由传输层自动选择网卡")
+        self._backend.start(
+            port, self._dispatch, register=register, bind_address=bind_address
+        )
         self._running = True
+        self._register_requested = register
+        if register:
+            self._log_line("[SIP] 本地服务已启动，正在连接网关…")
+        else:
+            self._log_line("[SIP] 本地服务已启动（仅监听，未连接网关）")
         self._emit(EVENT_SIP_STARTED)
+
+    def connect_gateway(self) -> None:
+        """REGISTER to the configured gateway without restarting the transport.
+
+        Raises ``RuntimeError`` when the service is not running or when the
+        gateway account settings are incomplete, so the caller can surface a
+        concrete reason instead of silently doing nothing.
+        """
+        if not self._running:
+            raise RuntimeError("SIP service is not running")
+        settings = self._store.load()
+        if not (settings.sip_host and settings.sip_user):
+            raise RuntimeError("gateway address / extension not configured")
+        self._register_requested = True
+        self._backend.connect()
+        self._log_line(
+            f"[SIP] 正在连接网关 {settings.sip_host}:{settings.sip_server_port} "
+            f"(账号 {settings.sip_user})…"
+        )
 
     def _log_ffmpeg_readiness(self, config: ResolvedConfig) -> None:
         """Announce at startup whether TTS transcoding can work at all.
@@ -626,6 +790,7 @@ class SipCoreService:
         self._state = CallState.IDLE
         self._contact = None
         self._registered = False
+        self._register_requested = False
         self._emit(EVENT_SIP_STOPPED)
 
     def place_call(self, target: str) -> None:

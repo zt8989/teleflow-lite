@@ -24,6 +24,31 @@ except ImportError:  # pragma: no cover - environment dependent
 pytestmark = pytest.mark.skipif(not _HAVE_PJSUA2, reason="pjsua2 native lib not built")
 
 
+def _has_default_audio_device() -> bool:
+    """makeCall opens a bidirectional sound device at call setup and raises
+    PJMEDIA_EAUD_NODEFDEV when the machine has no capture device (e.g. an RDP
+    session exposing only "远程音频"/Wave-mapper render devices). Call-placing
+    tests must skip in that case instead of failing on machine state."""
+    try:
+        ep = pjsua2.Endpoint()
+        ep.libCreate()
+        ep.libInit(pjsua2.EpConfig())
+        med = ep.audDevManager()
+        ok = any(
+            med.getDevInfo(i).inputCount > 0 for i in range(med.getDevCount())
+        )
+        ep.libDestroy()
+        return ok
+    except Exception:  # noqa: BLE001 - probe failure == no usable audio
+        return False
+
+
+_HAS_AUDIO_IN = _has_default_audio_device()
+_NEEDS_AUDIO = pytest.mark.skipif(
+    not _HAS_AUDIO_IN, reason="no audio capture device on this machine (e.g. RDP)"
+)
+
+
 def test_real_backend_starts_stops_and_tolerates_no_device(tmp_path) -> None:
     store = ConfigStore(tmp_path / "c.json")
     backend = Pjsua2Backend(store)
@@ -35,6 +60,7 @@ def test_real_backend_starts_stops_and_tolerates_no_device(tmp_path) -> None:
     assert backend.running is False
 
 
+@_NEEDS_AUDIO
 def test_place_call_and_place_report_call_do_not_raise(tmp_path) -> None:
     """Regression: pjsua2's Call.makeCall(dst_uri, prm) requires an explicit
     CallOpParam; the outbound paths used to call makeCall(target) and blew up
@@ -79,6 +105,7 @@ def test_stop_from_foreign_thread_does_not_abort(tmp_path) -> None:
     assert backend.running is False
 
 
+@_NEEDS_AUDIO
 def test_new_call_op_requests_audio_only(tmp_path) -> None:
     """Regression: pjsua2's default call setting adds a T.140 ``m=text`` SDP
     line, which the NewRockTech ATA rejects with 415 (phone never rings).
